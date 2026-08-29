@@ -386,8 +386,8 @@ async fn main() -> Result<()> {
                 if let Err(e) = append_rows(&st.path, &rows) {
                     eprintln!("[{}] запись: {e:#}", st.symbol);
                     failed += 1;
-                } else {
-                    let d = if rows.is_empty() { done.clone().load(Ordering::SeqCst) } else { done.fetch_add(1, Ordering::SeqCst) + 1 };
+                } else if !rows.is_empty() {
+                    let d = done.fetch_add(1, Ordering::SeqCst) + 1;
                     if d % 50 == 0 || d == 1 {
                         println!("дофилл: {d}/{total}...");
                     }
