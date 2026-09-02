@@ -1,0 +1,3 @@
+# Уведомления ntfy (ТЗ §42). Топик — из .env (NTFY_TOPIC), не в конфиге.
+server = "https://ntfy.sh"
+paper_only_on_close = true   # по умолчанию отправлять итоги закрытия бумажных сделок + SUMMARY исследования
