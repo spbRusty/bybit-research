@@ -10,6 +10,9 @@ import json
 import logging
 from datetime import datetime
 
+import numpy as np
+import polars as pl
+
 from config.settings import REPORTS_DIR, load_toml
 
 logger = logging.getLogger(__name__)
@@ -31,24 +34,32 @@ class CriticVerdict:
 
     @property
     def passed(self) -> bool:
-        return all(ok for _, ok, _ in self.results)
+        # UNKNOWN (None) не проходит: only explicit True counts as passed
+        return self.results and all(ok is True for _, ok, _ in self.results)
 
     @property
     def fail_reason(self) -> str:
         for n, ok, d in self.results:
-            if not ok:
+            if ok is not True:
                 return f"{n}: {d}"
         return ""
 
     def to_dict(self) -> dict:
+        status = {True: "PASS", False: "FAIL", None: "UNKNOWN"}
         return {"verdict": "PASS" if self.passed else "REJECT",
                 "fail_reason": self.fail_reason,
-                "results": [{"check": n, "pass": ok, "detail": d}
+                "results": [{"check": n, "pass": ok,
+                             "status": status.get(ok, "UNKNOWN"), "detail": d}
                             for n, ok, d in self.results]}
 
 
-def review(result: dict) -> CriticVerdict:
-    """Critic получает результат исследования (research.run_research) -> вердикт."""
+def review(result: dict, events: pl.DataFrame | None = None) -> CriticVerdict:
+    """Critic получает результат исследования (research.run_research) -> вердикт.
+
+    events — полный DataFrame событий (для реальных проверок temporal stability
+    и concentration по кандидату). Если events не передан — эти проверки UNKNOWN
+    (а не PASS): проверка, фактически не выполненная, не маркируется как пройденная (ТЗ §34).
+    """
     v = CriticVerdict()
 
     v.add("leakage", True,
@@ -64,7 +75,7 @@ def review(result: dict) -> CriticVerdict:
     else:
         v.add("multiple_testing", True, "единственная гипотеза")
 
-    # 3. Размер выборки и зависимость наблюдений
+    # 3. Размер выборки
     n_events = result.get("n_events_total", 0)
     min_ev = _R["min_events"]
     ok_n = n_events >= min_ev
@@ -76,22 +87,26 @@ def review(result: dict) -> CriticVerdict:
           f"уникальных символов={n_syms}, минимум={_R['min_unique_symbols']} "
           f"({'OK' if ok_dep else 'СИЛЬНАЯ ЗАВИСИМОСТЬ'})")
 
-    # 4. Временная стабильность: доля месяцев с positive mean после издержек
-    #    (по discovery-строкам у нас нет месячного разреза, поэтому оценка по кандидатам:
-    #     validation и oos должны оставаться положительными)
+    # 4. Временная стабильность
     fin = result.get("finalist")
-    if fin and fin["hypothesis_id"] in result.get("validation", {}):
-        mv = result["validation"][fin["hypothesis_id"]]
-        mo = result["oos"][fin["hypothesis_id"]]
-        ok_stab = mv.get("mean_net", -1) > 0 and mo.get("mean_net", -1) > 0
-        v.add("temporal_stability", ok_stab,
-              f"validation EV={mv.get('mean_net', float('nan')):+.5f}, "
-              f"oos EV={mo.get('mean_net', float('nan')):+.5f} "
-              f"({'стабильно' if ok_stab else 'НЕСТАБИЛЬНО'})")
+    if fin:
+        cid = fin["hypothesis_id"]
+        if events is not None and cid:
+            # реальная проверка: доля месяцев с положительным EV после издержек
+            stab = _temporal_stability(events, fin, result.get("cost_survival", _R["survival_cost"]))
+            ok_stab = stab["pos_share"] >= _R["stability_pos_share"]
+            v.add("temporal_stability", ok_stab,
+                  f"месяцев_pol={stab['n_pos']}/{stab['n']}, доля={stab['pos_share']:.0%} "
+                  f"(>={_R['stability_pos_share']:.0%}), worst={stab['worst']:+.5f}, "
+                  f"best={stab['best']:+.5f} "
+                  f"({'стабильно' if ok_stab else 'НЕСТАБИЛЬНО'})")
+        else:
+            v.add("temporal_stability", None,
+                  "нет events для реальной проверки по месяцам (UNKNOWN)")
     else:
         v.add("temporal_stability", True, "кандидатов нет — оценка не требуется")
 
-    # 5. Издержки: выживание при realistic cost (сетка §34)
+    # 5. Издержки
     survival = _R["survival_cost"]
     disc = result.get("discovery_results", [])
     best_t = max((r.get("t_stat") or -99) for r in disc) if disc else -99
@@ -100,17 +115,22 @@ def review(result: dict) -> CriticVerdict:
           f"сильнейший discovery t={best_t:.2f} (>={_R['min_t_stat']}) при издержках "
           f"{survival:.2%} кругового оборота; сетка стресса: {_R['cost_grid_round_trip']}")
 
-    # 6. Концентрация прибыли (проверка по кандидату: символы, OOS)
+    # 6. Концентрация (реальная, по кандидату)
     cid = fin["hypothesis_id"] if fin else None
-    if cid:
-        n_tot = result.get("n_events", {}).get("oos", 0) or 0
-        v.add("concentration", n_tot > 0,
-              f"проверено по OOS (событий={n_tot}); "
-              "концентрация оценивается в paper-контуре по фактическим сделкам")
+    if cid and events is not None:
+        conc = _concentration(events, fin, result.get("cost_survival", _R["survival_cost"]))
+        ok_c = conc["top1_share"] <= _R["max_symbol_concentration"]
+        v.add("concentration", ok_c,
+              f"top1={conc['top1_share']:.0%} событий, top5={conc['top5_share']:.0%}, "
+              f"символов={conc['n_symbols']} (>={_R['min_unique_symbols']}); "
+              f"порог top1<={_R['max_symbol_concentration']:.0%} "
+              f"({'OK' if ok_c else 'КОНЦЕНТРАЦИЯ'})")
+    elif cid:
+        v.add("concentration", None, "нет events для реальной проверки (UNKNOWN)")
     else:
         v.add("concentration", True, "нет кандидата")
 
-    # 7. OOS независим (не подгоняемся под него — параметры зафиксированы на discovery)
+    # 7. OOS
     if fin and fin["hypothesis_id"] in result.get("oos", {}):
         mo = result["oos"][fin["hypothesis_id"]]
         ok_oos = mo.get("mean_net", -1) > 0 and (mo.get("n") or 0) >= min_ev
@@ -122,6 +142,51 @@ def review(result: dict) -> CriticVerdict:
         v.add("oos", True, "нет кандидата — проверка не требуется")
 
     return v
+
+
+def _candidate_subset(events: pl.DataFrame, finalist: dict) -> pl.DataFrame | None:
+    """Подвыборка событий, удовлетворяющих условию финалиста."""
+    try:
+        cond = eval(finalist["condition"], {"pl": pl})
+    except Exception:
+        return None
+    target = f"return_{finalist['horizon_min']}m"
+    side = 1.0 if finalist.get("entry_side") == "long" else -1.0
+    sub = events.filter(cond).filter(
+        pl.col(target).is_not_null() & pl.col("entry_price").is_not_null())
+    return sub.with_columns(
+        ((pl.col(target) * side) - finalist.get("cost", _R["survival_cost"]))
+        .alias("net_ret"))
+
+
+def _temporal_stability(events: pl.DataFrame, finalist: dict, cost: float) -> dict:
+    """Доля месяцев с положительным средним net_ret после издержек (§27)."""
+    finalist = {**finalist, "cost": cost}
+    sub = _candidate_subset(events, finalist)
+    if sub is None or sub.height == 0:
+        return {"n": 0, "n_pos": 0, "pos_share": 0.0, "worst": np.nan, "best": np.nan}
+    by_month = (sub.with_columns(pl.col("open_time").dt.strftime("%Y-%m").alias("m"))
+                   .group_by("m").agg(pl.col("net_ret").mean().alias("mean")))
+    means = by_month["mean"].to_numpy()
+    pos = int((means > 0).sum())
+    return {"n": int(means.size), "n_pos": pos, "pos_share": pos / max(1, means.size),
+            "worst": float(means.min()), "best": float(means.max())}
+
+
+def _concentration(events: pl.DataFrame, finalist: dict, cost: float) -> dict:
+    """Концентрация по символам: доля событий top-1/top-5 (§29)."""
+    finalist = {**finalist, "cost": cost}
+    sub = _candidate_subset(events, finalist)
+    if sub is None or sub.height == 0:
+        return {"n_symbols": 0, "top1_share": 1.0, "top5_share": 1.0}
+    by_sym = (sub.group_by("symbol").agg(pl.len().alias("n"))
+                 .sort("n", descending=True))
+    ns = by_sym["n"].to_numpy()
+    total = ns.sum()
+    top1 = ns[0] / total if ns.size else 1.0
+    top5 = ns[:5].sum() / total if ns.size else 1.0
+    return {"n_symbols": int(by_sym.height), "top1_share": float(top1),
+            "top5_share": float(top5)}
 
 
 def save_report(result: dict, verdict: CriticVerdict, paper_report: dict | None = None) -> str:
@@ -142,7 +207,8 @@ def save_report(result: dict, verdict: CriticVerdict, paper_report: dict | None 
         "",
         "## Проверки",
     ]
-    lines += [f"- [{'PASS' if ok else 'FAIL'}] {n}: {d}" for n, ok, d in verdict.results]
+    lines += [f"- [{'PASS' if ok is True else 'UNKNOWN' if ok is None else 'FAIL'}] {n}: {d}"
+              for n, ok, d in verdict.results]
     lines.append("")
     if verdict.passed and paper_report:
         lines += [

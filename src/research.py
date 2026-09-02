@@ -18,6 +18,8 @@ from scipy import stats
 
 from config.settings import RESULTS_DIR, HYPOTHESES_DIR
 from config.settings import load_toml
+from src.registry import Provenance
+from src.stats import dependency_stats
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,8 @@ def test_hypothesis(events: pl.DataFrame, hyp: Hypothesis, cost: float) -> dict:
     side = 1.0 if hyp.entry_side == "long" else -1.0
     ret: np.ndarray = sub[hyp.target_column].to_numpy() * side - cost
     t, p = stats.ttest_1samp(ret, 0.0)
+    # Зависимость наблюдений (§26): block bootstrap, cluster bootstrap, HAC.
+    dep = dependency_stats(ret, sub["symbol"].to_list())
     return {**base,
             "n": n,
             "n_symbols": int(sub["symbol"].n_unique()),
@@ -110,7 +114,10 @@ def test_hypothesis(events: pl.DataFrame, hyp: Hypothesis, cost: float) -> dict:
             "t_stat": float(t), "p_value": float(p),
             "mean_net": float(ret.mean()), "median_net": float(np.median(ret)),
             "winrate": float((ret > 0).mean()),
-            "ev_annualized": float(ret.mean()) * 1440 * 365 / hyp.horizon_min}
+            "ev_annualized": float(ret.mean()) * 1440 * 365 / hyp.horizon_min,
+            "bootstrap_ci": dep["block_bootstrap_ci"],
+            "cluster_ci": dep["cluster_bootstrap_ci"],
+            "t_hac": dep["t_hac"], "p_hac": dep["p_hac"]}
 
 
 def benjamini_hochberg(p_values: np.ndarray, q: float) -> np.ndarray:
@@ -145,15 +152,17 @@ def split_periods(events: pl.DataFrame) -> dict[str, pl.DataFrame]:
 
 def run_research(events: pl.DataFrame,
                  q: float | None = None,
-                 cost_survival: float | None = None) -> dict:
+                 cost_survival: float | None = None,
+                 hypotheses: list[Hypothesis] | None = None) -> dict:
     """Полный прогон: discovery sweep -> БХ -> validation -> oos -> результат."""
     q = q or _R["bh_q"]
     cost_survival = cost_survival or _R["survival_cost"]
+    hypotheses = hypotheses if hypotheses is not None else HYPOTHESES
     periods = split_periods(events)
     disc, val, oos = periods["discovery"], periods["validation"], periods["oos"]
 
     rows = []
-    for hyp in HYPOTHESES:
+    for hyp in hypotheses:
         m = test_hypothesis(disc, hyp, cost_survival)
         m.update({"hypothesis_id": hyp.hypothesis_id, "description": hyp.description,
                   "entry_side": hyp.entry_side, "horizon_min": hyp.horizon_min})
@@ -171,9 +180,16 @@ def run_research(events: pl.DataFrame,
             (df["mean_net"].to_numpy() > 0))
     candidates = df.filter(pl.Series(mask))
 
+    # Провенанс (§32): тимстэмп, версии, период, издержки, seed — воспроизводимость
+    p = Provenance(
+        data_version="1.0", config_version="1.0",
+        cost_assumptions=list(_R.get("cost_grid_round_trip", [])),
+        random_seed=42,
+    )
     out = {
         "created_at": datetime.utcnow().isoformat(),
-        "q_bh": q, "cost_survival": cost_survival, "n_hypotheses": len(HYPOTHESES),
+        "provenance": p.to_dict(),
+        "q_bh": q, "cost_survival": cost_survival, "n_hypotheses": len(hypotheses),
         "n_events_total": events.height,
         "n_events": {k: v.height for k, v in periods.items()},
         "discovery_results": df.to_dicts(),
@@ -182,7 +198,7 @@ def run_research(events: pl.DataFrame,
     }
 
     for cid in out["candidates"]:
-        hyp = next(h for h in HYPOTHESES if h.hypothesis_id == cid)
+        hyp = next(h for h in hypotheses if h.hypothesis_id == cid)
         mv = test_hypothesis(val, hyp, cost_survival)
         mo = test_hypothesis(oos, hyp, cost_survival)
         out["validation"][cid] = mv

@@ -1,92 +1,82 @@
-"""Признаки свечей (ТЗ §15, §24-26). Все признаки в момент T используют данные <= T (ТЗ §27).
+"""Оркестратор признаков (ТЗ §5-21). Надстройка над модулями feature-категорий.
 
-Временные признаки — по UTC. BTC — фактор рынка, не фильтр входа (§25).
+add_features(df, btc, eth=None, is_spike=None) собирает полный feature-space из
+зарегистрированных модулей. Каждый генератор вызывается только при наличии
+необходимых входных колонок (устойчиво к отсутствию данных рынка).
 """
 from __future__ import annotations
 
 import polars as pl
-from config.settings import load_toml
 
-_FEAT = load_toml("features.toml")
-_MKT = load_toml("market.toml")
+from src import features_candle as fc
+from src import features_volume as fv
+from src import features_volatility as fvol
+from src import features_momentum as fm
+from src import features_structure as fs
+from src import features_cross as fx
+from src import features_regime as fr
+from src import features_context as fctx
+from src.registry import REGISTRY
+
+
+def _has(df: pl.DataFrame, col: str) -> bool:
+    return col in df.columns
 
 
 def time_features(df: pl.DataFrame) -> pl.DataFrame:
-    """§15: hour_utc, minute_utc, day_of_week, day_of_month, week_of_year, session."""
-    df = df.with_columns([
+    """Временные признаки (§15/§18): hour_utc, minute_utc, day_of_week, session."""
+    return df.with_columns([
         pl.col("open_time").dt.hour().alias("hour_utc"),
         pl.col("open_time").dt.minute().alias("minute_utc"),
         pl.col("open_time").dt.weekday().alias("day_of_week"),
         pl.col("open_time").dt.day().alias("day_of_month"),
         pl.col("open_time").dt.week().alias("week_of_year"),
-    ])
-    return df.with_columns(
+    ]).with_columns(
         pl.when(pl.col("hour_utc").is_between(0, 6)).then(pl.lit("asia"))
          .when(pl.col("hour_utc").is_between(7, 12)).then(pl.lit("europe"))
          .otherwise(pl.lit("america")).alias("session"))
 
 
-def candle_features(df: pl.DataFrame) -> pl.DataFrame:
-    """§24: доходности, range/body/фитили, объём, относительный объём, волатильность.
+def add_features(df: pl.DataFrame, btc: pl.DataFrame | None = None,
+                 eth: pl.DataFrame | None = None,
+                 is_spike: pl.Series | None = None) -> pl.DataFrame:
+    """Полный feature-space. Возвращает df с зарегистрированными признаками.
 
-    rolling-окна считаются по прошедшим свечам (shift на 1) — без lookahead.
+    Порядок важен: базовые (candle) -> производные (volume/vol/momentum/...) ->
+    структура/режим -> cross (требует market) -> context (требует is_spike).
     """
-    vol_med = _FEAT["vol_window_min"]
-    out = df.with_columns([
-        pl.col("close").pct_change().alias("return_1m"),
-        (pl.col("high") - pl.col("low")).alias("range"),
-        ((pl.col("high") - pl.col("low")) / pl.col("close")).alias("range_pct"),
-        (pl.col("close") - pl.col("open")).abs().alias("body"),
-        ((pl.col("close") - pl.col("open")).abs() / pl.col("close")).alias("body_pct"),
-        ((pl.col("high") - pl.max_horizontal("open", "close")) / pl.col("close"))
-        .alias("upper_wick"),
-        ((pl.min_horizontal("open", "close") - pl.col("low")) / pl.col("close"))
-        .alias("lower_wick"),
-    ])
-    # производные над базовыми полями (нужно два прохода: ссылки в том же with_columns нельзя)
+    # 0. Время (контракт H001-H008: hour_utc для сессий)
+    out = time_features(df)
+    # 1. Базовые свечи (всегда доступны)
+    out = fc.add_candle_features(out)
+    # backward-compat алиасы для H001-H008 (старые имена wick/body)
     out = out.with_columns([
-        # относительный объём: текущий / медиана окна ПРЕДЫДУЩИХ свечей
-        (pl.col("volume") / pl.col("volume").shift(1)
-         .rolling_median(vol_med, min_samples=1)).alias("relative_volume"),
-        # z-score объёма по окну предыдущих свечей
-        ((pl.col("volume") - pl.col("volume").shift(1)
-          .rolling_mean(vol_med, min_samples=1)) /
-         pl.col("volume").shift(1).rolling_std(vol_med, min_samples=1).clip(1e-12))
-        .alias("volume_zscore"),
-        # относительный диапазон: (high-low)/close / медиану окна предыдущих свечей
-        (pl.col("range_pct") / pl.col("range_pct").shift(1)
-         .rolling_median(vol_med, min_samples=1)).alias("relative_range"),
-        # относительная волатильность: текущий диапазон / среднеисторический (день)
-        (pl.col("range_pct") / pl.col("range_pct").shift(1)
-         .rolling_mean(1440, min_samples=1)).alias("relative_volatility"),
+        pl.col("candle_upper_wick").alias("upper_wick"),
+        pl.col("candle_lower_wick").alias("lower_wick"),
+        pl.col("candle_body").alias("body"),
+        pl.col("candle_range").alias("range"),
     ])
-    # многоминутные доходности (3/5/10/15/30) — закрытие T к закрытию T-n
-    for n in (3, 5, 10, 15, 30):
-        out = out.with_columns(
-            (pl.col("close") / pl.col("close").shift(n) - 1).alias(f"return_{n}m"))
-    return out
+    out = fc.add_multi_timeframe_returns(out)
+    out = fc.add_return_derivatives(out)
+    out = fv.add_volume_features(out)
+    out = fvol.add_volatility_features(out)   # требует candle_true_range, candle_return_1m
+    out = fm.add_momentum_features(out)       # требует atr, roc_20 (из candles/vol)
 
+    # 2. Структура (требует candle-колонки)
+    out = fs.add_structure_features(out)
 
-def btc_features(df: pl.DataFrame, btc: pl.DataFrame) -> pl.DataFrame:
-    """§25: возврат/объём/волатильность BTC, выровненные к свече символа без lookahead."""
-    w = _FEAT["btc_vol_window_min"]
-    b = btc.sort("open_time").with_columns([
-        pl.col("close").pct_change().alias("btc_return"),
-        (pl.col("volume") / pl.col("volume").shift(1)
-         .rolling_median(w, min_samples=1)).alias("btc_relative_volume"),
-        ((pl.col("high") - pl.col("low")) / pl.col("close")).alias("btc_range"),
-    ])
-    b = b.select([
-        "open_time", "btc_return", "btc_relative_volume", "btc_range",
-        pl.col("btc_range").rolling_mean(w, min_samples=1).alias("btc_volatility"),
-    ])
-    # asof: для каждой свечи символа берём последнее значение BTC <= T
-    return df.join_asof(b, on="open_time", strategy="backward")
-
-
-def add_features(df: pl.DataFrame, btc: pl.DataFrame | None = None) -> pl.DataFrame:
-    df = time_features(df)
-    df = candle_features(df)
+    # 3. Cross-признаки (требуют roc_20 из momentum + candle_return_1m)
     if btc is not None:
-        df = btc_features(df, btc)
-    return df
+        out = fx.add_cross_features(out, btc, "btc")
+    if eth is not None:
+        out = fx.add_cross_features(out, eth, "eth")
+
+    # 4. Режим (требует trend_strength, volume; btc_trend_regime при наличии btc)
+    out = fr.add_regime_features(out)
+
+    # 5. Контекст событий (требует is_spike)
+    if is_spike is not None and len(is_spike) == out.height:
+        out = out.with_columns(pl.Series("is_spike", is_spike))
+        out = fctx.add_context_features(out)
+
+    return out

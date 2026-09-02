@@ -23,6 +23,7 @@ from src import data as data_mod
 from src import critic as critic_mod
 from src import events as events_mod
 from src import features as features_mod
+from src import hypothesis_generator as hgen_mod
 from src import notify as notify_mod
 from src import paper as paper_mod
 from src import research as research_mod
@@ -96,15 +97,21 @@ def main(limit: int | None = None, category: str | None = None) -> int:
     events_mod.save_events(events, "all")
     logger.info("Событий всего: %d", events.height)
 
-    # 3. Исследование (§30-34)
-    result = research_mod.run_research(events)
+    # 3. Исследование (§30-34): baseline H001-H008 + автоматически сгенерированные (§22)
+    baseline = research_mod.HYPOTHESES
+    generated = hgen_mod.generate_hypotheses(events)
+    generated = hgen_mod.filter_by_freq(generated, events, _R["min_events"])
+    all_hyp = list(baseline) + generated
+    logger.info("Гипотез: baseline=%d + generator=%d = %d",
+                len(baseline), len(generated), len(all_hyp))
+    result = research_mod.run_research(events, hypotheses=all_hyp)
     rid = research_mod.save_result(result)
     logger.info("RESEARCH %s: кандидаты=%s финалист=%s вердикт=%s",
                 rid, result["candidates"], (result.get("finalist") or {}).get("hypothesis_id"),
                 result["verdict"])
 
-    # 4. Critic (§32)
-    verdict = critic_mod.review(result)
+    # 4. Critic (§32) — реальные проверки по events
+    verdict = critic_mod.review(result, events)
     critic_mod.save_report(result, verdict)
     logger.info("CRITIC: %s (%s)", "PASS" if verdict.passed else "REJECT", verdict.fail_reason)
 
