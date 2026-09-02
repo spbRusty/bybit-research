@@ -3,6 +3,14 @@ name = "bybit_rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "bybit_rs"
+path = "src/main.rs"
+
+[[bin]]
+name = "marketdata"
+path = "src/bin/marketdata.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 arrow = "59.2.0"
