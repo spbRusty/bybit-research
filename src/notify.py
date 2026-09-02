@@ -14,14 +14,15 @@ logger = logging.getLogger(__name__)
 
 
 def notify(title: str, message: str, tags: str = "") -> bool:
-    """Отправка в ntfy. Возвращает True при успехе; тихо пропускает без топика."""
+    """Отправка в ntfy (JSON-тело: UTF-8, без заголовков). True при успехе."""
     if not NTFY_TOPIC:
         logger.info("[ntfy отключён: NTFY_TOPIC не задан] %s: %s", title, message)
         return False
-    url = f"{NTFY_SERVER.rstrip('/')}/{NTFY_TOPIC}"
+    payload = json.dumps({"topic": NTFY_TOPIC, "title": title[:200],
+                          "message": message, "tags": tags.split()}).encode("utf-8")
     req = urllib.request.Request(
-        url, data=message.encode("utf-8"), method="POST",
-        headers={"Title": title[:200], "Tags": tags, "Priority": "default"})
+        f"{NTFY_SERVER.rstrip('/')}/", data=payload, method="POST",
+        headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status == 200
