@@ -9,6 +9,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import datetime as dt
+import re
+
 import numpy as np
 import polars as pl
 
@@ -17,6 +20,8 @@ sys.path.insert(0, str(ROOT))
 
 from src import features as F
 from src import events as ev_mod
+from src import hypothesis_generator as hg
+from src.research import split_periods
 
 
 def _synth_df(n=500, seed=7) -> pl.DataFrame:
@@ -82,3 +87,44 @@ def test_events_no_future_in_features():
     assert out.height > 0
     # build_events использует фьючерсы только в _future_metrics (после suspicious)
     assert "return_5m" in out.columns  # получено из add_features (прошлые доходности)
+
+
+def test_generator_thresholds_use_discovery_only():
+    """Пороги генератора считаются по discovery; val/oos НЕ влияют (§33).
+
+    Discovery: признак ~ N(0,1). val+oos: сдвиг +100. Если бы порог считался по
+    всему events (утечка), он был бы ~50; по discovery он ~N(0,1) 90-й pct (~1.28).
+    """
+    def mk(n, base_ms, mu):
+        ts = pl.datetime_range(
+            dt.datetime.fromtimestamp(base_ms),
+            dt.datetime.fromtimestamp(base_ms + (n - 1) * 60),
+            interval="1m", time_unit="ms", eager=True)
+        rng = np.random.default_rng(7)
+        return pl.DataFrame({
+            "open_time": ts, "open": 100.0, "high": 101.0, "low": 99.0,
+            "close": 100.5, "volume": 1.0, "turnover": 1.0, "is_green": True,
+            "symbol": ["X"] * n, "category": ["linear"] * n,
+            "entry_price": 100.0,
+            "return_5m": np.zeros(n), "return_10m": np.zeros(n), "return_30m": np.zeros(n),
+            "feature": rng.normal(mu, 1, n),
+        })
+
+    D0 = dt.datetime(2025, 12, 25, tzinfo=dt.timezone.utc).timestamp()
+    O0 = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc).timestamp()
+    disc = mk(600, D0, 0.0)      # discovery-распределение N(0,1)
+    valo = mk(600, O0, 100.0)    # val+oos с другим сдвигом
+    events = pl.concat([disc, valo])
+
+    disc_ev = split_periods(events)["discovery"]
+    assert disc_ev.height == 600  # discovery окно отрезало ровно discovery
+
+    rule = hg.GenRule("feature", "gt", "long", (5,))
+    cond_disc = hg._condition_from_rule(rule, disc_ev)  # как делает main после фикса
+    cond_all = hg._condition_from_rule(rule, events)    # утечечный путь (весь df)
+
+    thr_disc = float(re.search(r"> ([\d.e+-]+)", cond_disc).group(1))
+    thr_all = float(re.search(r"> ([\d.e+-]+)", cond_all).group(1))
+    # discovery ~1.28 (90pct N(0,1)); весь df (со смесью +100) >> discovery
+    assert 0.0 < thr_disc < 3.0, thr_disc
+    assert thr_disc < thr_all - 10, (thr_disc, thr_all)

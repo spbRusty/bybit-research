@@ -50,19 +50,25 @@ def _future_metrics(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def build_events(df: pl.DataFrame, symbol: str, category: str) -> pl.DataFrame:
-    """Полный контур: признаки -> предфильтр -> события + будущие доходности."""
-    cand = suspicious_candles(df)
+    """Полный контур: признаки -> будущие доходности -> предфильтр -> события.
+
+    Будущие доходности (return_{h}m / mfe / mae) считаются на ПОЛНОМ временном
+    ряду ДО фильтра, иначе shift(-h) сдвигался бы на h строк прореженного df —
+    и return был бы до h-й следующей подозрительной свечи, а не через h минут.
+    Предфильтр применяется ПОСЛЕ, чтобы выбрать, какие строки становятся событиями.
+    """
+    full = _future_metrics(df)
+    cand = suspicious_candles(full)
     if cand.height == 0:
         return cand
-    ev = _future_metrics(cand)
-    ev = ev.with_columns([
+    cand = cand.with_columns([
         pl.lit(symbol).alias("symbol"),
         pl.lit(category).alias("category"),
         pl.col("open_time").dt.strftime("%Y%m%dT%H%M%SZ").alias("event_id"),
     ])
-    # события в конце файла без полного будущего окна исключаются (null)
-    ev = ev.drop_nulls(subset=["entry_price"])
-    return ev
+    # события без полного будущего окна исключаются (null)
+    cand = cand.drop_nulls(subset=["entry_price"])
+    return cand
 
 
 def save_events(events: pl.DataFrame, name: str) -> None:
