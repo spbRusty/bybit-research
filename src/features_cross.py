@@ -32,6 +32,26 @@ register(_mk("residual_return_btc", "Остаточная доходность �
              "r - beta*r_btc", "resid", 60, cost="medium"))
 register(_mk("relative_strength_btc", "Относительная сила к BTC",
              "roc_20 - roc_btc_20", "rs_btc", 21))
+# ETH как второй фактор рынка (§16): те же признаки, префикс eth_
+for _fid, _name, _desc, _formula, _lb, *_cost in [
+    ("eth_return", "Доходность ETH", "close_eth/close_eth(-1)-1", "r_eth", 2),
+    ("eth_volatility_60", "Волатильность ETH (60)", "std(r_eth,60)", "vol_eth", 60),
+    ("eth_znak", "Направление ETH", "sign(r_eth)", "dir_eth", 2),
+    ("eth_roc_20", "ROC ETH (20)", "close_eth/close_eth(-20)-1", "roc_eth", 21),
+    ("eth_trend_regime", "Режим тренда ETH", "sign(SMA20_eth-SMA60_eth)",
+     "trend_eth", 60, "medium"),
+    ("eth_volatility_regime", "Режим волатильности ETH",
+     "high|low по процентилю", "volreg_eth", 120, "medium"),
+    ("corr_eth_60", "Корреляция с ETH (60)", "corr(r, r_eth, 60)",
+     "corr_eth", 60, "medium"),
+    ("rolling_beta_eth_60", "Бета к ETH (60)", "cov(r,r_eth)/var(r_eth)",
+     "beta_eth", 60, "medium"),
+    ("residual_return_eth", "Остаточная доходность к ETH", "r - beta*r_eth",
+     "resid_eth", 60, "medium"),
+    ("relative_strength_eth", "Относительная сила к ETH", "roc_20 - roc_eth_20",
+     "rs_eth", 21),
+]:
+    register(_mk(_fid, _name, _desc, _formula, _lb, cost=(_cost[0] if _cost else "low")))
 
 
 def _ema(s: pl.Expr, span: int) -> pl.Expr:

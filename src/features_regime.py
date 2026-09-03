@@ -22,6 +22,20 @@ register(_mk("risk_on", "Риск-он", "btc_trend_regime>0 и breadth>0", "ris
              cost="medium", data=("ohlcv", "btc")))
 register(_mk("risk_off", "Риск-офф", "btc_trend_regime<0", "risk_off", 60,
              cost="medium", data=("ohlcv", "btc")))
+# §20 — дополнительные режимы (производные от уже вычисленных признаков)
+register(_mk("range_regime", "Режим боковика", "trend_strength <= 70-процентиль",
+             "range", 120))
+register(_mk("low_volatility_regime", "Режим низкой волатильности",
+             "volatility_regime in (low, very_low)", "lvol", 241, cost="medium"))
+register(_mk("btc_trend", "Режим тренда BTC (label)", "sign(SMA20-SMA60) BTC",
+             "btc_trend", 60, data=("ohlcv", "btc")))
+register(_mk("btc_volatility", "Режим волатильности BTC (label)",
+             "high|low BTC", "btc_vol", 120, data=("ohlcv", "btc")))
+register(_mk("correlation_regime", "Режим корреляции с BTC",
+             "high|low corr по порогу", "corrreg", 60, data=("ohlcv", "btc")))
+register(_mk("market_breadth_regime", "Рыночная широта (breadth)",
+             "advancing - declining / total", "breadth", 60, cost="medium",
+             data=("ohlcv", "breadth")))
 
 
 def _ema(s: pl.Expr, span: int) -> pl.Expr:
@@ -54,4 +68,28 @@ def add_regime_features(df: pl.DataFrame) -> pl.DataFrame:
         out = out.with_columns(
             (pl.col("btc_trend_regime") > 0).cast(pl.Int8).alias("risk_on"),
             (pl.col("btc_trend_regime") < 0).cast(pl.Int8).alias("risk_off"))
+        out = out.with_columns(
+            pl.when(pl.col("btc_trend_regime") > 0).then(pl.lit("up"))
+             .when(pl.col("btc_trend_regime") < 0).then(pl.lit("down"))
+             .otherwise(pl.lit("flat")).alias("btc_trend"))
+    # range_regime — производный от trend_regime (inverse)
+    if "trend_regime" in out.columns:
+        out = out.with_columns(pl.col("trend_regime").alias("range_regime"))
+    # low_volatility — производный от volatility_regime, если он есть
+    if "volatility_regime" in out.columns:
+        out = out.with_columns(
+            pl.when(pl.col("volatility_regime").is_in(["low", "very_low"]))
+            .then(pl.lit(1)).otherwise(pl.lit(0)).alias("low_volatility_regime"))
+        out = out.with_columns(
+            pl.when(pl.col("volatility_regime").is_in(["high", "very_high"]))
+            .then(pl.lit("high")).otherwise(pl.lit("low")).alias("btc_volatility"))
+    # correlation_regime — порог ABS корреляции с BTC
+    if "corr_btc_60" in out.columns:
+        out = out.with_columns(
+            pl.when(pl.col("corr_btc_60").abs() >= 0.5).then(pl.lit("high"))
+            .otherwise(pl.lit("low")).alias("correlation_regime"))
+    # market_breadth — только если включён §17 (колонка breadth из внешнего пайплайна)
+    if "breadth" in out.columns:
+        out = out.with_columns(
+            ((pl.col("breadth") > 0).cast(pl.Int8)).alias("market_breadth_regime"))
     return out

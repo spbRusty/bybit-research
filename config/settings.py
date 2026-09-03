@@ -27,6 +27,11 @@ RAW_KLINES_DIR = Path(os.environ.get(
     "RAW_KLINES_DIR",
     str(Path.home() / "Документы/bybit_rs/data/klines")))
 
+# --- Тиковые рыночные потоки (Rust marketdata-сервис, §12-§15) ---
+MARKET_DATA_DIR = Path(os.environ.get(
+    "MARKET_DATA_DIR",
+    str(Path.home() / "Документы/построение/collector/data/market")))
+
 # --- Выходы (ТЗ §4) ---
 DATA = ROOT / "data"
 CLEAN_CANDLES = DATA / "clean" / "candles"

@@ -16,6 +16,8 @@ from src import features_structure as fs
 from src import features_cross as fx
 from src import features_regime as fr
 from src import features_context as fctx
+from src import features_market as fmarket
+from src import features_external as fext
 from src.registry import REGISTRY
 
 
@@ -24,8 +26,8 @@ def _has(df: pl.DataFrame, col: str) -> bool:
 
 
 def time_features(df: pl.DataFrame) -> pl.DataFrame:
-    """Временные признаки (§15/§18): hour_utc, minute_utc, day_of_week, session."""
-    return df.with_columns([
+    """Временные признаки (§15/§18): час, минута, день недели, сессия и смещения."""
+    out = df.with_columns([
         pl.col("open_time").dt.hour().alias("hour_utc"),
         pl.col("open_time").dt.minute().alias("minute_utc"),
         pl.col("open_time").dt.weekday().alias("day_of_week"),
@@ -33,17 +35,39 @@ def time_features(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("open_time").dt.week().alias("week_of_year"),
     ]).with_columns(
         pl.when(pl.col("hour_utc").is_between(0, 6)).then(pl.lit("asia"))
+         .when(pl.col("hour_utc").is_between(19, 23)).then(pl.lit("asia"))
          .when(pl.col("hour_utc").is_between(7, 12)).then(pl.lit("europe"))
-         .otherwise(pl.lit("america")).alias("session"))
+         .otherwise(pl.lit("america")).alias("session"),
+        (pl.col("hour_utc").cast(pl.Int32) * 60
+         + pl.col("minute_utc").cast(pl.Int32)).alias("min_from_day"),
+        pl.col("minute_utc").alias("min_from_hour"),
+    )
+    # funding на 00/08/16 UTC — минуты с последнего funding (480 = 8ч)
+    out = out.with_columns(
+        ((pl.col("min_from_day")
+          - (pl.col("hour_utc").cast(pl.Int32) % 8) * 60) % 480)
+        .alias("min_from_funding"))
+    # session overlap: перекрытие asia/europe и europe/america
+    out = out.with_columns(
+        pl.when(pl.col("hour_utc").is_between(7, 12)).then(pl.lit("asia_europe"))
+         .when(pl.col("hour_utc").is_between(19, 23)).then(pl.lit("asia_america"))
+         .otherwise(pl.lit("single")).alias("session_overlap"))
+    return out
 
 
 def add_features(df: pl.DataFrame, btc: pl.DataFrame | None = None,
                  eth: pl.DataFrame | None = None,
-                 is_spike: pl.Series | None = None) -> pl.DataFrame:
+                 is_spike: pl.Series | None = None,
+                 market_symbol: str | None = None,
+                 breadth: pl.DataFrame | None = None) -> pl.DataFrame:
     """Полный feature-space. Возвращает df с зарегистрированными признаками.
 
     Порядок важен: базовые (candle) -> производные (volume/vol/momentum/...) ->
     структура/режим -> cross (требует market) -> context (требует is_spike).
+    При market_symbol не None добавляются рыночные тиковые признаки (§12-15)
+    по открытому времени свечи (без look-ahead: бакет T = тики [T, T+60s)).
+    breadth (§17) — cross-sectional DataFrame [open_time, breadth], join по
+    открытому времени свечи (forward-only, ничего "из будущего").
     """
     # 0. Время (контракт H001-H008: hour_utc для сессий)
     out = time_features(df)
@@ -71,6 +95,12 @@ def add_features(df: pl.DataFrame, btc: pl.DataFrame | None = None,
     if eth is not None:
         out = fx.add_cross_features(out, eth, "eth")
 
+    # 3b. Рыночная широта (§17) — join перед режимами, чтобы market_breadth_regime
+    #     считался как производный. join как есть; реестр/производные отсутствие
+    #     колонки переживают (функции проверяют наличие колонок).
+    if breadth is not None and breadth.height:
+        out = out.join(breadth, on="open_time", how="left")
+
     # 4. Режим (требует trend_strength, volume; btc_trend_regime при наличии btc)
     out = fr.add_regime_features(out)
 
@@ -78,5 +108,17 @@ def add_features(df: pl.DataFrame, btc: pl.DataFrame | None = None,
     if is_spike is not None and len(is_spike) == out.height:
         out = out.with_columns(pl.Series("is_spike", is_spike))
         out = fctx.add_context_features(out)
+
+    # 6. Рыночные тиковые признаки (§12-15) — join по open_time, если есть данные
+    if market_symbol is not None:
+        try:
+            mk = fmarket.build_market_features(market_symbol)
+            if mk.height:
+                out = out.join(mk, on="open_time", how="left")
+        except Exception:
+            pass  # рыночных данных нет — признаки пропущены, пайплайн не ломаем
+
+    # 7. Внешние источники (§21): Fear&Greed + CoinGecko (без ключа)
+    out = fext.add_external_features(out)
 
     return out

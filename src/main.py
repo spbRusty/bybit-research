@@ -21,8 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.settings import LOGS_DIR, load_toml
 from src import data as data_mod
 from src import critic as critic_mod
+from src import data as data_mod
 from src import events as events_mod
 from src import features as features_mod
+from src import features_breadth as breadth_mod
 from src import hypothesis_generator as hgen_mod
 from src import notify as notify_mod
 from src import paper as paper_mod
@@ -57,6 +59,18 @@ def load_btc() -> pl.DataFrame | None:
         return None
 
 
+def load_eth() -> pl.DataFrame | None:
+    """ETH — второй фактор рынка (§16); свечи linear ETHUSDT."""
+    try:
+        df = data_mod.load_validated(_FEAT["eth_symbol"], "linear")
+        if df is None:
+            logger.warning("ETHUSDT не найден — ETH-признаки пропущены")
+        return df
+    except Exception as e:
+        logger.warning("Ошибка загрузки ETH: %s", e)
+        return None
+
+
 def main(limit: int | None = None, category: str | None = None) -> int:
     setup_logging()
     t0 = datetime.utcnow()
@@ -72,13 +86,18 @@ def main(limit: int | None = None, category: str | None = None) -> int:
 
     # 2. Данные + признаки + волатильность
     btc = load_btc()
+    eth = load_eth()
+    # грузим свечи юниверса один раз (нужны и для breadth §17)
+    univ_dfs = data_mod.load_universe_data(universe)
+    breadth = breadth_mod.compute_breadth(univ_dfs)
     all_events = []
     n_loaded = 0
     for row in universe.iter_rows(named=True):
-        df = data_mod.load_validated(row["symbol"], row["category"])
+        df = univ_dfs.get((row["symbol"], row["category"]))
         if df is None:
             continue
-        df = features_mod.add_features(df, btc)
+        df = features_mod.add_features(df, btc, eth, market_symbol=row["symbol"],
+                                       breadth=breadth)
         # волатильность Гармана–Класса, 30 дней (§9) — для стопов
         gk = vol_mod.rolling_gk(df, 30).select(["date", "vol_gk_30d"])
         df = df.join(gk, left_on=pl.col("open_time").dt.date(), right_on="date", how="left")

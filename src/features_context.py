@@ -23,6 +23,25 @@ register(_mk("cooldown", "Cooldown после события", "0 если вр�
              "cooldown", 6))
 register(_mk("dist_from_prev_event", "Расстояние от предыдущего события",
              "open_time - prev_event_time", "dist_prev", 1440))
+# §19 — доп: счётчик одинаковых событий подряд и позиция в серии
+register(_mk("same_event_count", "Длина текущей серии событий",
+             "число подряд идущих is_spike==1", "same_cnt", 6))
+register(_mk("event_sequence", "Позиция в текущей серии событий",
+             "1..N внутри серии is_spike", "seq", 6))
+
+
+def _run_len(spike: pl.Expr) -> pl.Expr:
+    """Длина текущей серии (run) is_spike==1. Группа: переключение 0->1 или 1->0."""
+    sp = spike.cast(pl.Int32)
+    grp = (sp != sp.shift(1).fill_null(0)).cum_sum()
+    return pl.when(spike.cast(pl.Boolean)).then(grp.count().over(grp)).otherwise(None)
+
+
+def _run_seq(spike: pl.Expr) -> pl.Expr:
+    """Позиция (1..N) внутри текущей серии is_spike==1."""
+    sp = spike.cast(pl.Int32)
+    grp = (sp != sp.shift(1).fill_null(0)).cum_sum()
+    return pl.when(spike.cast(pl.Boolean)).then(sp.cum_sum().over(grp)).otherwise(None)
 
 
 def add_context_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -44,4 +63,6 @@ def add_context_features(df: pl.DataFrame) -> pl.DataFrame:
         spike.rolling_sum(240, min_samples=1).alias("event_intensity_240"),
         spike.rolling_sum(6, min_samples=1).alias("event_clustering"),
         (spike.rolling_sum(6, min_samples=1) > 0).cast(pl.Int8).alias("cooldown"),
+        _run_len(spike).alias("same_event_count"),
+        _run_seq(spike).alias("event_sequence"),
     ]).drop("_last_spike_t")
