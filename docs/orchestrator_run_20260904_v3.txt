@@ -1,0 +1,53 @@
+/home/vlad/Документы/построение/src/orchestrator.py:66: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  t0 = datetime.utcnow()
+2026-09-04 11:00:21,533 INFO orchestrator === ORCHESTRATOR: 2026-09-04T08:00:21.533850 (run_id=20260904T080021Z) ===
+2026-09-04 11:00:41,139 INFO data Юниверс ликвидности: 70 символов из 1383 (окно=30d порог=$5M устойчивость>=80%)
+2026-09-04 11:00:41,144 INFO orchestrator Universe: 10 symbols
+2026-09-04 11:01:27,412 INFO orchestrator Events: 540119
+2026-09-04 11:01:27,436 INFO orchestrator STAGE data_validation: PASS (OK)
+2026-09-04 11:01:31,823 INFO orchestrator STAGE feature_validation: PASS (OK)
+2026-09-04 11:01:35,205 INFO orchestrator Hypotheses: 37
+2026-09-04 11:01:36,406 INFO research research: 1/37 H001
+2026-09-04 11:01:46,932 INFO research research: 2/37 H002
+2026-09-04 11:01:55,443 INFO research research: 3/37 H003
+2026-09-04 11:01:59,318 INFO research research: 4/37 H004
+2026-09-04 11:01:59,475 INFO research research: 5/37 H005
+2026-09-04 11:02:05,360 INFO research research: 6/37 H006
+2026-09-04 11:02:05,386 INFO research research: 7/37 H007
+2026-09-04 11:02:05,616 INFO research research: 8/37 H008
+2026-09-04 11:02:05,729 INFO research research: 9/37 HG001
+2026-09-04 11:02:24,277 INFO research research: 10/37 HG002
+2026-09-04 11:02:41,445 INFO research research: 11/37 HG003
+2026-09-04 11:02:56,325 INFO research research: 12/37 HG004
+2026-09-04 11:03:02,387 INFO research research: 13/37 HG005
+2026-09-04 11:03:10,196 INFO research research: 14/37 HG006
+2026-09-04 11:03:16,182 INFO research research: 15/37 HG007
+2026-09-04 11:03:22,055 INFO research research: 16/37 HG008
+2026-09-04 11:03:23,172 INFO research research: 17/37 HG009
+2026-09-04 11:03:24,519 INFO research research: 18/37 HG010
+2026-09-04 11:03:31,605 INFO research research: 19/37 HG011
+2026-09-04 11:03:38,626 INFO research research: 20/37 HG012
+2026-09-04 11:03:39,690 INFO research research: 21/37 HG013
+2026-09-04 11:03:40,656 INFO research research: 22/37 HG014
+2026-09-04 11:03:42,002 INFO research research: 23/37 HG015
+2026-09-04 11:03:43,308 INFO research research: 24/37 HG016
+2026-09-04 11:03:45,433 INFO research research: 25/37 HG017
+2026-09-04 11:03:47,256 INFO research research: 26/37 HG018
+2026-09-04 11:03:55,355 INFO research research: 27/37 HG019
+2026-09-04 11:04:03,476 INFO research research: 28/37 HG020
+2026-09-04 11:04:04,689 INFO research research: 29/37 HG021
+2026-09-04 11:04:06,152 INFO research research: 30/37 HG022
+2026-09-04 11:04:22,654 INFO research research: 31/37 HG023
+2026-09-04 11:04:40,325 INFO research research: 32/37 HG024
+2026-09-04 11:04:56,474 INFO research research: 33/37 HG025
+2026-09-04 11:05:12,234 INFO research research: 34/37 HG026
+2026-09-04 11:05:20,750 INFO research research: 35/37 HG027
+2026-09-04 11:05:27,974 INFO research research: 36/37 HG028
+2026-09-04 11:05:33,280 INFO research research: 37/37 HG029
+2026-09-04 11:05:38,604 INFO orchestrator Research research_20260904T080538Z: candidates=[] verdict=NO_CANDIDATE
+2026-09-04 11:05:38,604 INFO orchestrator STAGE parameter_freeze: SKIPPED (OK)
+2026-09-04 11:05:38,605 INFO orchestrator STAGE critic: REJECT (costs: сильнейший discovery t=-3.55 <= 2.0 (порог: > 2.0, нужен положительный t), издержки 0.20% кругового оборота; сетка стресса: [0.001, 0.0015, 0.002, 0.003])
+2026-09-04 11:05:38,607 INFO orchestrator Acceptance report: /home/vlad/Документы/построение/data/research/results/acceptance_20260904T080021Z.json (verdict=REJECT)
+/home/vlad/Документы/построение/src/orchestrator.py:185: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  dt = (datetime.utcnow() - t0).total_seconds()
+2026-09-04 11:05:38,607 INFO orchestrator === DONE in 317.1s: verdict=REJECT ===

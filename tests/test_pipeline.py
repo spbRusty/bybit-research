@@ -230,7 +230,8 @@ class TestOOSGate(unittest.TestCase):
 class TestParameterFreeze(unittest.TestCase):
     def test_no_finalist_skips(self):
         r = stage_parameter_freeze({"candidates": []}, {})
-        self.assertTrue(r.passed)
+        self.assertEqual(r.status, StageStatus.SKIPPED)
+        self.assertFalse(r.passed)
         self.assertTrue(r.metrics.get("skipped"))
 
     def test_freeze_roundtrip(self):
@@ -308,6 +309,41 @@ class TestAcceptanceReport(unittest.TestCase):
         stages = [StageResult(stage="x", status=StageStatus.PASS, run_id="r1")]
         report = build_acceptance_report(stages, {"provenance": {"a": 1}}, "r1")
         self.assertEqual(report["provenance"]["a"], 1)
+
+    def test_skipped_does_not_affect_verdict(self):
+        stages = [
+            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
+            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1",
+                        metrics={"skipped": True}),
+            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
+                        errors=["costs fail"]),
+        ]
+        report = build_acceptance_report(stages, {}, "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+        self.assertNotIn("skipped", [s["stage"] for s in report["stages"]
+                                     if s["status"] == "SKIPPED"
+                                     and "skipped" in str(report["reject_reasons"])])
+
+    def test_skipped_only_pass(self):
+        stages = [
+            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
+            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+        ]
+        report = build_acceptance_report(stages, {}, "r1")
+        self.assertEqual(report["verdict"], "PASS")
+
+    def test_no_finalist_reject_from_critic(self):
+        stages = [
+            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
+            StageResult(stage="feature_validation", status=StageStatus.PASS, run_id="r1"),
+            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
+                        errors=["costs: t=-3.55 <= 2.0"]),
+        ]
+        report = build_acceptance_report(stages, {"candidates": [], "finalist": None}, "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+        self.assertEqual(report["finalist"], None)
+        self.assertEqual(report["candidates"], [])
 
 
 def _critic_events(n=200, relative_volume=4.0, is_green=True):

@@ -31,6 +31,7 @@ class StageStatus(str, Enum):
     REJECT = "REJECT"
     STOP = "STOP"
     ERROR = "ERROR"
+    SKIPPED = "SKIPPED"
 
 
 @dataclass
@@ -355,7 +356,7 @@ def stage_parameter_freeze(
     finalist = result.get("finalist")
     if not finalist:
         return StageResult(
-            stage="parameter_freeze", status=StageStatus.PASS, run_id=run_id,
+            stage="parameter_freeze", status=StageStatus.SKIPPED, run_id=run_id,
             config_hash=compute_config_hash(),
             metrics={"skipped": True, "reason": "no finalist"},
         )
@@ -393,6 +394,8 @@ def build_acceptance_report(
     verdict = "PASS"
     reject_reasons = []
     for s in stages:
+        if s.status == StageStatus.SKIPPED:
+            continue
         if not s.passed:
             verdict = s.status.value
             reject_reasons.extend(s.errors)
