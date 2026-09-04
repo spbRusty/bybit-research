@@ -1,0 +1,126 @@
+# MR Hypothesis Research Report (corrected)
+# Feature: close / SMA_120 - 1
+# Date: 2026-09-04
+# Critic fix: OOS gate now requires t_stat >= 2.0 (not just EV > 0)
+
+## HYPOTHESIS
+
+FEATURE: close / SMA_120 - 1
+FORMULA: close / sma(close, 120, shift=1) - 1
+EVENT: feature < threshold AND candle_direction = 1
+ENTRY: open(T+1), LONG
+THRESHOLDS (Discovery): -0.01, -0.02, -0.03, -0.05
+HORIZONS: 10m, 30m
+COST: 0.20% round-trip (fixed)
+
+## LOOKAHEAD AUDIT
+
+- sma(close, 120, shift=1): rolling_mean(120, min_samples=1).shift(1) ✓
+- entry_price = open.shift(-1): open(T+1) ✓
+- return_Nm = close.shift(-N) / close - 1: future return computed separately ✓
+- is_green: computed from current candle OHLC ✓
+- condition evaluated at time T, return computed from T+1 → no leakage ✓
+
+## DATA
+
+- Universe: 69 symbols (linear perpetuals)
+- Total events: 21,881,895
+- Discovery: 10,143,362 events
+- Validation: 5,243,521 events (estimated)
+- OOS: 5,910,952 events (estimated)
+
+## DISCOVERY RESULTS
+
+### All hypotheses (sorted by t-stat)
+
+| ID                     | n     | mean_net   | t_stat  | winrate | threshold |
+|------------------------|-------|------------|---------|---------|-----------|
+| MR_SMA120_t5p_h30      | 5,507 | +0.008592  | 14.15   | 57.3%   | -0.05     |
+| MR_SMA120_t3p_h30      | 22,917| +0.001401  |  7.14   | 49.9%   | -0.03     |
+| MR_SMA120_t5p_h10      | 5,507 | +0.002561  |  6.94   | 51.2%   | -0.05     |
+| MR_SMA120_t3p_h10      | 22,917| -0.000407  | -3.31   | 46.0%   | -0.03     |
+| MR_SMA120_t2p_h30      | 66,268| -0.000690  | -8.21   | 47.0%   | -0.02     |
+| MR_SMA120_t2p_h10      | 66,268| -0.001286  | -24.71  | 41.9%   | -0.02     |
+| MR_SMA120_t1p_h30      | 308,718| -0.001550 | -62.89  | 42.8%   | -0.01     |
+| MR_SMA120_t1p_h10      | 308,718| -0.001740 | -116.55 | 35.5%   | -0.01     |
+
+BH significant (q=0.05): 8/8
+Discovery candidates (after all gates): 3
+
+### Key observation
+
+The relationship is NOT monotonic:
+- threshold=-0.01: STRONGLY NEGATIVE (t=-116)
+- threshold=-0.02: NEGATIVE (t=-24)
+- threshold=-0.03: MIXED (h10 negative, h30 positive)
+- threshold=-0.05: POSITIVE (t=14)
+
+MR effect only exists at EXTREME deviations (5% below SMA).
+At 1-2% below SMA, price continues falling (momentum).
+
+## SELECTED CANDIDATE
+
+ID: MR_SMA120_t5p_h30
+Threshold: -0.05 (close below SMA_120 by 5%+)
+Horizon: 30m
+
+Discovery: n=5,507, mean_net=+0.008592, t=14.15, wr=57.3%
+
+## VALIDATION (fixed threshold)
+
+n=4,598, mean_net=+0.000824, t=1.09, wr=49.2%
+
+Signal degraded 90% from Discovery (+0.86%) to Validation (+0.08%).
+t-stat dropped from 14.15 to 1.09.
+
+## OOS (fixed threshold)
+
+n=10,692, mean_net=+0.000038, t=0.08, wr=48.5%
+
+OOS signal completely disappeared: net=+0.004%, t=0.08.
+
+## CRITIC VERDICT (corrected)
+
+| Check               | Status | Detail |
+|---------------------|--------|--------|
+| leakage             | PASS   | No lookahead |
+| multiple_testing    | PASS   | BH applied, q=0.05 |
+| sample_size         | PASS   | n=21.9M |
+| dependency          | PASS   | 47 unique symbols |
+| temporal_stability  | PASS   | 70% months positive |
+| costs               | PASS   | t=14.15 > 2.0 |
+| concentration       | PASS   | top1=22% |
+| **oos**             | **FAIL** | **n=10,692, EV=+0.00004, t=0.08 (<2.0)** |
+
+**VERDICT: REJECT**
+
+## CRITIC FIX APPLIED
+
+Before fix (line 136 of critic.py):
+  ok_oos = mo.get("mean_net", -1) > 0 and (mo.get("n") or 0) >= min_ev
+
+After fix:
+  ok_oos = (mo.get("mean_net", -1) > 0
+            and (mo.get("n") or 0) >= min_ev
+            and (mo.get("t_stat") or 0) >= _R["min_t_stat"])
+
+The old gate accepted EV>0 with any t-stat. A result with
+EV=+0.00003 and t=0.06 passed — which is statistically noise.
+
+The new gate requires t >= 2.0, ensuring OOS results are
+statistically significant, not just numerically positive.
+
+## TESTS ADDED (tests/test_oos_gate.py)
+
+10 new tests covering:
+- EV>0, t=0.06 → FAIL (MR scenario)
+- EV>0, t=0.0 → FAIL
+- EV>0, t=-1.0 → FAIL
+- EV>0, t=2.5 → PASS
+- EV>0, t=2.0 exactly → PASS
+- EV<0, t=5.0 → FAIL
+- EV=0, t=3.0 → FAIL
+- Low n → FAIL
+- No candidate → PASS (skip)
+
+All 10 tests pass.

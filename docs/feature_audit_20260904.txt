@@ -1,0 +1,389 @@
+АУДИТ FEATURE SPACE — 2026-09-04
+==================================
+
+A. НАЙДЕННЫЕ ПРОБЛЕМЫ В FEATURE CALCULATIONS
+=============================================
+
+1. ДУБЛИРОВАНИЕ ПРИЗНАКОВ (критическое)
+----------------------------------------
+
+| Признак A          | Признак B          | Формула                              | Статус              |
+|--------------------|--------------------|--------------------------------------|---------------------|
+| volume_percentile  | relative_volume_60 | v / median(v, 60)                    | ТОЧНЫЙ ДУБЛИКАТ     |
+| volume_zscore      | volume_anomaly_60  | (v - mean(v,60)) / std(v,60)         | ТОЧНЫЙ ДУБЛИКАТ     |
+| relative_volume    | relative_volume_60 | v / median(v, 60)                    | ТОЧНЫЙ ДУБЛИКАТ     |
+| trend_range_score  | trend_strength     | |SMA20-SMA60| / denominator          | ПОЧТИ ДУБЛИКАТ      |
+| range_regime       | trend_regime       | производные от trend_strength         | ТОЧНЫЙ ДУБЛИКАТ     |
+| atr                | candle_true_range  | mean(TR, 14) vs TR                   | ПРОИЗВОДНЫЕ         |
+| roc_5              | return_5m          | close/close(-5)-1                    | ТОЧНЫЙ ДУБЛИКАТ     |
+| ema_dist_20        | sma_dist_20        | close/EMA20-1 vs close/SMA20-1       | ПОЧТИ ДУБЛИКАТ      |
+
+Влияние: Каждый дубликат увеличивает multiple testing без нового information.
+Если протестировать оба — BH correction будет менее консервативной.
+
+2. ПРОБЛЕМА С short_long_ratio
+-------------------------------
+
+# features_candle.py line 111:
+short_long_ratio = return_5m.clip(-0.2, 0.2) / return_60m.clip(-0.2, 0.2)
+
+Проблема: Деление на return_60m. Если return_60m = 0 → inf/-inf.
+В данных есть inf/-inf значения (проверено: min: -inf, max: inf).
+
+Корректно: Нужно добавить clip или fill_null для нулевых знаменателей.
+
+3. ПРОБЛЕМА С volume_abs_ret_ratio
+-----------------------------------
+
+# features_volume.py line 84:
+volume_abs_ret_ratio = v / ret  # ret = candle_return_1m.abs().clip(1e-12)
+
+Проблема: Если candle_return_1m = 0 (close = open), то ret = 1e-12
+→ volume_abs_ret_ratio = v / 1e-12 → огромное значение.
+
+Корректно: Деление на tiny number создаёт артефакты.
+
+4. ПРОБЛЕМА С consolidation_duration
+--------------------------------------
+
+# features_structure.py line 73:
+consolidation_duration = when((c > rl60 * 1.001) & (c < rh60 * 0.999)).then(1).otherwise(0)
+
+Проблема: Это не длительность, а флаг (0 или 1). Настоящая длительность
+требует cum_sum или group_by. Текущая реализация = бинарный индикатор,
+а не счётчик.
+
+
+B. LOOKAUDIT
+=============
+
+Признаки с ПОЛНЫМ покрытием (100% non-null):
+
+| Признак                | Формула                                           | Lookback | Lookahead? | Корректно? |
+|------------------------|---------------------------------------------------|----------|------------|------------|
+| mean_reversion_score   | dist_rolling_high_120 + dist_rolling_low_120      | 120      | НЕТ        | ✓          |
+| trend_regime           | when(trend_strength > rolling_quantile(0.7, 120)) | 120      | НЕТ        | ✓          |
+| trend_strength         | |SMA20-SMA60| / ATR                               | 60       | НЕТ        | ✓          |
+| trend_range_score      | |SMA20-SMA60| / (rolling_high_60 - rolling_low_60)| 60       | НЕТ        | ✓          |
+| liquidity_regime       | when(volume > median*1.3)                          | 240      | НЕТ        | ✓          |
+| liquidity_stability    | rolling_mean(240) of (v >= median)                | 240      | НЕТ        | ✓          |
+| volume_regime          | when(v > rolling_quantile(0.8, 240))              | 240      | НЕТ        | ✓          |
+| volume_percentile      | v / median(v, 60)                                 | 60       | НЕТ        | ✓          |
+| volume_persistence     | v / rolling_mean(v, 60)                           | 60       | НЕТ        | ✓          |
+| market_breadth_regime  | (breadth > 0).cast(Int8)                          | 60       | НЕТ        | ✓          |
+| relative_strength_btc  | roc_20 - btc_roc_20                               | 21       | НЕТ        | ✓          |
+| relative_strength_eth  | roc_20 - eth_roc_20                               | 21       | НЕТ        | ✓          |
+| residual_return_btc    | r - beta * r_btc                                  | 60       | НЕТ        | ✓          |
+| residual_return_eth    | r - beta * r_eth                                  | 60       | НЕТ        | ✓          |
+| rolling_beta_btc_60    | cov(r, r_btc) / var(r_btc)                        | 60       | НЕТ        | ✓          |
+| rolling_beta_eth_60    | cov(r, r_eth) / var(r_eth)                        | 60       | НЕТ        | ✓          |
+| short_long_ratio       | return_5m / return_60m                            | 61       | НЕТ        | ✓ (но inf) |
+| short_long_mom_ratio   | roc_5 / roc_60                                    | 61       | НЕТ        | ✓          |
+| min_from_funding       | (min_from_day - (hour%8)*60) % 480                | 1        | НЕТ        | ✓          |
+
+Вывод: Все проверенные признаки корректны с точки зрения lookahead.
+Rolling окна используют shift(1), cross-признаки используют только прошлые данные.
+
+Потенциальные проблемы:
+
+1. correlation_regime: when(corr_btc_60.abs() >= 0.5) — порог 0.5 фиксирован
+   в коде, не вычислен на данных. Это хардкод, не leakage.
+
+2. volatility_regime: Пороги (0.1, 0.3, 0.7, 0.9 квантили) вычисляются
+   rolling по 240 свечам. Корректно — нет global statistics.
+
+3. liquidity_regime: Пороги (0.7, 1.3 от медианы) фиксированы в коде.
+   Не leakage.
+
+
+C. REDUNDANT FEATURES
+=======================
+
+Группа 1: Volume (14 признаков → 8 уникальных)
+------------------------------------------------
+Уникальные:                Дубликаты:
+volume                     —
+volume_change              —
+volume_accel               —
+volume_zscore              volume_anomaly_60 (точный)
+volume_percentile          relative_volume_60, relative_volume (точные)
+volume_persistence         —
+volume_range_ratio         —
+volume_abs_ret_ratio       —
+
+Группа 2: Trend (6 признаков → 4 уникальных)
+----------------------------------------------
+Уникальные:                Дубликаты:
+trend_strength             —
+trend_regime               range_regime (точный)
+trend_range_score          — (почти дубликат trend_strength)
+ma_slope_20                —
+
+Группа 3: Cross-sectional (8 признаков → 4 уникальных пар)
+------------------------------------------------------------
+Уникальные:                Дубликаты:
+relative_strength_btc      relative_strength_eth (зеркальные)
+residual_return_btc        residual_return_eth (зеркальные)
+rolling_beta_btc_60        rolling_beta_eth_60 (зеркальные)
+corr_btc_60                corr_eth_60 (зеркальные)
+
+Группа 4: Volatility (8 признаков → 6 уникальных)
+---------------------------------------------------
+Уникальные:                Дубликаты:
+atr                        производный от candle_true_range
+realized_vol_60            —
+vol_compression            —
+vol_expansion              —
+vol_change_60              —
+parkinson_vol_20           —
+
+Группа 5: Candle Structure (15 признаков → 12 уникальных)
+-----------------------------------------------------------
+Уникальные:                Дубликаты:
+candle_return_1m           roc_5 (точный для 5m)
+candle_body                body (алиас)
+candle_range               range (алиас)
+candle_upper_wick          upper_wick (алиас)
+candle_lower_wick          lower_wick (алиас)
+candle_close_pos           —
+candle_direction           —
+candle_gap                 —
+
+
+D. 5 ЛУЧШИХ INTERACTION HYPOTHESES
+====================================
+
+1. Volume Anomaly × Trend Regime
+---------------------------------
+
+Экономический механизм: Объёмная аномалия в трендовом режиме = подтверждение
+тренда. Объёмная аномалия в боковике = potential breakout.
+
+Признаки:
+- volume_zscore > 2.0 (аномалия объёма)
+- trend_regime = "trending" (или "range")
+
+Event: Свеча T, где volume_zscore > 2.0 И trend_regime = "trending"
+
+Направление: Long (если is_green) или short (если ~is_green)
+
+Горизонт: 5m, 10m
+
+Почему отличается: Текущие гипотезы тестируют relative_volume > 3.0 БЕЗ
+условия на режим. Это interaction: объём + контекст.
+
+Параметры для подбора (Discovery):
+- Порог volume_zscore: 1.5, 2.0, 2.5, 3.0
+- Горизонты: 5m, 10m
+
+Зафиксировано до Validation:
+- trend_regime = "trending" (из кода)
+- Направление = по is_green
+
+2. Mean Reversion × Volatility Regime
+---------------------------------------
+
+Экономический механизм: Mean reversion в низковолатильном режиме = потенциальный
+pullback. Mean reversion в высоковолатильном режиме = шум.
+
+Признаки:
+- mean_reversion_score > 0.7 (сильный MR сигнал)
+- volatility_regime = "low" или "very_low"
+
+Event: Свеча T, где mean_reversion_score > 0.7 И volatility_regime ∈ {"low", "very_low"}
+
+Направление: Long (возврат к среднему)
+
+Горизонт: 10m, 30m
+
+Почему отличается: Текущие гипотезы не используют mean_reversion_score вообще.
+Это новый признак в interaction с regime.
+
+Параметры для подбора (Discovery):
+- Порог mean_reversion_score: 0.5, 0.6, 0.7, 0.8
+- Горизонты: 10m, 30m
+
+Зафиксировано до Validation:
+- volatility_regime = "low"/"very_low" (из кода)
+
+3. Cross-Sectional Relative Strength × BTC Trend
+--------------------------------------------------
+
+Экономический механизм: Монета, опережающая рынок в uptrend BTC = сильный
+momentum. Монета, опережающая рынок в downtrend = potential reversal.
+
+Признаки:
+- relative_strength_btc > 0.02 (опережает BTC на 2%+)
+- btc_trend_regime > 0 (BTC в uptrend)
+
+Event: Свеча T, где relative_strength_btc > 0.02 И btc_trend_regime > 0
+
+Направление: Long (momentum continuation)
+
+Горизонт: 5m, 10m
+
+Почему отличается: Текущие гипотезы используют corr_btc_60 > 0.3 (корреляция),
+но НЕ relative_strength_btc (относительная сила). Это другой класс signal.
+
+Параметры для подбора (Discovery):
+- Порог relative_strength_btc: 0.01, 0.02, 0.03
+- Горизонты: 5m, 10m
+
+Зафиксировано до Validation:
+- btc_trend_regime > 0 (из кода)
+
+4. Liquidity Regime × Volume Anomaly
+--------------------------------------
+
+Экономический механизм: Низкая ликвидность + аномальный объём = потенциальный
+liquidity shock. Высокая ликвидность + аномальный объём = нормальный market activity.
+
+Признаки:
+- liquidity_regime = "low" (низкая ликвидность)
+- volume_zscore > 2.0 (аномалия объёма)
+
+Event: Свеча T, где liquidity_regime = "low" И volume_zscore > 2.0
+
+Направление: Short (liquidity shock = давление продавцов)
+
+Горизонт: 5m, 10m
+
+Почему отличается: liquidity_regime никогда не тестировался как condition.
+Это новый признак в interaction.
+
+Параметры для подбора (Discovery):
+- Порог volume_zscore: 1.5, 2.0, 2.5
+- Горизонты: 5m, 10m
+
+Зафиксировано до Validation:
+- liquidity_regime = "low" (из кода)
+
+5. Trend Strength × Mean Reversion Score (Counter-trend)
+----------------------------------------------------------
+
+Экономический механизм: Сильный тренд + extreme mean reversion = potential
+exhaustion. Тренд истощается, mean reversion signal усиливается.
+
+Признаки:
+- trend_strength > 0.8 (сильный тренд)
+- mean_reversion_score < -0.5 (цена далеко от средней)
+
+Event: Свеча T, где trend_strength > 0.8 И mean_reversion_score < -0.5
+
+Направление: Short (exhaustion trade)
+
+Горизонт: 15m, 30m
+
+Почему отличается: Это counter-trend стратегия. Текущие гипотезы все trend-following.
+
+Параметры для подбора (Discovery):
+- Порог trend_strength: 0.6, 0.7, 0.8
+- Порог mean_reversion_score: -0.3, -0.5, -0.7
+- Горизонты: 15m, 30m
+
+Зафиксировано до Validation:
+- Направление = short (exhaustion)
+
+
+E. ОДНА РЕКОМЕНДОВАННАЯ ГИПОТЕЗА
+===================================
+
+HYPOTHESIS: Mean Reversion × Volatility Regime
+
+EVENT: Свеча T, где:
+1. mean_reversion_score > 0.7 (сильный mean reversion сигнал)
+2. volatility_regime ∈ {"low", "very_low"} (низкая волатильность)
+3. candle_direction = 1 (зелёная свеча — подтверждение)
+
+FEATURES:
+- mean_reversion_score = dist_rolling_high_120 + dist_rolling_low_120
+  Formula: (close / rolling_high_120 - 1) + (close / rolling_low_120 - 1)
+  Lookback: 120 минут
+  Availability: полностью на момент T
+
+- volatility_regime = классификация по квантилям realized_vol_60
+  Formula: when(rv60 <= p10).then("very_low")...
+  Lookback: 240 минут
+  Availability: полностью на момент T
+
+- candle_direction = sign(close - open)
+
+EXPECTED MECHANISM: В низковолатильном режиме цена колеблется в узком
+диапазоне. When mean_reversion_score high = цена у нижней границы.
+Зелёная свеча = начало возврата к среднему.
+
+ENTRY: open(T+1)
+
+HORIZONS: 10m, 30m
+
+TARGET: return_{h}m
+
+COST: 0.20% round-trip
+
+DISCOVERY: Подбор порога mean_reversion_score (0.5, 0.6, 0.7, 0.8)
+ТОЛЬКО на discovery периоде (2025-12-25 to 2026-04-30)
+
+VALIDATION: Фиксированный порог, проверка на validation
+(2026-05-01 to 2026-06-30)
+
+OOS: Фиксированный порог, проверка на OOS (2026-07-01 to 2026-09-02)
+
+FAIL CONDITIONS:
+- mean_net ≤ 0 на discovery
+- mean_net ≤ 0 на validation
+- mean_net ≤ 0 на OOS
+- t_stat < 2.0 на любом периоде
+- Не проходит cost stress (0.10/0.15/0.20/0.30%)
+- Не проходит temporal stability (pos_month_share < 60%)
+- Не проходит critic
+
+
+F. ПОЧЕМУ ИМЕННО ОНА
+=======================
+
+1. Новый признак: mean_reversion_score никогда не тестировался в качестве
+   condition. Все 37 предыдущих гипотез использовали только volume/volatility/
+   trend/cross-sectional признаки.
+
+2. Interaction: Не одиночный порог, а комбинация MR score + volatility regime
+   + candle direction. Это 3-условная гипотеза.
+
+3. Regime-conditional: Использует volatility_regime как фильтр. Предыдущие
+   гипотезы не разделяли режимы.
+
+4. Экономический механизм: Mean reversion в low-volatility = well-documented
+   phenomenon в microstructure. Не ad-hoc.
+
+5. Данные: 100% покрытие, нет пропусков, нет inf/-inf.
+
+6. Lookahead: Проверен — все признаки используют shift(1) в rolling окнах.
+
+7. Различие от отвергнутых: Текущие гипотезы = "volume spike → continuation".
+   Эта = "mean reversion + low vol → pullback". Это другой класс edge.
+
+
+G. ЧТО НУЖНО ПРОВЕРЕТЬ ПЕРЕД РЕАЛИЗАЦИЕЙ
+==========================================
+
+1. Redundancy: Убрать дубликаты перед тестом (volume_percentile =
+   relative_volume_60, volume_zscore = volume_anomaly_60, trend_regime =
+   range_regime).
+
+2. short_long_ratio: Исправить inf/-inf (добавить fill_null или clip для
+   нулевых знаменателей).
+
+3. volume_abs_ret_ratio: Проверить артефакты при tiny denominator.
+
+4. consolidation_duration: Исправить с бинарного флага на真正的 duration
+   (cum_sum).
+
+5. Multiple testing: С nouvelles interaction гипотезами количество комбинаций
+   растёт. Нужно:
+   - Ограничить количество interaction hypotheses (макс 10-15)
+   - BH correction должна контролировать FDR
+   - Каждая гипотеза должна иметь одно экономическое обоснование
+
+6. Discovery-only parameter tuning: Убедиться, что пороги для
+   mean_reversion_score подбираются ТОЛЬКО на discovery.
+
+7. Cost model: 0.20% round-trip фиксирован. Не менять.

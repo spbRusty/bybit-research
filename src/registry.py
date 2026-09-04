@@ -1,4 +1,4 @@
-"""Feature Registry (§4) + Provenance (§32).
+"""Feature Registry (§4) + Provenance (§32) + Hypothesis Lifecycle.
 
 Единая система регистрации признаков. Каждый признак имеет строго определённое
 время доступности — информация, ставшая известной после формирования события,
@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from enum import Enum
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -93,3 +96,99 @@ class Provenance:
     def fingerprint(self) -> str:
         raw = json.dumps(self.to_dict(), sort_keys=True)
         return hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+# --------------------------------------------------------------------------
+# Hypothesis Lifecycle
+# --------------------------------------------------------------------------
+
+class HypothesisStatus(str, Enum):
+    CANDIDATE = "CANDIDATE"
+    VALIDATED = "VALIDATED"
+    ACTIVE = "ACTIVE"
+    DEPRECATED = "DEPRECATED"
+    ARCHIVED = "ARCHIVED"
+
+
+class HypothesisLifecycle:
+    VALID_TRANSITIONS = {
+        HypothesisStatus.CANDIDATE: [HypothesisStatus.VALIDATED, HypothesisStatus.DEPRECATED],
+        HypothesisStatus.VALIDATED: [HypothesisStatus.ACTIVE, HypothesisStatus.DEPRECATED],
+        HypothesisStatus.ACTIVE: [HypothesisStatus.DEPRECATED],
+        HypothesisStatus.DEPRECATED: [HypothesisStatus.ARCHIVED],
+        HypothesisStatus.ARCHIVED: [],
+    }
+
+    def __init__(self, registry_path: Path | None = None):
+        self._path = registry_path or (Path(__file__).resolve().parent.parent / "data" / "research" / "registry.json")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._entries: dict[str, dict] = self._load()
+
+    def _load(self) -> dict:
+        if self._path.exists():
+            return json.loads(self._path.read_text())
+        return {}
+
+    def _save(self) -> None:
+        self._path.write_text(json.dumps(self._entries, indent=2, ensure_ascii=False, default=str))
+
+    def transition(self, hypothesis_id: str, new_status: HypothesisStatus, reason: str = "") -> bool:
+        entry = self._entries.get(hypothesis_id)
+        if entry is None:
+            if new_status == HypothesisStatus.CANDIDATE:
+                self.register(hypothesis_id, new_status, {"reason": reason})
+                return True
+            return False
+        current = HypothesisStatus(entry["status"])
+        if new_status not in self.VALID_TRANSITIONS.get(current, []):
+            return False
+        entry["status"] = new_status.value
+        entry["updated_at"] = datetime.utcnow().isoformat()
+        entry["history"].append({
+            "status": new_status.value,
+            "timestamp": datetime.utcnow().isoformat(),
+            "reason": reason,
+        })
+        self._save()
+        return True
+
+    def get_status(self, hypothesis_id: str) -> HypothesisStatus:
+        entry = self._entries.get(hypothesis_id)
+        return HypothesisStatus(entry["status"]) if entry else HypothesisStatus.CANDIDATE
+
+    def get_entry(self, hypothesis_id: str) -> dict | None:
+        return self._entries.get(hypothesis_id)
+
+    def register(self, hypothesis_id: str, initial: HypothesisStatus, metadata: dict | None = None) -> None:
+        now = datetime.utcnow().isoformat()
+        self._entries[hypothesis_id] = {
+            "status": initial.value,
+            "created_at": now,
+            "updated_at": now,
+            "metadata": metadata or {},
+            "history": [{"status": initial.value, "timestamp": now, "reason": "initial"}],
+        }
+        self._save()
+
+    def list_by_status(self, status: HypothesisStatus) -> list[str]:
+        return [hid for hid, e in self._entries.items() if e["status"] == status.value]
+
+    def to_dict(self) -> dict:
+        return dict(self._entries)
+
+
+def compute_config_hash(config_path: Path | None = None) -> str:
+    p = config_path or (Path(__file__).resolve().parent.parent / "config" / "research.toml")
+    return hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+
+
+def get_git_commit(repo_path: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_path or Path(__file__).resolve().parent.parent,
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""

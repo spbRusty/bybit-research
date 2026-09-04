@@ -165,3 +165,37 @@ def load_universe_data(universe: pl.DataFrame) -> dict[tuple[str, str], pl.DataF
         if df is not None:
             out[(row["symbol"], row["category"])] = df
     return out
+
+
+# --------------------------------------------------------------------------
+# Формальная валидация набора данных (pipeline stage)
+# --------------------------------------------------------------------------
+
+def validate_dataset(universe: pl.DataFrame, events: pl.DataFrame,
+                     min_symbols: int = 5, min_events: int = 100) -> dict:
+    """Formal dataset validation for pipeline.
+
+    Returns {ok, errors, warnings, metrics}.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    metrics: dict = {}
+
+    metrics["n_symbols"] = universe.height
+    metrics["n_events"] = events.height
+
+    if universe.height < min_symbols:
+        errors.append(f"Universe too small: {universe.height} < {min_symbols}")
+    if events.height < min_events:
+        errors.append(f"Events too few: {events.height} < {min_events}")
+
+    required = ["open_time", "symbol", "entry_price"]
+    for col in required:
+        if col not in events.columns:
+            errors.append(f"Missing required column: {col}")
+
+    if events.height > 0 and "open_time" in events.columns:
+        metrics["date_min"] = str(events["open_time"].min())
+        metrics["date_max"] = str(events["open_time"].max())
+
+    return {"ok": len(errors) == 0, "errors": errors, "warnings": warnings, "metrics": metrics}

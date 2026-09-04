@@ -21,7 +21,7 @@ _R = load_toml("research.toml")
 # Порядок проверок (фиксированный обходной список)
 CHECKS = [
     "leakage", "multiple_testing", "sample_size", "dependency",
-    "temporal_stability", "costs", "concentration", "oos",
+    "temporal_stability", "costs", "concentration", "validation", "oos",
 ]
 
 
@@ -106,14 +106,18 @@ def review(result: dict, events: pl.DataFrame | None = None) -> CriticVerdict:
     else:
         v.add("temporal_stability", True, "кандидатов нет — оценка не требуется")
 
-    # 5. Издержки
+    # 5. Издержки: t > min_t_stat (строгое сравнение, НЕ abs(t))
+    # Отрицательный t = эффект идёт в обратную сторону → НЕ проходит.
     survival = _R["survival_cost"]
     disc = result.get("discovery_results", [])
     best_t = max((r.get("t_stat") or -99) for r in disc) if disc else -99
     ok_cost = best_t > _R["min_t_stat"]
+    cmp_sym = ">" if ok_cost else "<="
     v.add("costs", ok_cost,
-          f"сильнейший discovery t={best_t:.2f} (>={_R['min_t_stat']}) при издержках "
-          f"{survival:.2%} кругового оборота; сетка стресса: {_R['cost_grid_round_trip']}")
+          f"сильнейший discovery t={best_t:.2f} {cmp_sym} {_R['min_t_stat']} "
+          f"(порог: > {_R['min_t_stat']}, нужен положительный t), "
+          f"издержки {survival:.2%} кругового оборота; "
+          f"сетка стресса: {_R['cost_grid_round_trip']}")
 
     # 6. Концентрация (реальная, по кандидату)
     cid = fin["hypothesis_id"] if fin else None
@@ -130,14 +134,33 @@ def review(result: dict, events: pl.DataFrame | None = None) -> CriticVerdict:
     else:
         v.add("concentration", True, "нет кандидата")
 
-    # 7. OOS
+    # 7. Validation: mean_net > 0 AND n >= min_events AND t_stat >= min_t_stat
+    if fin and fin["hypothesis_id"] in result.get("validation", {}):
+        mv = result["validation"][fin["hypothesis_id"]]
+        t_val = mv.get("t_stat") or 0
+        ok_val = (mv.get("mean_net", -1) > 0
+                  and (mv.get("n") or 0) >= min_ev
+                  and t_val >= _R["min_t_stat"])
+        cmp_v = ">=" if ok_val else "<"
+        v.add("validation", ok_val,
+              f"Validation: n={mv.get('n')}, EV={mv.get('mean_net', float('nan')):+.5f}, "
+              f"t={t_val:.2f} {cmp_v} {_R['min_t_stat']}, "
+              f"{'прошёл' if ok_val else 'НЕ ПРОШЁЛ'}")
+    else:
+        v.add("validation", True, "нет кандидата — проверка не требуется")
+
+    # 8. OOS: mean_net > 0 AND n >= min_events AND t_stat >= min_t_stat
     if fin and fin["hypothesis_id"] in result.get("oos", {}):
         mo = result["oos"][fin["hypothesis_id"]]
-        ok_oos = mo.get("mean_net", -1) > 0 and (mo.get("n") or 0) >= min_ev
+        t_oos = mo.get("t_stat") or 0
+        ok_oos = (mo.get("mean_net", -1) > 0
+                  and (mo.get("n") or 0) >= min_ev
+                  and t_oos >= _R["min_t_stat"])
+        cmp_o = ">=" if ok_oos else "<"
         v.add("oos", ok_oos,
               f"OOS: n={mo.get('n')}, EV={mo.get('mean_net', float('nan')):+.5f}, "
-              f"t={mo.get('t_stat', float('nan')):.2f} "
-              f"({'прошёл' if ok_oos else 'НЕ ПРОШЁЛ'})")
+              f"t={t_oos:.2f} {cmp_o} {_R['min_t_stat']}, "
+              f"{'прошёл' if ok_oos else 'НЕ ПРОШЁЛ'}")
     else:
         v.add("oos", True, "нет кандидата — проверка не требуется")
 
