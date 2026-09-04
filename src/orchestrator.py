@@ -1,6 +1,6 @@
 """Unified orchestrator — single command runs full pipeline with structured stages.
 
-Wraps src.main.py flow with StageResult at every step, producing
+Runs the complete research pipeline with StageResult at every step, producing
 machine-readable acceptance reports.
 
 Usage:
@@ -12,7 +12,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
@@ -63,7 +63,7 @@ def _log_stage(s: StageResult) -> None:
 def run_pipeline(limit: int | None = None, category: str | None = None,
                  mr_control: bool = False) -> dict:
     """Full pipeline with structured stage results. Returns acceptance report."""
-    t0 = datetime.utcnow()
+    t0 = datetime.now(tz=timezone.utc)
     run_id = t0.strftime("%Y%m%dT%H%M%SZ")
     stages: list[StageResult] = []
 
@@ -197,7 +197,7 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     logger.info("Acceptance report: %s (verdict=%s)", report_path,
                 report["verdict"])
 
-    dt = (datetime.utcnow() - t0).total_seconds()
+    dt = (datetime.now(tz=timezone.utc) - t0).total_seconds()
     logger.info("=== DONE in %.1fs: verdict=%s ===", dt, report["verdict"])
     return report
 

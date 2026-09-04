@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import polars as pl
@@ -140,7 +140,7 @@ def paper_run(events: pl.DataFrame, finalist: dict) -> dict:
     save_state(state)
     path = None
     if trades:
-        path = PAPER_TRADES / f"paper_{datetime.utcnow():%Y%m%dT%H%M%SZ}.parquet"
+        path = PAPER_TRADES / f"paper_{datetime.now(tz=timezone.utc):%Y%m%dT%H%M%SZ}.parquet"
         pl.DataFrame(trades).write_parquet(path)
 
     net = np.array([t["net_pnl"] for t in trades], dtype=float) if trades else np.array([])

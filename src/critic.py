@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import polars as pl
@@ -214,11 +214,11 @@ def _concentration(events: pl.DataFrame, finalist: dict, cost: float) -> dict:
 
 def save_report(result: dict, verdict: CriticVerdict, paper_report: dict | None = None) -> str:
     """Отчёт (ТЗ §23): machine-readable JSON + человекочитаемый md."""
-    rid = f"critic_{datetime.utcnow():%Y%m%dT%H%M%SZ}"
+    rid = f"critic_{datetime.now(tz=timezone.utc):%Y%m%dT%H%M%SZ}"
     fin = result.get("finalist") or {}
     lines = [
         "# Отчёт Critic",
-        f"Дата: {datetime.utcnow():%Y-%m-%d %H:%M} UTC",
+        f"Дата: {datetime.now(tz=timezone.utc):%Y-%m-%d %H:%M} UTC",
         f"Вердикт: **{('ПРОШЁЛ' if verdict.passed else 'ОТКЛОНЁН')}**",
         f"Причина (если отклонён): {verdict.fail_reason or '—'}",
         "",
@@ -254,7 +254,7 @@ def save_report(result: dict, verdict: CriticVerdict, paper_report: dict | None 
 
 
 def save_verdict_json(result: dict, verdict: CriticVerdict) -> str:
-    rid = f"critic_{datetime.utcnow():%Y%m%dT%H%M%SZ}"
+    rid = f"critic_{datetime.now(tz=timezone.utc):%Y%m%dT%H%M%SZ}"
     path = REPORTS_DIR / f"{rid}.json"
     path.write_text(json.dumps({"result": result, "critic": verdict.to_dict()},
                                indent=2, ensure_ascii=False, default=str))

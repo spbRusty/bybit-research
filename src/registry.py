@@ -10,7 +10,7 @@ import hashlib
 import json
 import subprocess
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -86,7 +86,7 @@ class Provenance:
     dataset_period: tuple[str, str] = ("", "")
     cost_assumptions: list[float] = field(default_factory=list)
     random_seed: int = 42
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(tz=timezone.utc).isoformat())
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -143,10 +143,10 @@ class HypothesisLifecycle:
         if new_status not in self.VALID_TRANSITIONS.get(current, []):
             return False
         entry["status"] = new_status.value
-        entry["updated_at"] = datetime.utcnow().isoformat()
+        entry["updated_at"] = datetime.now(tz=timezone.utc).isoformat()
         entry["history"].append({
             "status": new_status.value,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "reason": reason,
         })
         self._save()
@@ -160,7 +160,7 @@ class HypothesisLifecycle:
         return self._entries.get(hypothesis_id)
 
     def register(self, hypothesis_id: str, initial: HypothesisStatus, metadata: dict | None = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(tz=timezone.utc).isoformat()
         self._entries[hypothesis_id] = {
             "status": initial.value,
             "created_at": now,

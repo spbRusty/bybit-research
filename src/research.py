@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import polars as pl
@@ -44,7 +44,7 @@ class Hypothesis:
     mae_column: str = None   # колонка MAE для SL (по умолчанию mae_{h}m)
     version: str = "1.0"
     status: str = "CANDIDATE"
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(tz=timezone.utc).isoformat())
 
     def __post_init__(self):
         if self.target_column is None:
@@ -198,7 +198,7 @@ def run_research(events: pl.DataFrame,
         random_seed=42,
     )
     out = {
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
         "provenance": p.to_dict(),
         "q_bh": q, "cost_survival": cost_survival, "n_hypotheses": len(hypotheses),
         "n_events_total": events.height,
@@ -220,7 +220,7 @@ def run_research(events: pl.DataFrame,
 
 
 def save_result(result: dict) -> str:
-    rid = f"research_{datetime.utcnow():%Y%m%dT%H%M%SZ}"
+    rid = f"research_{datetime.now(tz=timezone.utc):%Y%m%dT%H%M%SZ}"
     (RESULTS_DIR / f"{rid}.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
     (HYPOTHESES_DIR / "hypotheses_v1.json").write_text(
         json.dumps([h.to_record() for h in HYPOTHESES], indent=2, ensure_ascii=False))

@@ -14,7 +14,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -72,7 +72,7 @@ def compute_config_hash(config_path: Path | None = None) -> str:
 
 
 def _make_run_id() -> str:
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 # --------------------------------------------------------------------------
@@ -400,11 +400,17 @@ def build_acceptance_report(
             verdict = s.status.value
             reject_reasons.extend(s.errors)
 
+    has_finalist = bool(result.get("finalist"))
+    has_candidates = bool(result.get("candidates"))
+
+    if verdict == "PASS" and not has_finalist:
+        verdict = "NO_CANDIDATE"
+
     return {
         "run_id": run_id,
-        "timestamp": datetime.utcnow().isoformat(),
-        "verdict": verdict,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "config_hash": compute_config_hash(),
+        "verdict": verdict,
         "provenance": result.get("provenance", {}),
         "stages": [s.to_dict() for s in stages],
         "candidates": result.get("candidates", []),
