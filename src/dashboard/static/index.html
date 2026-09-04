@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bybit Research Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--purple:#bc8cff}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);padding:16px;line-height:1.4}
+h1{font-size:18px;margin-bottom:12px;color:var(--blue)}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:12px;min-height:120px}
+.card.wide{grid-column:span 2}
+.status-ok{color:var(--green)}.status-warn{color:var(--yellow)}.status-err{color:var(--red)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)}
+th{color:var(--dim);font-weight:600}
+.mono{font-family:'SFMono-Regular',Consolas,monospace;font-size:11px}
+.big{font-size:28px;font-weight:700;color:var(--text)}
+.sub{font-size:12px;color:var(--dim)}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600}
+.tag-pass{background:#238636;color:#fff}.tag-reject{background:#da3633;color:#fff}.tag-skip{background:#6e7681;color:#fff}.tag-stop{background:#d29922;color:#000}
+.log-box{background:#0d1117;border:1px solid var(--border);border-radius:4px;padding:8px;max-height:240px;overflow-y:auto;font-family:monospace;font-size:11px;color:var(--dim);white-space:pre-wrap;word-break:break-all}
+#status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+#status-dot.ok{background:var(--green)}.stale{background:var(--red)}
+.refresh{font-size:11px;color:var(--dim);margin-bottom:12px}
+</style>
+</head>
+<body>
+<h1><span id="status-dot" class="ok"></span>Bybit Research Dashboard</h1>
+<div class="refresh">Auto-refresh: <span id="timer">5</span>s | Last: <span id="last-update">—</span></div>
+
+<!-- Panel 1: System Status -->
+<div class="grid">
+<div class="card" id="p-system">
+<h2>System Status</h2>
+<div id="system-content">Loading...</div>
+</div>
+
+<!-- Panel 2: Data Download -->
+<div class="card" id="p-data">
+<h2>Data Download</h2>
+<div id="data-content">Loading...</div>
+</div>
+
+<!-- Panel 3: Market Metrics -->
+<div class="card" id="p-market">
+<h2>Market Metrics</h2>
+<div id="market-content">Loading...</div>
+</div>
+
+<!-- Panel 4: Signals -->
+<div class="card" id="p-signals">
+<h2>Signals</h2>
+<div id="signals-content">Loading...</div>
+</div>
+</div>
+
+<!-- Panel 5: Hypotheses & Research -->
+<div class="card wide" id="p-hyp">
+<h2>Hypotheses &amp; Research</h2>
+<div id="hyp-content">Loading...</div>
+</div>
+
+<!-- Panel 6: Paper Trading -->
+<div class="grid">
+<div class="card" id="p-paper">
+<h2>Paper Trading</h2>
+<div id="paper-content">Loading...</div>
+</div>
+
+<!-- Panel 7: Logs -->
+<div class="card" id="p-logs">
+<h2>Logs</h2>
+<div id="log-content" class="log-box">Loading...</div>
+</div>
+</div>
+
+<script>
+const API = '/api';
+const POLL = 5000;
+let countdown = 5;
+let sseActive = false;
+
+function fmt(ts) {
+  if (!ts) return '—';
+  try { return new Date(ts).toLocaleString(); } catch { return ts; }
+}
+function age(s) {
+  if (s === Infinity || s === null) return '—';
+  if (s < 60) return Math.round(s) + 's ago';
+  if (s < 3600) return Math.round(s/60) + 'm ago';
+  return Math.round(s/3600) + 'h ago';
+}
+function staleClass(s) { return s > 300 ? 'status-err' : s > 60 ? 'status-warn' : 'status-ok'; }
+function tagHTML(v) {
+  if (!v) return '';
+  const cls = v === 'PASS' ? 'tag-pass' : v === 'REJECT' ? 'tag-reject' : v === 'STOP' ? 'tag-stop' : 'tag-skip';
+  return `<span class="tag ${cls}">${v}</span>`;
+}
+
+async function fetchJSON(path) {
+  try { const r = await fetch(API + path); return r.ok ? await r.json() : null; }
+  catch { return null; }
+}
+
+async function renderSystem() {
+  const d = await fetchJSON('/status');
+  if (!d) { document.getElementById('system-content').innerHTML = '<span class="status-err">Error</span>'; return; }
+  let html = '<table>';
+  for (const [name, info] of Object.entries(d.logs)) {
+    const cls = info.stale ? 'status-err' : 'status-ok';
+    html += `<tr><td>${name}</td><td class="${cls}">${info.exists ? age(info.age_s) : 'missing'}</td></tr>`;
+  }
+  html += '</table>';
+  document.getElementById('system-content').innerHTML = html;
+  // overall status
+  const anyStale = Object.values(d.logs).some(l => l.stale);
+  document.getElementById('status-dot').className = anyStale ? 'stale' : 'ok';
+}
+
+async function renderData() {
+  const d = await fetchJSON('/data');
+  if (!d) { document.getElementById('data-content').innerHTML = '<span class="status-err">Error</span>'; return; }
+  let html = `<div class="big">${d.total_klines_files}</div><div class="sub">kline files, ${d.total_size_mb} MB</div>`;
+  html += '<table><tr><th>Category</th><th>Files</th><th>Size</th></tr>';
+  for (const [cat, info] of Object.entries(d.klines)) {
+    html += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td></tr>`;
+  }
+  html += '</table>';
+  if (Object.keys(d.collector).length) {
+    html += '<table><tr><th>Collector Stream</th><th>Files</th></tr>';
+    for (const [s, n] of Object.entries(d.collector)) {
+      html += `<tr><td>${s}</td><td>${n}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  document.getElementById('data-content').innerHTML = html;
+}
+
+async function renderMarket() {
+  const d = await fetchJSON('/market');
+  if (!d) { document.getElementById('market-content').innerHTML = '<span class="status-err">Error</span>'; return; }
+  let html = '';
+  if (d.summary) {
+    html += '<table>';
+    if (d.summary.symbols_count !== undefined) html += `<tr><td>Symbols</td><td>${d.summary.symbols_count}</td></tr>`;
+    if (d.summary.avg_funding_rate !== null && d.summary.avg_funding_rate !== undefined) html += `<tr><td>Avg Funding</td><td class="${d.summary.avg_funding_rate > 0 ? 'status-ok' : 'status-err'}">${(d.summary.avg_funding_rate * 100).toFixed(4)}%</td></tr>`;
+    if (d.summary.total_oi_usd) html += `<tr><td>Total OI</td><td>$${(d.summary.total_oi_usd / 1e6).toFixed(0)}M</td></tr>`;
+    html += '</table>';
+  }
+  if (d.symbols && d.symbols.length) {
+    html += '<table><tr><th>Symbol</th><th>Funding</th><th>OI ($M)</th></tr>';
+    for (const s of d.symbols.slice(0, 10)) {
+      const fr = s.funding_rate !== null ? (s.funding_rate * 100).toFixed(4) + '%' : '—';
+      const oi = s.oi_value ? '$' + (s.oi_value / 1e6).toFixed(1) : '—';
+      html += `<tr><td class="mono">${s.symbol}</td><td>${fr}</td><td>${oi}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  document.getElementById('market-content').innerHTML = html || '<span class="sub">No market data</span>';
+}
+
+async function renderSignals() {
+  const d = await fetchJSON('/signals');
+  if (!d) { document.getElementById('signals-content').innerHTML = '<span class="status-err">Error</span>'; return; }
+  let html = `<div class="big">${d.count.toLocaleString()}</div><div class="sub">total events</div>`;
+  if (d.symbols && d.symbols.length) {
+    html += '<table><tr><th>Symbol</th><th>Events</th></tr>';
+    for (const s of d.symbols.slice(0, 8)) {
+      html += `<tr><td class="mono">${s.symbol}</td><td>${s.count.toLocaleString()}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  document.getElementById('signals-content').innerHTML = html;
+}
+
+async function renderHypotheses() {
+  const d = await fetchJSON('/hypotheses');
+  if (!d) { document.getElementById('hyp-content').innerHTML = '<span class="status-err">Error</span>'; return; }
+  let html = `<div class="big">${d.count}</div><div class="sub">hypotheses</div>`;
+  // Acceptance report
+  if (d.acceptance) {
+    const a = d.acceptance;
+    html += `<div style="margin-top:8px">Verdict: ${tagHTML(a.verdict)} <span class="sub">(${fmt(a.timestamp)})</span></div>`;
+    if (a.stages && a.stages.length) {
+      html += '<table><tr><th>Stage</th><th>Status</th><th>Metric</th></tr>';
+      for (const s of a.stages) {
+        const m = s.metrics || {};
+        const metricStr = m.n_events ? `${m.n_events.toLocaleString()} events, ${m.n_symbols || 0} symbols` : '';
+        html += `<tr><td>${s.stage}</td><td>${tagHTML(s.status)}</td><td class="sub">${metricStr}</td></tr>`;
+      }
+      html += '</table>';
+    }
+  }
+  // Research runs
+  if (d.research_runs && d.research_runs.length) {
+    html += '<div style="margin-top:8px"><table><tr><th>Run</th><th>Hyps</th><th>Cands</th><th>Best</th><th>t</th></tr>';
+    for (const r of d.research_runs.slice(0, 5)) {
+      const t = r.best_t_stat !== null && r.best_t_stat !== undefined ? r.best_t_stat.toFixed(2) : '—';
+      html += `<tr><td class="mono">${(r.run_id || '').slice(0, 15)}</td><td>${r.n_hypotheses || '—'}</td><td>${r.n_candidates || 0}</td><td>${r.best_hypothesis || '—'}</td><td>${t}</td></tr>`;
+    }
+    html += '</table></div>';
+  }
+  document.getElementById('hyp-content').innerHTML = html;
+}
+
+async function renderPaper() {
+  const d = await fetchJSON('/paper');
+  if (!d) { document.getElementById('paper-content').innerHTML = '<span class="status-err">Error</span>'; return; }
+  const s = d.state || {};
+  if (!s.balance) {
+    document.getElementById('paper-content').innerHTML = '<span class="sub">No paper trading data yet</span>';
+    return;
+  }
+  let html = '<table>';
+  html += `<tr><td>Balance</td><td class="big">$${(s.balance || 0).toFixed(2)}</td></tr>`;
+  html += `<tr><td>PnL</td><td class="${(s.realized_pnl||0) >= 0 ? 'status-ok' : 'status-err'}">${(s.realized_pnl||0) >= 0 ? '+' : ''}$${(s.realized_pnl||0).toFixed(2)}</td></tr>`;
+  html += `<tr><td>Win Rate</td><td>${((s.win_rate||0)*100).toFixed(1)}%</td></tr>`;
+  html += `<tr><td>Trades</td><td>${s.trade_count||0}</td></tr>`;
+  html += `<tr><td>Max DD</td><td class="status-err">${((s.max_drawdown||0)*100).toFixed(2)}%</td></tr>`;
+  html += `<tr><td>Open Positions</td><td>${(s.open_positions||[]).length}</td></tr>`;
+  html += '</table>';
+  document.getElementById('paper-content').innerHTML = html;
+}
+
+function renderLogs(data) {
+  if (!data) return;
+  const box = document.getElementById('log-content');
+  const lines = (data.orchestrator || []).slice(-30);
+  box.textContent = lines.join('\n') || 'No logs';
+  box.scrollTop = box.scrollHeight;
+}
+
+async function renderLogsPoll() {
+  const d = await fetchJSON('/logs?n=30');
+  if (d) renderLogs(d);
+}
+
+function startSSE() {
+  if (sseActive) return;
+  try {
+    const es = new EventSource(API + '/stream');
+    es.onmessage = (e) => {
+      try {
+        const obj = JSON.parse(e.data);
+        const box = document.getElementById('log-content');
+        box.textContent += '\n' + obj.line;
+        box.scrollTop = box.scrollHeight;
+      } catch {}
+    };
+    es.onerror = () => { sseActive = false; es.close(); };
+    sseActive = true;
+  } catch {
+    // fallback: polling
+  }
+}
+
+async function refreshAll() {
+  await Promise.all([
+    renderSystem(), renderData(), renderMarket(),
+    renderSignals(), renderHypotheses(), renderPaper(), renderLogsPoll()
+  ]);
+  document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+  countdown = 5;
+}
+
+// Countdown + auto-refresh
+setInterval(() => {
+  countdown--;
+  document.getElementById('timer').textContent = countdown;
+  if (countdown <= 0) refreshAll();
+}, 1000);
+
+// Init
+refreshAll();
+startSSE();
+</script>
+</body>
+</html>
