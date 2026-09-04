@@ -33,29 +33,26 @@ th{color:var(--dim);font-weight:600}
 <div class="refresh">Auto-refresh: <span id="timer">3</span>s | Last: <span id="last-update">—</span></div>
 
 <div class="grid">
-<div class="card" id="p-system"><h2>System Status</h2><div id="system-content">Loading...</div></div>
-<div class="card" id="p-data"><h2>Data Download</h2><div id="data-content">Loading...</div></div>
-<div class="card" id="p-market"><h2>Market Metrics</h2><div id="market-content">Loading...</div></div>
-<div class="card" id="p-signals"><h2>Signals</h2><div id="signals-content">Loading...</div></div>
+<div class="card"><h2>System Status</h2><div id="system-content">Loading...</div></div>
+<div class="card"><h2>Data Download</h2><div id="data-content">Loading...</div></div>
+<div class="card"><h2>Market Metrics</h2><div id="market-content">Loading...</div></div>
+<div class="card"><h2>Signals</h2><div id="signals-content">Loading...</div></div>
 </div>
-
-<div class="card wide" id="p-hyp"><h2>Hypotheses &amp; Research</h2><div id="hyp-content">Loading...</div></div>
-
+<div class="card wide"><h2>Hypotheses &amp; Research</h2><div id="hyp-content">Loading...</div></div>
 <div class="grid">
-<div class="card" id="p-paper"><h2>Paper Trading</h2><div id="paper-content">Loading...</div></div>
-<div class="card" id="p-logs"><h2>Logs</h2><div id="log-content" class="log-box">Loading...</div></div>
+<div class="card"><h2>Paper Trading</h2><div id="paper-content">Loading...</div></div>
+<div class="card"><h2>Logs</h2><div id="log-content" class="log-box">Loading...</div></div>
 </div>
 
 <script>
 const API = '/api';
 let countdown = 3;
 let sseActive = false;
-const _h = {};
-const _logLines = [];
+const _prev = {};
 
-function setPanel(id, html) {
-  if (_h[id] === html) return;
-  _h[id] = html;
+function setIfChanged(id, html) {
+  if (_prev[id] === html) return;
+  _prev[id] = html;
   document.getElementById(id).innerHTML = html;
 }
 
@@ -74,7 +71,6 @@ function tagHTML(v) {
   const cls = v === 'PASS' ? 'tag-pass' : v === 'REJECT' ? 'tag-reject' : v === 'STOP' ? 'tag-stop' : 'tag-skip';
   return `<span class="tag ${cls}">${v}</span>`;
 }
-
 async function fetchJSON(path) {
   try { const r = await fetch(API + path); return r.ok ? await r.json() : null; }
   catch { return null; }
@@ -82,38 +78,36 @@ async function fetchJSON(path) {
 
 async function renderSystem() {
   const d = await fetchJSON('/status');
-  if (!d) { setPanel('system-content', '<span class="status-err">Error</span>'); return; }
+  if (!d) return;
   let html = '<table>';
   for (const [name, info] of Object.entries(d.logs)) {
     const cls = info.stale ? 'status-err' : 'status-ok';
     html += `<tr><td>${name}</td><td class="${cls}">${info.exists ? age(info.age_s) : 'missing'}</td></tr>`;
   }
-  html += '</table>';
-  setPanel('system-content', html);
-  const anyStale = Object.values(d.logs).some(l => l.stale);
-  document.getElementById('status-dot').className = anyStale ? 'stale' : 'ok';
+  setIfChanged('system-content', html + '</table>');
+  document.getElementById('status-dot').className = Object.values(d.logs).some(l => l.stale) ? 'stale' : 'ok';
 }
 
 async function renderData() {
   const d = await fetchJSON('/data');
-  if (!d) { setPanel('data-content', '<span class="status-err">Error</span>'); return; }
+  if (!d) return;
   let html = `<div class="big">${d.total_klines_files}</div><div class="sub">kline files, ${d.total_size_mb} MB</div>`;
   html += '<table><tr><th>Category</th><th>Files</th><th>Size</th></tr>';
   for (const [cat, info] of Object.entries(d.klines))
     html += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td></tr>`;
   html += '</table>';
   if (Object.keys(d.collector).length) {
-    html += '<table><tr><th>Collector Stream</th><th>Files</th></tr>';
+    html += '<table><tr><th>Collector</th><th>Files</th></tr>';
     for (const [s, n] of Object.entries(d.collector))
       html += `<tr><td>${s}</td><td>${n}</td></tr>`;
     html += '</table>';
   }
-  setPanel('data-content', html);
+  setIfChanged('data-content', html);
 }
 
 async function renderMarket() {
   const d = await fetchJSON('/market');
-  if (!d) { setPanel('market-content', '<span class="status-err">Error</span>'); return; }
+  if (!d) return;
   let html = '';
   if (d.summary) {
     html += '<table>';
@@ -131,12 +125,12 @@ async function renderMarket() {
     }
     html += '</table>';
   }
-  setPanel('market-content', html || '<span class="sub">No market data</span>');
+  setIfChanged('market-content', html || '<span class="sub">No market data</span>');
 }
 
 async function renderSignals() {
   const d = await fetchJSON('/signals');
-  if (!d) { setPanel('signals-content', '<span class="status-err">Error</span>'); return; }
+  if (!d) return;
   let html = `<div class="big">${d.count.toLocaleString()}</div><div class="sub">total events</div>`;
   if (d.symbols && d.symbols.length) {
     html += '<table><tr><th>Symbol</th><th>Events</th></tr>';
@@ -144,12 +138,12 @@ async function renderSignals() {
       html += `<tr><td class="mono">${s.symbol}</td><td>${s.count.toLocaleString()}</td></tr>`;
     html += '</table>';
   }
-  setPanel('signals-content', html);
+  setIfChanged('signals-content', html);
 }
 
 async function renderHypotheses() {
   const d = await fetchJSON('/hypotheses');
-  if (!d) { setPanel('hyp-content', '<span class="status-err">Error</span>'); return; }
+  if (!d) return;
   let html = `<div class="big">${d.count}</div><div class="sub">hypotheses</div>`;
   if (d.acceptance) {
     const a = d.acceptance;
@@ -172,14 +166,14 @@ async function renderHypotheses() {
     }
     html += '</table></div>';
   }
-  setPanel('hyp-content', html);
+  setIfChanged('hyp-content', html);
 }
 
 async function renderPaper() {
   const d = await fetchJSON('/paper');
-  if (!d) { setPanel('paper-content', '<span class="status-err">Error</span>'); return; }
+  if (!d) return;
   const s = d.state || {};
-  if (!s.balance) { setPanel('paper-content', '<span class="sub">No paper trading data yet</span>'); return; }
+  if (!s.balance) { setIfChanged('paper-content', '<span class="sub">No paper trading data yet</span>'); return; }
   let html = '<table>';
   html += `<tr><td>Balance</td><td class="big">$${(s.balance || 0).toFixed(2)}</td></tr>`;
   html += `<tr><td>PnL</td><td class="${(s.realized_pnl||0) >= 0 ? 'status-ok' : 'status-err'}">${(s.realized_pnl||0) >= 0 ? '+' : ''}$${(s.realized_pnl||0).toFixed(2)}</td></tr>`;
@@ -187,24 +181,14 @@ async function renderPaper() {
   html += `<tr><td>Trades</td><td>${s.trade_count||0}</td></tr>`;
   html += `<tr><td>Max DD</td><td class="status-err">${((s.max_drawdown||0)*100).toFixed(2)}%</td></tr>`;
   html += `<tr><td>Open Positions</td><td>${(s.open_positions||[]).length}</td></tr>`;
-  html += '</table>';
-  setPanel('paper-content', html);
-}
-
-function renderLogs(data) {
-  if (!data) return;
-  const box = document.getElementById('log-content');
-  const incoming = (data.orchestrator || []).slice(-30);
-  const joined = incoming.join('\n');
-  if (_h['_log'] === joined) return;
-  _h['_log'] = joined;
-  box.textContent = joined || 'No logs';
-  box.scrollTop = box.scrollHeight;
+  setIfChanged('paper-content', html + '</table>');
 }
 
 async function renderLogsPoll() {
   const d = await fetchJSON('/logs?n=30');
-  if (d) renderLogs(d);
+  if (!d) return;
+  const text = (d.orchestrator || []).slice(-30).join('\n') || 'No logs';
+  setIfChanged('log-content', text);
 }
 
 function startSSE() {
@@ -214,15 +198,10 @@ function startSSE() {
     es.onmessage = (e) => {
       try {
         const obj = JSON.parse(e.data);
+        if (!obj.line) return;
         const box = document.getElementById('log-content');
-        const line = obj.line;
-        if (!line) return;
-        _logLines.push(line);
-        if (_logLines.length > 200) _logLines.splice(0, _logLines.length - 200);
-        const text = _logLines.slice(-30).join('\n');
-        if (_h['_log'] === text) return;
-        _h['_log'] = text;
-        box.textContent = text;
+        const lines = (box.textContent + '\n' + obj.line).split('\n').slice(-50);
+        box.textContent = lines.join('\n');
         box.scrollTop = box.scrollHeight;
       } catch {}
     };

@@ -24,6 +24,18 @@ from config.settings import (
 
 STALE_THRESHOLD_S = 300  # 5 minutes — no update = stale
 
+_cache: dict[str, tuple[float, dict]] = {}
+_CACHE_TTL = 30  # seconds
+
+
+def _cached(key: str, ttl: int, fn):
+    now = time.time()
+    if key in _cache and now - _cache[key][0] < ttl:
+        return _cache[key][1]
+    result = fn()
+    _cache[key] = (now, result)
+    return result
+
 
 def _safe(v):
     """Convert non-JSON-serializable values (datetime, Timestamp) to str."""
@@ -165,80 +177,72 @@ def get_data_status() -> dict:
 # ─── 3. Market Metrics ─────────────────────────────────────────────
 
 def get_market_metrics() -> dict:
-    """Read latest futures data: funding, OI, bid-ask for top symbols."""
-    futures_dir = MARKET_DATA_DIR / "futures" / "linear"
-    if not futures_dir.exists():
-        return {"symbols": [], "summary": {}}
+    def _load():
+        futures_dir = MARKET_DATA_DIR / "futures" / "linear"
+        if not futures_dir.exists():
+            return {"symbols": [], "summary": {}}
 
-    files = sorted(futures_dir.glob("*.parquet"))
-    rows = []
-    for f in files[:50]:  # limit to 50 for speed
-        try:
-            df = pl.read_parquet(f)
-            if df.height == 0:
+        files = sorted(futures_dir.glob("*.parquet"))
+        rows = []
+        for f in files[:50]:
+            try:
+                df = pl.read_parquet(f)
+                if df.height == 0:
+                    continue
+                last = _sanitize(df.tail(1).to_dicts()[0])
+                sym = f.stem
+                rows.append({
+                    "symbol": sym,
+                    "funding_rate": last.get("funding_rate"),
+                    "oi": last.get("oi"),
+                    "oi_value": last.get("oi_value"),
+                    "last_px": last.get("last_px"),
+                    "mark_px": last.get("mark_px"),
+                    "bid1_px": last.get("bid1_px"),
+                    "ask1_px": last.get("ask1_px"),
+                    "bid1_sz": last.get("bid1_sz"),
+                    "ask1_sz": last.get("ask1_sz"),
+                })
+            except Exception:
                 continue
-            last = _sanitize(df.tail(1).to_dicts()[0])
-            sym = f.stem
-            rows.append({
-                "symbol": sym,
-                "funding_rate": last.get("funding_rate"),
-                "oi": last.get("oi"),
-                "oi_value": last.get("oi_value"),
-                "last_px": last.get("last_px"),
-                "mark_px": last.get("mark_px"),
-                "bid1_px": last.get("bid1_px"),
-                "ask1_px": last.get("ask1_px"),
-                "bid1_sz": last.get("bid1_sz"),
-                "ask1_sz": last.get("ask1_sz"),
-            })
-        except Exception:
-            continue
 
-    # Summary: avg funding, total OI
-    if rows:
-        funding_vals = [r["funding_rate"] for r in rows if r["funding_rate"] is not None]
-        oi_vals = [r["oi_value"] for r in rows if r["oi_value"] is not None]
-        summary = {
-            "symbols_count": len(rows),
-            "avg_funding_rate": round(sum(funding_vals) / len(funding_vals), 6) if funding_vals else None,
-            "total_oi_usd": round(sum(oi_vals), 0) if oi_vals else None,
-        }
-    else:
-        summary = {}
+        if rows:
+            funding_vals = [r["funding_rate"] for r in rows if r["funding_rate"] is not None]
+            oi_vals = [r["oi_value"] for r in rows if r["oi_value"] is not None]
+            summary = {
+                "symbols_count": len(rows),
+                "avg_funding_rate": round(sum(funding_vals) / len(funding_vals), 6) if funding_vals else None,
+                "total_oi_usd": round(sum(oi_vals), 0) if oi_vals else None,
+            }
+        else:
+            summary = {}
 
-    return {"symbols": rows[:20], "summary": summary}  # top 20 for display
+        return {"symbols": rows[:20], "summary": summary}
+    return _cached("market", 60, _load)
 
 
 # ─── 4. Signals ────────────────────────────────────────────────────
 
 def get_signals() -> dict:
-    """Read latest signal events parquet."""
-    events_path = EVENTS_DIR / "all_events.parquet"
-    if not events_path.exists():
-        return {"count": 0, "symbols": [], "recent": []}
-
-    try:
-        df = pl.read_parquet(events_path)
-    except Exception:
-        return {"count": 0, "symbols": [], "recent": []}
-
-    if df.height == 0:
-        return {"count": 0, "symbols": [], "recent": []}
-
-    sym_counts = [_sanitize(d) for d in (df.group_by("symbol").agg(pl.len().alias("count"))
-                  .sort("count", descending=True).to_dicts())]
-
-    recent_cols = [c for c in ["symbol", "category", "open_time", "entry_price",
-                               "relative_volume", "relative_range",
-                               "return_5m", "return_15m", "return_30m"]
-                   if c in df.columns]
-    recent = [_sanitize(d) for d in df.select(recent_cols).tail(10).to_dicts()]
-
-    return {
-        "count": df.height,
-        "symbols": sym_counts[:20],
-        "recent": recent,
-    }
+    def _load():
+        events_path = EVENTS_DIR / "all_events.parquet"
+        if not events_path.exists():
+            return {"count": 0, "symbols": [], "recent": []}
+        try:
+            df = pl.read_parquet(events_path)
+        except Exception:
+            return {"count": 0, "symbols": [], "recent": []}
+        if df.height == 0:
+            return {"count": 0, "symbols": [], "recent": []}
+        sym_counts = [_sanitize(d) for d in (df.group_by("symbol").agg(pl.len().alias("count"))
+                      .sort("count", descending=True).to_dicts())]
+        recent_cols = [c for c in ["symbol", "category", "open_time", "entry_price",
+                                   "relative_volume", "relative_range",
+                                   "return_5m", "return_15m", "return_30m"]
+                       if c in df.columns]
+        recent = [_sanitize(d) for d in df.select(recent_cols).tail(10).to_dicts()]
+        return {"count": df.height, "symbols": sym_counts[:20], "recent": recent}
+    return _cached("signals", 30, _load)
 
 
 # ─── 5. Hypotheses & Research ──────────────────────────────────────
