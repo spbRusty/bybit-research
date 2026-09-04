@@ -40,6 +40,8 @@ class Hypothesis:
     entry_side: str          # long | short
     horizon_min: int
     target_column: str = None  # колонка будущей доходности, по умолчанию return_{h}m
+    stop_loss: float | None = None  # SL fraction (e.g. 0.0003 = 3 bps)
+    mae_column: str = None   # колонка MAE для SL (по умолчанию mae_{h}m)
     version: str = "1.0"
     status: str = "CANDIDATE"
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -47,6 +49,8 @@ class Hypothesis:
     def __post_init__(self):
         if self.target_column is None:
             self.target_column = f"return_{self.horizon_min}m"
+        if self.stop_loss is not None and self.mae_column is None:
+            self.mae_column = f"mae_{self.horizon_min}m"
 
     def to_record(self) -> dict:
         return asdict(self)
@@ -103,7 +107,13 @@ def test_hypothesis(events: pl.DataFrame, hyp: Hypothesis, cost: float) -> dict:
     if n == 0:
         return base
     side = 1.0 if hyp.entry_side == "long" else -1.0
-    ret: np.ndarray = sub[hyp.target_column].to_numpy() * side - cost
+    if hyp.stop_loss is not None and hyp.mae_column in sub.columns:
+        raw_ret = sub[hyp.target_column].to_numpy() * side
+        mae = sub[hyp.mae_column].to_numpy() * side  # MAE for our side
+        sl_hit = mae < -hyp.stop_loss
+        ret = np.where(sl_hit, -hyp.stop_loss, raw_ret) - cost
+    else:
+        ret: np.ndarray = sub[hyp.target_column].to_numpy() * side - cost
     t, p = stats.ttest_1samp(ret, 0.0)
     # Зависимость наблюдений (§26): block bootstrap, cluster bootstrap, HAC.
     dep = dependency_stats(ret, sub["symbol"].to_list())
