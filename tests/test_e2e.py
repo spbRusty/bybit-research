@@ -87,33 +87,50 @@ def test_e2e_mr_control():
                 condition=cond, entry_side="long", horizon_min=h))
 
     result = research_mod.run_research(events_mr, hypotheses=hypotheses)
-    print(f"Research: candidates={result['candidates']} verdict={result['verdict']}")
+    print(f"Research: candidates={result['candidates']}")
+
+    # Stage 3a: Validation gate (per candidate)
+    passed_val = []
+    for cid in result.get("candidates", []):
+        if cid in result.get("validation", {}):
+            s = stage_validation_gate(result["validation"][cid])
+            stages.append(s)
+            print(f"  validation_gate({cid}): {s.status.value}")
+            if s.passed:
+                passed_val.append(cid)
+
+    # Stage 3b: OOS gate (per validation-passed candidate)
+    passed_oos = []
+    for cid in passed_val:
+        if cid in result.get("oos", {}):
+            s = stage_oos_gate(result["oos"][cid])
+            stages.append(s)
+            print(f"  oos_gate({cid}): {s.status.value}")
+            if s.passed:
+                passed_oos.append(cid)
+
+    # Stage 3c: Finalist (only after both gates pass)
+    if passed_oos:
+        cid = passed_oos[0]
+        hyp = next(h for h in hypotheses if h.hypothesis_id == cid)
+        result["finalist"] = {
+            "hypothesis_id": cid, "horizon_min": hyp.horizon_min,
+            "entry_side": hyp.entry_side, "condition": hyp.condition,
+            "description": hyp.description,
+        }
+        result["verdict"] = "CANDIDATE"
 
     # Stage 4: Parameter freeze
     frozen = freeze_finalist(result)
     s = stage_parameter_freeze(result, frozen)
     stages.append(s)
-    assert s.passed, f"parameter_freeze failed: {s.errors}"
+    print(f"  parameter_freeze: {s.status.value}")
 
-    # Stage 5: Validation gate
-    if result.get("finalist"):
-        cid = result["finalist"]["hypothesis_id"]
-        if cid in result.get("validation", {}):
-            s = stage_validation_gate(result["validation"][cid])
-            stages.append(s)
-
-    # Stage 6: OOS gate
-    if result.get("finalist"):
-        cid = result["finalist"]["hypothesis_id"]
-        if cid in result.get("oos", {}):
-            s = stage_oos_gate(result["oos"][cid])
-            stages.append(s)
-
-    # Stage 7: Critic
+    # Stage 5: Critic
     s = stage_critic(result, events_mr)
     stages.append(s)
 
-    # Stage 8: Acceptance report
+    # Stage 6: Acceptance report
     report = build_acceptance_report(stages, result, run_id)
     print(f"\nAcceptance report:")
     print(f"  verdict: {report['verdict']}")

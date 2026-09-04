@@ -407,5 +407,76 @@ class TestCriticStage(unittest.TestCase):
         self.assertTrue(r.passed)
 
 
+# ---------------------------------------------------------------------------
+# Finalist formation: gates must run BEFORE finalist is set
+# ---------------------------------------------------------------------------
+class TestFinalistFormation(unittest.TestCase):
+
+    def test_val_low_t_no_finalist(self):
+        val = {"n": 200, "mean_net": 0.003, "t_stat": 1.5}
+        s = stage_validation_gate(val)
+        self.assertEqual(s.status, StageStatus.REJECT)
+
+    def test_oos_low_t_no_finalist(self):
+        oos = {"n": 200, "mean_net": 0.003, "t_stat": 1.5}
+        s = stage_oos_gate(oos)
+        self.assertEqual(s.status, StageStatus.REJECT)
+
+    def test_val_pass_oos_reject_no_finalist(self):
+        val = {"n": 200, "mean_net": 0.003, "t_stat": 2.5}
+        oos = {"n": 200, "mean_net": 0.003, "t_stat": 1.5}
+        sv = stage_validation_gate(val)
+        so = stage_oos_gate(oos)
+        self.assertTrue(sv.passed)
+        self.assertFalse(so.passed)
+
+    def test_val_pass_oos_pass_finalist_eligible(self):
+        val = {"n": 200, "mean_net": 0.003, "t_stat": 2.5}
+        oos = {"n": 200, "mean_net": 0.003, "t_stat": 2.5}
+        sv = stage_validation_gate(val)
+        so = stage_oos_gate(oos)
+        self.assertTrue(sv.passed)
+        self.assertTrue(so.passed)
+
+    def test_negative_t_reject(self):
+        val = {"n": 200, "mean_net": 0.003, "t_stat": -3.55}
+        s = stage_validation_gate(val)
+        self.assertEqual(s.status, StageStatus.REJECT)
+
+    def test_t_exactly_2_pass(self):
+        val = {"n": 200, "mean_net": 0.003, "t_stat": 2.0}
+        s = stage_validation_gate(val)
+        self.assertTrue(s.passed)
+
+    def test_no_finalist_skipped_freeze(self):
+        result = {"candidates": [], "finalist": None}
+        frozen = freeze_finalist(result)
+        s = stage_parameter_freeze(result, frozen)
+        self.assertEqual(s.status, StageStatus.SKIPPED)
+
+    def test_no_candidate_not_false_pass(self):
+        stages = [
+            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
+            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
+                        errors=["costs: no positive edge"]),
+        ]
+        report = build_acceptance_report(stages, {"candidates": [], "finalist": None}, "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+        self.assertIsNone(report["finalist"])
+
+    def test_verdict_deterministic(self):
+        stages_a = [
+            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
+            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
+                        errors=["costs fail"]),
+        ]
+        stages_b = list(stages_a)
+        r1 = build_acceptance_report(stages_a, {"candidates": []}, "r1")
+        r2 = build_acceptance_report(stages_b, {"candidates": []}, "r2")
+        self.assertEqual(r1["verdict"], r2["verdict"])
+
+
 if __name__ == "__main__":
     unittest.main()

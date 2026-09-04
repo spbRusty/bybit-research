@@ -205,7 +205,8 @@ def run_research(events: pl.DataFrame,
         "n_events": {k: v.height for k, v in periods.items()},
         "discovery_results": df.to_dicts(),
         "candidates": candidates.select("hypothesis_id").to_series().to_list() if candidates.height else [],
-        "validation": {}, "oos": {}, "verdict": "NO_CANDIDATE",
+        "validation": {}, "oos": {},
+        "verdict": "NO_CANDIDATE",
     }
 
     for cid in out["candidates"]:
@@ -214,12 +215,7 @@ def run_research(events: pl.DataFrame,
         mo = test_hypothesis(oos, hyp, cost_survival)
         out["validation"][cid] = mv
         out["oos"][cid] = mo
-        if mv.get("mean_net", np.nan) > 0 and mo.get("mean_net", np.nan) > 0 \
-                and mo.get("n", 0) >= _R["min_events"]:
-            out["verdict"] = "CANDIDATE"
-            out["finalist"] = {"hypothesis_id": cid, "horizon_min": hyp.horizon_min,
-                               "entry_side": hyp.entry_side, "condition": hyp.condition,
-                               "description": hyp.description}
+
     return out
 
 

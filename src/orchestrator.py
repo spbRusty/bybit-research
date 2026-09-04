@@ -141,40 +141,55 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
         hypotheses = list(baseline) + generated
     logger.info("Hypotheses: %d", len(hypotheses))
 
-    # --- 6. RESEARCH (discovery + validation + OOS) ---
+    # --- 6. RESEARCH (discovery + validation + OOS metrics) ---
     result = research_mod.run_research(events, hypotheses=hypotheses)
     rid = research_mod.save_result(result)
-    logger.info("Research %s: candidates=%s verdict=%s",
-                rid, result["candidates"], result["verdict"])
+    logger.info("Research %s: candidates=%s", rid, result["candidates"])
 
-    # --- 7. PARAMETER FREEZE ---
+    # --- 7. VALIDATION GATE (per candidate) ---
+    passed_val: list[str] = []
+    for cid in result.get("candidates", []):
+        if cid in result.get("validation", {}):
+            s = stage_validation_gate(result["validation"][cid])
+            stages.append(s)
+            _log_stage(s)
+            if s.passed:
+                passed_val.append(cid)
+
+    # --- 8. OOS GATE (per validation-passed candidate) ---
+    passed_oos: list[str] = []
+    for cid in passed_val:
+        if cid in result.get("oos", {}):
+            s = stage_oos_gate(result["oos"][cid])
+            stages.append(s)
+            _log_stage(s)
+            if s.passed:
+                passed_oos.append(cid)
+
+    # --- 9. FINALIST (only after both gates pass) ---
+    if passed_oos:
+        cid = passed_oos[0]
+        hyp = next(h for h in hypotheses if h.hypothesis_id == cid)
+        result["finalist"] = {
+            "hypothesis_id": cid, "horizon_min": hyp.horizon_min,
+            "entry_side": hyp.entry_side, "condition": hyp.condition,
+            "description": hyp.description,
+        }
+        result["verdict"] = "CANDIDATE"
+        logger.info("Finalist: %s", cid)
+
+    # --- 10. PARAMETER FREEZE ---
     frozen = freeze_finalist(result)
     s = stage_parameter_freeze(result, frozen)
     stages.append(s)
     _log_stage(s)
 
-    # --- 8. VALIDATION GATE ---
-    if result.get("finalist"):
-        cid = result["finalist"]["hypothesis_id"]
-        if cid in result.get("validation", {}):
-            s = stage_validation_gate(result["validation"][cid])
-            stages.append(s)
-            _log_stage(s)
-
-    # --- 9. OOS GATE ---
-    if result.get("finalist"):
-        cid = result["finalist"]["hypothesis_id"]
-        if cid in result.get("oos", {}):
-            s = stage_oos_gate(result["oos"][cid])
-            stages.append(s)
-            _log_stage(s)
-
-    # --- 10. CRITIC ---
+    # --- 11. CRITIC ---
     s = stage_critic(result, events)
     stages.append(s)
     _log_stage(s)
 
-    # --- 11. ACCEPTANCE REPORT ---
+    # --- 12. ACCEPTANCE REPORT ---
     report = build_acceptance_report(stages, result, run_id)
     report_path = RESULTS_DIR / f"acceptance_{run_id}.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False,
