@@ -6,42 +6,118 @@
 <title>Bybit Research Dashboard</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);padding:16px;line-height:1.4}
-h1{font-size:18px;margin-bottom:12px;color:var(--blue)}
-h2{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:12px;margin-bottom:16px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:12px;min-height:120px}
-.card.wide{grid-column:span 2}
-.status-ok{color:var(--green)}.status-warn{color:var(--yellow)}.status-err{color:var(--red)}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)}
-th{color:var(--dim);font-weight:600}
-.mono{font-family:'SFMono-Regular',Consolas,monospace;font-size:11px}
-.big{font-size:28px;font-weight:700;color:var(--text)}
-.sub{font-size:12px;color:var(--dim)}
-.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600}
-.tag-pass{background:#238636;color:#fff}.tag-reject{background:#da3633;color:#fff}.tag-skip{background:#6e7681;color:#fff}.tag-stop{background:#d29922;color:#000}
-.log-box{background:#0d1117;border:1px solid var(--border);border-radius:4px;padding:8px;max-height:240px;overflow-y:auto;font-family:monospace;font-size:11px;color:var(--dim);white-space:pre-wrap;word-break:break-all}
-#status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--card-sm:8px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);padding:8px 12px;font-size:12px;line-height:1.35}
+h1{font-size:16px;margin-bottom:6px;color:var(--blue)}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:4px}
+.grid{display:grid;gap:8px;margin-bottom:8px}
+.g2{grid-template-columns:1fr 1fr}
+.g3{grid-template-columns:1fr 1fr 1fr}
+.g4{grid-template-columns:1fr 1fr 1fr 1fr}
+.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:var(--card-sm)}
+.card.g span{font-size:11px;color:var(--dim);display:block}
+.card.g .v{font-size:20px;font-weight:700;color:var(--text)}
+.card.g .v.sm{font-size:14px}
+.status-ok{color:var(--green)}.status-warn{color:var(--yellow)}.status-err{color:var(--red)}.status-na{color:var(--dim)}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th,td{padding:2px 6px;text-align:left;border-bottom:1px solid var(--border)}
+th{color:var(--dim);font-weight:600;font-size:10px}
+.mono{font-family:'SFMono-Regular',Consolas,monospace;font-size:10px}
+.tag{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600}
+.tag-pass{background:#238636;color:#fff}.tag-reject{background:#da3633;color:#fff}.tag-skip{background:#6e7681;color:#fff}.tag-stop{background:#d29922;color:#000}.tag-error{background:#f85149;color:#fff}.tag-na{background:#30363d;color:var(--dim)}
+.sub{font-size:10px;color:var(--dim)}
+.pipe{display:flex;gap:2px;flex-wrap:wrap;margin:4px 0}
+.pipe .step{padding:2px 6px;border-radius:3px;font-size:10px;font-weight:600;background:var(--border);color:var(--dim)}
+.pipe .step.PASS{background:#238636;color:#fff}
+.pipe .step.REJECT{background:#da3633;color:#fff}
+.pipe .step.SKIPPED{background:#6e7681;color:#fff}
+.pipe .step.ERROR{background:#f85149;color:#fff}
+.pipe .step.NOT{background:#30363d;color:var(--dim)}
+.log-box{background:#0d1117;border:1px solid var(--border);border-radius:4px;padding:4px;height:100px;overflow-y:auto;font-family:monospace;font-size:10px;color:var(--dim);white-space:pre-wrap;word-break:break-all}
+#status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
 #status-dot.ok{background:var(--green)}.stale{background:var(--red)}
-.refresh{font-size:11px;color:var(--dim);margin-bottom:12px}
+.hdr{font-size:11px;color:var(--dim);margin-bottom:6px}
 </style>
 </head>
 <body>
-<h1><span id="status-dot" class="ok"></span>Bybit Research Dashboard</h1>
-<div class="refresh">Auto-refresh: <span id="timer">3</span>s | Last: <span id="last-update">—</span></div>
+<h1><span id="status-dot" class="ok"></span>Bybit Research Dashboard <span class="sub" style="font-weight:normal">| <span id="last-update">—</span> | <span id="timer">3</span>s</span></h1>
 
-<div class="grid">
-<div class="card"><h2>System Status</h2><div id="system-content">Loading...</div></div>
-<div class="card"><h2>Data Download</h2><div id="data-content">Loading...</div></div>
-<div class="card"><h2>Market Metrics</h2><div id="market-content">Loading...</div></div>
-<div class="card"><h2>Signals</h2><div id="signals-content">Loading...</div></div>
+<!-- ═══════ ROW 1: Paper Wallet ═══════ -->
+<div class="grid g4" id="row-wallet">
+<div class="card g"><span>Paper Trading</span><div class="v" id="p-status">—</div><div class="sub" id="p-reason"></div></div>
+<div class="card g"><span>Balance</span><div class="v" id="p-balance">—</div><div class="sub" id="p-equity-start"></div></div>
+<div class="card g"><span>PnL</span><div class="v" id="p-pnl">—</div><div class="sub" id="p-pnl-pct"></div></div>
+<div class="card g"><span>Win Rate</span><div class="v" id="p-winrate">—</div><div class="sub" id="p-trades"></div></div>
 </div>
-<div class="card wide"><h2>Hypotheses &amp; Research</h2><div id="hyp-content">Loading...</div></div>
-<div class="grid">
-<div class="card"><h2>Paper Trading</h2><div id="paper-content">Loading...</div></div>
-<div class="card"><h2>Logs</h2><div id="log-content" class="log-box">Loading...</div></div>
+
+<!-- ═══════ ROW 2: Parameters + Costs ═══════ -->
+<div class="grid g3">
+<div class="card">
+<h2>Risk Management</h2>
+<table id="t-risk"><tr><td colspan="2" class="sub">Loading...</td></tr></table>
+</div>
+<div class="card">
+<h2>Position Sizing</h2>
+<table id="t-sizing"><tr><td colspan="2" class="sub">Loading...</td></tr></table>
+</div>
+<div class="card">
+<h2>Trading Costs</h2>
+<table id="t-costs"><tr><td colspan="2" class="sub">Loading...</td></tr></table>
+</div>
+</div>
+
+<!-- ═══════ ROW 3: Stakes + Win Rate by Stake + Instrument ═══════ -->
+<div class="grid g3">
+<div class="card">
+<h2>Stake Levels</h2>
+<table id="t-stakes"><tr><td class="sub">Loading...</td></tr></table>
+<div class="sub" id="stake-note"></div>
+</div>
+<div class="card">
+<h2>Win Rate by Stake</h2>
+<table id="t-winrate"><tr><td class="sub">Loading...</td></tr></table>
+</div>
+<div class="card">
+<h2>Instrument Info</h2>
+<div id="instrument-info">Loading...</div>
+</div>
+</div>
+
+<!-- ═══════ ROW 4: Pipeline ═══════ -->
+<div class="card" style="margin-bottom:8px">
+<h2>Pipeline</h2>
+<div class="pipe" id="pipeline-flow"></div>
+<table id="t-pipeline" style="margin-top:4px"><tr><td class="sub">Loading...</td></tr></table>
+</div>
+
+<!-- ═══════ ROW 5: Data + Market Streams ═══════ -->
+<div class="grid g2">
+<div class="card">
+<h2>Data Download (Klines)</h2>
+<table id="t-data"><tr><td class="sub">Loading...</td></tr></table>
+</div>
+<div class="card">
+<h2>Market Data Streams</h2>
+<table id="t-streams"><tr><td class="sub">Loading...</td></tr></table>
+</div>
+</div>
+
+<!-- ═══════ ROW 6: Signals + Hypotheses ═══════ -->
+<div class="grid g2">
+<div class="card">
+<h2>Signals / Events</h2>
+<div id="signals-content">Loading...</div>
+</div>
+<div class="card">
+<h2>Hypotheses &amp; Research</h2>
+<div id="hyp-content">Loading...</div>
+</div>
+</div>
+
+<!-- ═══════ ROW 7: Logs ═══════ -->
+<div class="card" style="margin-bottom:0">
+<h2>Logs</h2>
+<div class="log-box" id="log-content">Loading...</div>
 </div>
 
 <script>
@@ -50,145 +126,231 @@ let countdown = 3;
 let sseActive = false;
 const _prev = {};
 
-function setIfChanged(id, html) {
+function setIf(id, html) {
   if (_prev[id] === html) return;
   _prev[id] = html;
   document.getElementById(id).innerHTML = html;
 }
-
+function tagHTML(v) {
+  if (!v) return '';
+  const c = v === 'PASS' ? 'tag-pass' : v === 'REJECT' ? 'tag-reject' : v === 'STOP' ? 'tag-stop' : v === 'ERROR' ? 'tag-error' : v === 'SKIPPED' ? 'tag-skip' : 'tag-na';
+  return `<span class="tag ${c}">${v}</span>`;
+}
 function fmt(ts) {
   if (!ts) return '—';
   try { return new Date(ts).toLocaleString(); } catch { return ts; }
-}
-function age(s) {
-  if (s === Infinity || s === null) return '—';
-  if (s < 60) return Math.round(s) + 's ago';
-  if (s < 3600) return Math.round(s/60) + 'm ago';
-  return Math.round(s/3600) + 'h ago';
-}
-function tagHTML(v) {
-  if (!v) return '';
-  const cls = v === 'PASS' ? 'tag-pass' : v === 'REJECT' ? 'tag-reject' : v === 'STOP' ? 'tag-stop' : 'tag-skip';
-  return `<span class="tag ${cls}">${v}</span>`;
 }
 async function fetchJSON(path) {
   try { const r = await fetch(API + path); return r.ok ? await r.json() : null; }
   catch { return null; }
 }
+function money(v) { return v != null ? '$' + Number(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : 'N/A'; }
+function pct(v) { return v != null ? v.toFixed(2) + '%' : 'N/A'; }
 
-async function renderSystem() {
-  const d = await fetchJSON('/status');
+// ═══════ 1. Paper Wallet ═══════
+async function renderPaper() {
+  const d = await fetchJSON('/paper');
   if (!d) return;
-  let html = '<table>';
-  for (const [name, info] of Object.entries(d.logs)) {
-    const cls = info.stale ? 'status-err' : 'status-ok';
-    html += `<tr><td>${name}</td><td class="${cls}">${info.exists ? age(info.age_s) : 'missing'}</td></tr>`;
-  }
-  setIfChanged('system-content', html + '</table>');
-  document.getElementById('status-dot').className = Object.values(d.logs).some(l => l.stale) ? 'stale' : 'ok';
+  const stClass = d.status === 'RUNNING' ? 'status-ok' : d.status === 'NOT READY' ? 'status-na' : 'status-warn';
+  setIf('p-status', `<span class="${stClass}">${d.status}</span>`);
+  setIf('p-reason', d.status_reason || '');
+  setIf('p-balance', d.balance != null ? money(d.balance) : 'N/A');
+  setIf('p-equity-start', `Start: ${money(d.equity_start)}`);
+  setIf('p-pnl', d.realized_pnl != null ? `<span class="${d.realized_pnl >= 0 ? 'status-ok' : 'status-err'}">${d.realized_pnl >= 0 ? '+' : ''}${money(d.realized_pnl)}</span>` : 'N/A');
+  setIf('p-pnl-pct', d.pnl_pct != null ? `${d.pnl_pct >= 0 ? '+' : ''}${d.pnl_pct.toFixed(2)}%` : '');
+  setIf('p-winrate', d.trade_count > 0 ? `${(d.win_rate * 100).toFixed(1)}%` : 'N/A');
+  setIf('p-trades', `${d.trade_count} trades | PF ${d.profit_factor != null ? d.profit_factor.toFixed(2) : 'N/A'}`);
 }
 
+// ═══════ 2. Risk + Sizing + Costs ═══════
+async function renderRisk() {
+  const d = await fetchJSON('/risk');
+  if (!d) return;
+  let h = '';
+  h += `<tr><td>Max risk/trade</td><td>${pct(d.risk_per_trade_pct * 100)} (${money(d.risk_per_trade_usd)})</td></tr>`;
+  h += `<tr><td>Stop (k × vol)</td><td>${d.stop_k_vol}×</td></tr>`;
+  h += `<tr><td>Take (m × stop)</td><td>${d.take_k_stop}×</td></tr>`;
+  h += `<tr><td>Max positions</td><td>${d.max_positions}</td></tr>`;
+  setIf('t-risk', h);
+
+  const s = await fetchJSON('/stakes');
+  if (!s) return;
+  let h2 = '';
+  h2 += `<tr><td>Min stake</td><td>${money(s.min_stake_usdt)}</td></tr>`;
+  h2 += `<tr><td>Current stake</td><td>${money(s.current_stake_usdt)}</td></tr>`;
+  h2 += `<tr><td>Min lot</td><td>${s.min_lot}</td></tr>`;
+  h2 += `<tr><td>Qty step</td><td>${s.qty_step}</td></tr>`;
+  setIf('t-sizing', h2);
+  setIf('stake-note', s.note || '');
+
+  const c = await fetchJSON('/costs');
+  if (!c) return;
+  let h3 = '';
+  h3 += `<tr><td>Paper fee (round-trip)</td><td>${pct(c.fee_round_trip_pct)}</td></tr>`;
+  h3 += `<tr><td>Paper slippage</td><td>${pct(c.slippage_pct)}</td></tr>`;
+  h3 += `<tr><td>Survival cost</td><td>${c.survival_cost != null ? pct(c.survival_cost * 100) : 'N/A'}</td></tr>`;
+  if (c.backtest_cost_grid && c.backtest_cost_grid.length) {
+    h3 += `<tr><td>Backtest grid</td><td>${c.backtest_cost_grid.map(v => pct(v * 100)).join(', ')}</td></tr>`;
+  }
+  setIf('t-costs', h3);
+}
+
+// ═══════ 3. Stakes Table ═══════
+async function renderStakes() {
+  const s = await fetchJSON('/stakes');
+  if (!s) return;
+  let h = '<tr><th>Level</th><th>USDT</th><th>% Bank</th></tr>';
+  for (const l of s.levels) {
+    const isCurrent = l.level === s.current_level;
+    h += `<tr${isCurrent ? ' style="font-weight:700"' : ''}><td>${l.level}</td><td>${money(l.stake_usdt)}</td><td>${pct(l.pct_bankroll)}</td></tr>`;
+  }
+  setIf('t-stakes', h);
+}
+
+// ═══════ 4. Win Rate by Stake ═══════
+async function renderWinrate() {
+  const d = await fetchJSON('/winrate');
+  if (!d || !d.length) { setIf('t-winrate', '<tr><td class="sub">No data</td></tr>'); return; }
+  let h = '<tr><th>Level</th><th>Trades</th><th>Win%</th><th>PnL</th><th>Avg</th></tr>';
+  for (const r of d) {
+    const wr = r.win_rate != null ? r.win_rate.toFixed(1) + '%' : 'N/A';
+    const pnl = r.pnl != null ? `<span class="${r.pnl >= 0 ? 'status-ok' : 'status-err'}">${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(4)}</span>` : 'N/A';
+    const avg = r.avg_pnl != null ? r.avg_pnl.toFixed(4) : 'N/A';
+    h += `<tr><td>${r.level}</td><td>${r.trades}</td><td>${wr}</td><td>${pnl}</td><td>${avg}</td></tr>`;
+  }
+  setIf('t-winrate', h);
+}
+
+// ═══════ 5. Instrument Info ═══════
+async function renderInstruments() {
+  const d = await fetchJSON('/instruments');
+  if (!d) return;
+  let h = '';
+  if (!d.available) {
+    h = `<div class="status-na">NOT AVAILABLE</div>`;
+    h += `<div class="sub">${d.reason}</div>`;
+    h += `<div class="sub" style="margin-top:4px">Symbols in list: ${d.symbols_count}</div>`;
+    h += `<div class="sub">Missing: ${d.fields_missing.join(', ')}</div>`;
+  }
+  setIf('instrument-info', h);
+}
+
+// ═══════ 6. Pipeline ═══════
+async function renderPipeline() {
+  const d = await fetchJSON('/pipeline');
+  if (!d) return;
+
+  const flow = document.getElementById('pipeline-flow');
+  const names = ['DATA', 'FEATURES', 'HYPOTHESES', 'DISCOVERY', 'VALIDATION', 'OOS', 'FREEZE', 'CRITIC', 'VERDICT'];
+  const mapping = {
+    'DATA': 'data_validation', 'FEATURES': 'feature_validation', 'HYPOTHESES': null,
+    'DISCOVERY': 'discovery', 'VALIDATION': 'validation_gate', 'OOS': 'oos_gate',
+    'FREEZE': 'parameter_freeze', 'CRITIC': 'critic', 'VERDICT': null
+  };
+  let flowHtml = '';
+  for (const name of names) {
+    const stage = mapping[name];
+    let status = 'NOT';
+    if (name === 'VERDICT') {
+      status = d.verdict || 'NOT';
+    } else if (name === 'HYPOTHESES') {
+      status = d.n_hypotheses > 0 ? 'PASS' : 'NOT';
+    } else if (stage && d.stages) {
+      const found = d.stages.find(s => s.stage === stage);
+      status = found ? found.status : 'NOT';
+    }
+    flowHtml += `<span class="step ${status}">${name}: ${status}</span>`;
+  }
+  setIf('pipeline-flow', flowHtml);
+
+  if (!d.has_report) {
+    setIf('t-pipeline', '<tr><td class="sub">No acceptance report</td></tr>');
+    return;
+  }
+  let h = '';
+  h += `<tr><td>Run</td><td class="mono">${d.run_id || '—'}</td></tr>`;
+  h += `<tr><td>Verdict</td><td>${tagHTML(d.verdict)}</td></tr>`;
+  h += `<tr><td>Hypotheses</td><td>${d.n_hypotheses || 0}</td></tr>`;
+  h += `<tr><td>Events</td><td>${(d.n_events_total || 0).toLocaleString()}</td></tr>`;
+  h += `<tr><td>Candidates</td><td>${d.n_candidates || 0}</td></tr>`;
+  h += `<tr><td>Finalist</td><td>${d.finalist ? d.finalist.hypothesis_id : '—'}</td></tr>`;
+  if (d.reject_reasons && d.reject_reasons.length) {
+    h += `<tr><td>Reason</td><td class="status-err">${d.reject_reasons[0]}</td></tr>`;
+  }
+  setIf('t-pipeline', h);
+}
+
+// ═══════ 7. Data Download ═══════
 async function renderData() {
   const d = await fetchJSON('/data');
   if (!d) return;
-  let html = `<div class="big">${d.total_klines_files}</div><div class="sub">kline files, ${d.total_size_mb} MB</div>`;
-  html += '<table><tr><th>Category</th><th>Files</th><th>Size</th></tr>';
-  for (const [cat, info] of Object.entries(d.klines))
-    html += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td></tr>`;
-  html += '</table>';
-  if (Object.keys(d.collector).length) {
-    html += '<table><tr><th>Collector</th><th>Files</th></tr>';
-    for (const [s, n] of Object.entries(d.collector))
-      html += `<tr><td>${s}</td><td>${n}</td></tr>`;
-    html += '</table>';
+  let h = '<tr><th>Category</th><th>Files</th><th>Size</th><th>Oldest</th><th>Newest</th><th>Lag</th><th>Status</th></tr>';
+  for (const [cat, info] of Object.entries(d.klines)) {
+    const sc = info.status === 'LIVE' ? 'status-ok' : info.status === 'STALE' ? 'status-err' : 'status-na';
+    const lag = info.lag_min != null ? (info.lag_min < 60 ? Math.round(info.lag_min) + 'm' : Math.round(info.lag_min / 60) + 'h') : '—';
+    const old = info.oldest ? info.oldest.slice(0, 10) : '—';
+    const newest = info.newest ? info.newest.slice(0, 16) : '—';
+    h += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td><td class="mono">${old}</td><td class="mono">${newest}</td><td>${lag}</td><td class="${sc}">${info.status}</td></tr>`;
   }
-  setIfChanged('data-content', html);
+  h += `<tr><td colspan="7" class="sub">Total: ${d.total_files} files, ${d.total_size_mb} MB</td></tr>`;
+  setIf('t-data', h);
 }
 
-async function renderMarket() {
-  const d = await fetchJSON('/market');
+// ═══════ 8. Market Data Streams ═══════
+async function renderStreams() {
+  const d = await fetchJSON('/market-data');
   if (!d) return;
-  let html = '';
-  if (d.summary) {
-    html += '<table>';
-    if (d.summary.symbols_count !== undefined) html += `<tr><td>Symbols</td><td>${d.summary.symbols_count}</td></tr>`;
-    if (d.summary.avg_funding_rate != null) html += `<tr><td>Avg Funding</td><td class="${d.summary.avg_funding_rate > 0 ? 'status-ok' : 'status-err'}">${(d.summary.avg_funding_rate * 100).toFixed(4)}%</td></tr>`;
-    if (d.summary.total_oi_usd) html += `<tr><td>Total OI</td><td>$${(d.summary.total_oi_usd / 1e6).toFixed(0)}M</td></tr>`;
-    html += '</table>';
+  let h = '<tr><th>Stream</th><th>Files</th><th>Status</th><th>Lag</th></tr>';
+  for (const [name, info] of Object.entries(d.streams)) {
+    const sc = info.status === 'LIVE' ? 'status-ok' : info.status === 'STALE' ? 'status-warn' : 'status-err';
+    const lag = info.lag_min != null ? (info.lag_min < 60 ? Math.round(info.lag_min) + 'm' : Math.round(info.lag_min / 60) + 'h') : '—';
+    h += `<tr><td>${name}</td><td>${info.count}</td><td class="${sc}">${info.status}</td><td>${lag}</td></tr>`;
   }
-  if (d.symbols && d.symbols.length) {
-    html += '<table><tr><th>Symbol</th><th>Funding</th><th>OI ($M)</th></tr>';
-    for (const s of d.symbols.slice(0, 10)) {
-      const fr = s.funding_rate != null ? (s.funding_rate * 100).toFixed(4) + '%' : '—';
-      const oi = s.oi_value ? '$' + (s.oi_value / 1e6).toFixed(1) : '—';
-      html += `<tr><td class="mono">${s.symbol}</td><td>${fr}</td><td>${oi}</td></tr>`;
-    }
-    html += '</table>';
-  }
-  setIfChanged('market-content', html || '<span class="sub">No market data</span>');
+  setIf('t-streams', h);
 }
 
+// ═══════ 9. Signals ═══════
 async function renderSignals() {
   const d = await fetchJSON('/signals');
   if (!d) return;
-  let html = `<div class="big">${d.count.toLocaleString()}</div><div class="sub">total events</div>`;
+  let html = `<div style="font-size:20px;font-weight:700">${d.count.toLocaleString()}</div><div class="sub">total events</div>`;
   if (d.symbols && d.symbols.length) {
     html += '<table><tr><th>Symbol</th><th>Events</th></tr>';
     for (const s of d.symbols.slice(0, 8))
       html += `<tr><td class="mono">${s.symbol}</td><td>${s.count.toLocaleString()}</td></tr>`;
     html += '</table>';
   }
-  setIfChanged('signals-content', html);
+  setIf('signals-content', html);
 }
 
+// ═══════ 10. Hypotheses ═══════
 async function renderHypotheses() {
   const d = await fetchJSON('/hypotheses');
   if (!d) return;
-  let html = `<div class="big">${d.count}</div><div class="sub">hypotheses</div>`;
-  if (d.acceptance) {
-    const a = d.acceptance;
-    html += `<div style="margin-top:8px">Verdict: ${tagHTML(a.verdict)} <span class="sub">(${fmt(a.timestamp)})</span></div>`;
-    if (a.stages && a.stages.length) {
-      html += '<table><tr><th>Stage</th><th>Status</th><th>Metric</th></tr>';
-      for (const s of a.stages) {
-        const m = s.metrics || {};
-        const metricStr = m.n_events ? `${m.n_events.toLocaleString()} events, ${m.n_symbols || 0} symbols` : '';
-        html += `<tr><td>${s.stage}</td><td>${tagHTML(s.status)}</td><td class="sub">${metricStr}</td></tr>`;
-      }
-      html += '</table>';
-    }
-  }
+  let html = `<div style="font-size:14px;font-weight:700">${d.count}</div><div class="sub">hypotheses</div>`;
   if (d.research_runs && d.research_runs.length) {
-    html += '<div style="margin-top:8px"><table><tr><th>Run</th><th>Hyps</th><th>Cands</th><th>Best</th><th>t</th></tr>';
-    for (const r of d.research_runs.slice(0, 5)) {
-      const t = r.best_t_stat != null ? r.best_t_stat.toFixed(2) : '—';
-      html += `<tr><td class="mono">${(r.run_id || '').slice(0, 15)}</td><td>${r.n_hypotheses || '—'}</td><td>${r.n_candidates || 0}</td><td>${r.best_hypothesis || '—'}</td><td>${t}</td></tr>`;
+    html += '<table style="margin-top:4px"><tr><th>Run</th><th>Hyps</th><th>Cands</th><th>Verdict</th></tr>';
+    for (const r of d.research_runs.slice(0, 3)) {
+      html += `<tr><td class="mono">${(r.run_id || '').slice(0, 15)}</td><td>${r.n_hypotheses || '—'}</td><td>${r.n_candidates || 0}</td><td>${tagHTML(r.verdict)}</td></tr>`;
     }
-    html += '</table></div>';
+    html += '</table>';
   }
-  setIfChanged('hyp-content', html);
+  setIf('hyp-content', html);
 }
 
-async function renderPaper() {
-  const d = await fetchJSON('/paper');
+// ═══════ 11. System Status + Logs ═══════
+async function renderStatus() {
+  const d = await fetchJSON('/status');
   if (!d) return;
-  const s = d.state || {};
-  if (!s.balance) { setIfChanged('paper-content', '<span class="sub">No paper trading data yet</span>'); return; }
-  let html = '<table>';
-  html += `<tr><td>Balance</td><td class="big">$${(s.balance || 0).toFixed(2)}</td></tr>`;
-  html += `<tr><td>PnL</td><td class="${(s.realized_pnl||0) >= 0 ? 'status-ok' : 'status-err'}">${(s.realized_pnl||0) >= 0 ? '+' : ''}$${(s.realized_pnl||0).toFixed(2)}</td></tr>`;
-  html += `<tr><td>Win Rate</td><td>${((s.win_rate||0)*100).toFixed(1)}%</td></tr>`;
-  html += `<tr><td>Trades</td><td>${s.trade_count||0}</td></tr>`;
-  html += `<tr><td>Max DD</td><td class="status-err">${((s.max_drawdown||0)*100).toFixed(2)}%</td></tr>`;
-  html += `<tr><td>Open Positions</td><td>${(s.open_positions||[]).length}</td></tr>`;
-  setIfChanged('paper-content', html + '</table>');
+  document.getElementById('status-dot').className = d.any_stale ? 'stale' : 'ok';
 }
 
 async function renderLogsPoll() {
-  const d = await fetchJSON('/logs?n=30');
+  const d = await fetchJSON('/logs?n=20');
   if (!d) return;
-  const text = (d.orchestrator || []).slice(-30).join('\n') || 'No logs';
-  setIfChanged('log-content', text);
+  const all = [...(d.orchestrator || []).slice(-8), ...(d.collector || []).slice(-5)];
+  const text = all.join('\n') || 'No logs';
+  setIf('log-content', text);
 }
 
 function startSSE() {
@@ -200,7 +362,7 @@ function startSSE() {
         const obj = JSON.parse(e.data);
         if (!obj.line) return;
         const box = document.getElementById('log-content');
-        const lines = (box.textContent + '\n' + obj.line).split('\n').slice(-50);
+        const lines = (box.textContent + '\n' + obj.line).split('\n').slice(-30);
         box.textContent = lines.join('\n');
         box.scrollTop = box.scrollHeight;
       } catch {}
@@ -212,8 +374,9 @@ function startSSE() {
 
 async function refreshAll() {
   await Promise.all([
-    renderSystem(), renderData(), renderMarket(),
-    renderSignals(), renderHypotheses(), renderPaper(), renderLogsPoll()
+    renderPaper(), renderRisk(), renderStakes(), renderWinrate(),
+    renderInstruments(), renderPipeline(), renderData(), renderStreams(),
+    renderSignals(), renderHypotheses(), renderStatus(), renderLogsPoll()
   ]);
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
   countdown = 3;
