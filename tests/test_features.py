@@ -147,7 +147,6 @@ def test_market_orderbook_sparse_fill():
     r = _orderbook_features(df)
     assert r["mk_best_bid"][0] == 100.0
     assert r["mk_best_ask"][0] == 101.0
-    assert r["bid1_px"][0] == 100.0   # level 1, а не 99.0 с level 2
     assert r["mk_depth_bid5"][0] == 15.0   # 10 + 5
 
 

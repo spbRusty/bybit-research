@@ -160,14 +160,17 @@ impl Stream {
         match self {
             Stream::Trades => format!("publicTrade.{sym}"),
             Stream::Orderbook => format!("orderbook.50.{sym}"),
-            Stream::Liquidation => format!("allLiquidation.{sym}"),
+            Stream::Liquidation => "allLiquidation".to_string(),
         }
     }
     fn strip<'a>(&self, topic: &'a str) -> Option<&'a str> {
         match self {
             Stream::Trades => topic.strip_prefix("publicTrade."),
             Stream::Orderbook => topic.strip_prefix("orderbook.50."),
-            Stream::Liquidation => topic.strip_prefix("allLiquidation."),
+            Stream::Liquidation => {
+                if topic == "allLiquidation" { Some("broadcast") }
+                else { topic.strip_prefix("allLiquidation.") }
+            }
         }
     }
 }
@@ -225,6 +228,11 @@ fn parse_message(stream: Stream, v: &Value) -> Option<(String, Table)> {
         }
         Stream::Liquidation => {
             let arr = data.as_array()?;
+            let sym = if stream.strip(topic) == Some("broadcast") {
+                arr.first()?.get("symbol")?.as_str()?.to_string()
+            } else {
+                stream.strip(topic)?.to_string()
+            };
             let mut t = Table::from([
                 ("ts", Col::new()), ("is_sell", Col::new()), ("price", Col::new()), ("size", Col::new()),
             ]);
@@ -243,6 +251,11 @@ fn parse_message(stream: Stream, v: &Value) -> Option<(String, Table)> {
 async fn subscribe_all<S>(sink: &mut S, stream: Stream, syms: &[String]) -> Result<()>
 where S: Sink<Message> + Unpin, S::Error: std::error::Error + Send + Sync + 'static,
 {
+    if stream == Stream::Liquidation {
+        let args = vec!["allLiquidation".to_string()];
+        sink.send(Message::Text(json!({"op":"subscribe","args":args}).to_string().into())).await?;
+        return Ok(());
+    }
     for c in syms.chunks(SUB_CHUNK) {
         let args: Vec<String> = c.iter().map(|s| stream.topic(s)).collect();
         sink.send(Message::Text(json!({"op":"subscribe","args":args}).to_string().into())).await?;
@@ -251,12 +264,17 @@ where S: Sink<Message> + Unpin, S::Error: std::error::Error + Send + Sync + 'sta
 }
 
 async fn ws_loop(stream: Stream, syms: Arc<Vec<String>>, tx: mpsc::Sender<(String, Table)>) {
+    let mut backoff = 1u64;
     loop {
         let url = "wss://stream.bybit.com/v5/public/linear";
-        if let Err(e) = ws_run(stream, url, &syms, &tx).await {
-            eprintln!("[ws {}] {e:#}; переподключение через 3с", stream.dir());
+        match ws_run(stream, url, &syms, &tx).await {
+            Ok(()) => { backoff = 1; }
+            Err(e) => {
+                eprintln!("[ws {}] {e:#}; переподключение через {backoff}с", stream.dir());
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+            }
         }
-        sleep(Duration::from_secs(3)).await;
     }
 }
 
@@ -496,6 +514,11 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel(16384);
     let spawn = |stream: Stream, list: Arc<Vec<String>>, tx: &mpsc::Sender<(String, Table)>| {
+        if stream == Stream::Liquidation {
+            let tx = tx.clone();
+            tokio::spawn(async move { ws_loop(stream, list, tx).await });
+            return;
+        }
         let per = if stream == Stream::Orderbook { OB_PER_CONN } else { TOPIC_PER_CONN };
         for chunk in list.chunks(per) {
             let tx = tx.clone();
@@ -521,4 +544,49 @@ async fn main() -> Result<()> {
     drop(tx);
     flush_loop(rx).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn liquidation_strip_broadcast() {
+        assert_eq!(Stream::Liquidation.strip("allLiquidation"), Some("broadcast"));
+        assert_eq!(Stream::Liquidation.strip("allLiquidation.BTCUSDT"), Some("BTCUSDT"));
+    }
+
+    #[test]
+    fn liquidation_parse_broadcast() {
+        let msg = json!({
+            "topic": "allLiquidation",
+            "ts": 1234567890000u64,
+            "data": [{"symbol": "BTCUSDT", "S": "Sell", "p": "50000", "v": "0.1"}]
+        });
+        let (sym, table) = parse_message(Stream::Liquidation, &msg).unwrap();
+        assert_eq!(sym, "BTCUSDT");
+        assert_eq!(table[0].1.len(), 1);
+    }
+
+    #[test]
+    fn liquidation_parse_direct() {
+        let msg = json!({
+            "topic": "allLiquidation.ETHUSDT",
+            "ts": 1234567890000u64,
+            "data": [{"S": "Buy", "p": "3000", "v": "1.0"}]
+        });
+        let (sym, table) = parse_message(Stream::Liquidation, &msg).unwrap();
+        assert_eq!(sym, "ETHUSDT");
+    }
+
+    #[test]
+    fn trades_strip() {
+        assert_eq!(Stream::Trades.strip("publicTrade.BTCUSDT"), Some("BTCUSDT"));
+        assert_eq!(Stream::Trades.strip("something.else"), None);
+    }
+
+    #[test]
+    fn orderbook_strip() {
+        assert_eq!(Stream::Orderbook.strip("orderbook.50.ETHUSDT"), Some("ETHUSDT"));
+    }
 }

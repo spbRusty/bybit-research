@@ -66,8 +66,11 @@ def _read(kind: str, sym: str) -> pl.DataFrame | None:
 
 
 def _join_min(out: pl.DataFrame, f: pl.DataFrame) -> pl.DataFrame:
-    cols = ["bucket_ms"] + [c for c in f.columns if c != "bucket_ms"]
-    return (out.join(f.select(cols), on="bucket_ms", how="full", coalesce=True)
+    right_cols = [c for c in f.columns if c != "bucket_ms"]
+    collide = [c for c in right_cols if c in out.columns]
+    f = f.rename({c: f"{c}_r" for c in collide})
+    return (out.join(f, on="bucket_ms", how="full", coalesce=True)
+            .drop([f"{c}_r" for c in collide])
             .sort("bucket_ms"))
 
 
@@ -114,12 +117,16 @@ def _orderbook_features(df: pl.DataFrame) -> pl.DataFrame:
     pivot = pivot.rename(rename)
     bid_sz_cols = [c for c in pivot.columns if c.startswith("bid") and c.endswith("_sz")]
     ask_sz_cols = [c for c in pivot.columns if c.startswith("ask") and c.endswith("_sz")]
+    raw_level_cols = [c for c in pivot.columns
+                       if c.startswith(("bid", "ask"))]
     return pivot.with_columns([
         pl.sum_horizontal(bid_sz_cols).alias("mk_depth_bid5"),
         pl.sum_horizontal(ask_sz_cols).alias("mk_depth_ask5"),
         pl.col("bid1_px").alias("mk_best_bid"),
         pl.col("ask1_px").alias("mk_best_ask"),
-    ])
+        pl.col("bid1_sz").alias("mk_bid1_sz"),
+        pl.col("ask1_sz").alias("mk_ask1_sz"),
+    ]).drop(raw_level_cols)
 
 
 def _futures_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -168,7 +175,7 @@ def build_market_features(symbol: str) -> pl.DataFrame:
     # Разреженность: стакан/funding/ratio — «состояния», известные и между поллингами.
     # forward_fill по времени (только назад, без look-ahead в будущее) для медленных величин.
     state_cols = [c for c in ("mk_best_bid", "mk_best_ask", "mk_funding_rate", "mk_oi",
-                              "mk_mark_px", "mk_buy_ratio", "bid1_sz", "ask1_sz",
+                              "mk_mark_px", "mk_buy_ratio",
                               "mk_depth_bid5", "mk_depth_ask5") if c in out.columns]
     out = out.with_columns([pl.col(c).forward_fill() for c in state_cols])
     if "mk_oi" in out.columns:
@@ -183,11 +190,11 @@ def build_market_features(symbol: str) -> pl.DataFrame:
              .then((pl.col("mk_best_bid") + pl.col("mk_best_ask")) / 2).otherwise(None)
              .alias("mk_imid"),
         ])
-    if "bid1_sz" in out.columns and "ask1_sz" in out.columns:
+    if "mk_bid1_sz" in out.columns and "mk_ask1_sz" in out.columns:
         out = out.with_columns([
-            pl.when((pl.col("bid1_sz") + pl.col("ask1_sz")) > 0)
-             .then((pl.col("bid1_sz") - pl.col("ask1_sz"))
-                   / (pl.col("bid1_sz") + pl.col("ask1_sz"))).otherwise(None)
+            pl.when((pl.col("mk_bid1_sz") + pl.col("mk_ask1_sz")) > 0)
+             .then((pl.col("mk_bid1_sz") - pl.col("mk_ask1_sz"))
+                   / (pl.col("mk_bid1_sz") + pl.col("mk_ask1_sz"))).otherwise(None)
              .alias("mk_imb1"),
         ])
     return (out.with_columns(pl.col("bucket_ms").cast(pl.Datetime("ms")).alias("open_time"))

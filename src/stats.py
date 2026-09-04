@@ -22,11 +22,7 @@ _R = load_toml("research.toml")
 def block_bootstrap_ci(values: np.ndarray, block: int = 25,
                        n_boot: int = 2000, alpha: float = 0.05,
                        seed: int = 42) -> tuple[float, float, float]:
-    """Доверительный интервал среднего через block bootstrap.
-
-    Наблюдения ресемплируются целыми блоками длины block (сохраняет
-    кратковременную временную зависимость). Возвращает (mean, lo, hi).
-    """
+    """Доверительный интервал среднего через block bootstrap."""
     vals = np.asarray(values, dtype=float)
     vals = vals[~np.isnan(vals)]
     n = vals.size
@@ -36,11 +32,15 @@ def block_bootstrap_ci(values: np.ndarray, block: int = 25,
         block = max(1, n // 2)
     rng = np.random.default_rng(seed)
     n_blocks = int(np.ceil(n / block))
-    means = np.empty(n_boot)
-    for i in range(n_boot):
-        starts = rng.integers(0, n, size=n_blocks)
-        idx = np.concatenate([np.arange(s, min(s + block, n)) for s in starts])
-        means[i] = vals[idx[:n]].mean()
+    all_starts = rng.integers(0, n, size=(n_boot, n_blocks))
+    offsets = np.arange(block)
+    CHUNK = 100
+    block_means = np.empty((n_boot, n_blocks), dtype=np.float64)
+    for i in range(0, n_boot, CHUNK):
+        chunk = min(CHUNK, n_boot - i)
+        idx = ((all_starts[i:i+chunk, :, None] + offsets[None, None, :]) % n)
+        block_means[i:i+chunk] = vals[idx].mean(axis=2)
+    means = block_means.mean(axis=1)
     lo, hi = np.percentile(means, (100 * alpha / 2, 100 * (1 - alpha / 2)))
     return (vals.mean(), float(lo), float(hi))
 
@@ -64,14 +64,20 @@ def cluster_bootstrap_ci(values: np.ndarray, labels: np.ndarray,
     n = vals.size
     if n == 0:
         return (np.nan, np.nan, np.nan)
-    clusters = np.unique(labels)
+    clusters, inv = np.unique(labels, return_inverse=True)
+    n_clusters = clusters.size
     rng = np.random.default_rng(seed)
-    means = np.empty(n_boot)
-    for i in range(n_boot):
-        chosen = rng.choice(clusters, size=clusters.size, replace=True)
-        # среднее по объединению наблюдений выбранных кластеров
-        sel = np.isin(labels, chosen)
-        means[i] = vals[sel].mean()
+    order = np.argsort(inv)
+    sorted_inv = inv[order]
+    sorted_vals = vals[order]
+    cluster_starts = np.searchsorted(sorted_inv, np.arange(n_clusters))
+    cluster_counts = np.diff(np.append(cluster_starts, n))
+    cluster_sums = np.add.reduceat(sorted_vals, cluster_starts)
+    cluster_means = cluster_sums / np.maximum(cluster_counts, 1)
+    chosen = rng.choice(n_clusters, size=(n_boot, n_clusters), replace=True)
+    sel_counts = cluster_counts[chosen]
+    sel_sums = cluster_means[chosen] * sel_counts
+    means = sel_sums.sum(axis=1) / sel_counts.sum(axis=1)
     lo, hi = np.percentile(means, (100 * alpha / 2, 100 * (1 - alpha / 2)))
     return (vals.mean(), float(lo), float(hi))
 

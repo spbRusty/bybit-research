@@ -112,14 +112,24 @@ def main(limit: int | None = None, category: str | None = None) -> int:
     if not all_events:
         logger.error("Нет событий — проверьте данные/юниверс")
         return 1
-    events = pl.concat(all_events)
+    all_cols = sorted(set(c for ev in all_events for c in ev.columns))
+    aligned = []
+    for ev in all_events:
+        missing = [c for c in all_cols if c not in ev.columns]
+        for c in missing:
+            ev = ev.with_columns(pl.lit(None).alias(c))
+        aligned.append(ev.select(all_cols))
+    events = pl.concat(aligned)
     events_mod.save_events(events, "all")
     logger.info("Событий всего: %d", events.height)
 
     # 3. Исследование (§30-34): baseline H001-H008 + автоматически сгенерированные (§22)
     baseline = research_mod.HYPOTHESES
-    generated = hgen_mod.generate_hypotheses(events)
-    generated = hgen_mod.filter_by_freq(generated, events, _R["min_events"])
+    # Пороги/percentile генератора считаются ТОЛЬКО по discovery (§33): иначе
+    # validation/oos влияли бы на подбор порогов — утечка выбора гипотезы.
+    disc_events = research_mod.split_periods(events)["discovery"]
+    generated = hgen_mod.generate_hypotheses(disc_events)
+    generated = hgen_mod.filter_by_freq(generated, disc_events, _R["min_events"])
     all_hyp = list(baseline) + generated
     logger.info("Гипотез: baseline=%d + generator=%d = %d",
                 len(baseline), len(generated), len(all_hyp))

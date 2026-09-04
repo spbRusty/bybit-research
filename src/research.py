@@ -162,7 +162,8 @@ def run_research(events: pl.DataFrame,
     disc, val, oos = periods["discovery"], periods["validation"], periods["oos"]
 
     rows = []
-    for hyp in hypotheses:
+    for i, hyp in enumerate(hypotheses):
+        logger.info("research: %d/%d %s", i + 1, len(hypotheses), hyp.hypothesis_id)
         m = test_hypothesis(disc, hyp, cost_survival)
         m.update({"hypothesis_id": hyp.hypothesis_id, "description": hyp.description,
                   "entry_side": hyp.entry_side, "horizon_min": hyp.horizon_min})
