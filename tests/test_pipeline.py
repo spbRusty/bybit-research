@@ -10,6 +10,8 @@ import numpy as np
 import polars as pl
 
 from src.pipeline import (
+    ALWAYS_REQUIRED,
+    CANDIDATE_REQUIRED,
     StageResult,
     StageStatus,
     build_acceptance_report,
@@ -285,65 +287,319 @@ class TestParameterFreeze(unittest.TestCase):
         self.assertFalse(r.metrics["match"])
 
 
+def _pass(s: str) -> StageResult:
+    return StageResult(stage=s, status=StageStatus.PASS, run_id="r1")
+
+def _reject(s: str, err: str = "fail") -> StageResult:
+    return StageResult(stage=s, status=StageStatus.REJECT, run_id="r1", errors=[err])
+
+def _stop(s: str, err: str = "stop") -> StageResult:
+    return StageResult(stage=s, status=StageStatus.STOP, run_id="r1", errors=[err])
+
+def _error(s: str, err: str = "error") -> StageResult:
+    return StageResult(stage=s, status=StageStatus.ERROR, run_id="r1", errors=[err])
+
+def _skipped(s: str) -> StageResult:
+    return StageResult(stage=s, status=StageStatus.SKIPPED, run_id="r1",
+                       metrics={"skipped": True})
+
+
 class TestAcceptanceReport(unittest.TestCase):
-    def test_all_pass(self):
-        stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="critic", status=StageStatus.PASS, run_id="r1"),
-        ]
-        report = build_acceptance_report(stages, {"candidates": ["H001"], "finalist": {"hypothesis_id": "H001"}}, "r1")
+
+    def _all_pass_with_finalist(self):
+        return [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ], {"candidates": ["H001"], "finalist": {"hypothesis_id": "H001"}}
+
+    def test_all_pass_with_finalist(self):
+        stages, result = self._all_pass_with_finalist()
+        report = build_acceptance_report(stages, result, "r1")
         self.assertEqual(report["verdict"], "PASS")
         self.assertEqual(report["run_id"], "r1")
 
     def test_one_reject(self):
-        stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="oos_gate", status=StageStatus.REJECT, run_id="r1",
-                        errors=["t_stat too low"]),
-        ]
-        report = build_acceptance_report(stages, {}, "r1")
+        stages, result = self._all_pass_with_finalist()
+        stages[4] = _reject("parameter_freeze", "Parameter drift")
+        report = build_acceptance_report(stages, result, "r1")
         self.assertEqual(report["verdict"], "REJECT")
-        self.assertIn("t_stat too low", report["reject_reasons"])
+        self.assertIn("Parameter drift", report["reject_reasons"])
 
     def test_has_provenance(self):
-        stages = [StageResult(stage="x", status=StageStatus.PASS, run_id="r1")]
+        stages = [_pass("data_validation"), _pass("feature_validation"),
+                  _pass("critic")]
         report = build_acceptance_report(stages, {"provenance": {"a": 1}}, "r1")
         self.assertEqual(report["provenance"]["a"], 1)
 
     def test_skipped_does_not_affect_verdict(self):
-        stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1",
-                        metrics={"skipped": True}),
-            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
-                        errors=["costs fail"]),
-        ]
-        report = build_acceptance_report(stages, {}, "r1")
-        self.assertEqual(report["verdict"], "REJECT")
-        self.assertNotIn("skipped", [s["stage"] for s in report["stages"]
-                                     if s["status"] == "SKIPPED"
-                                     and "skipped" in str(report["reject_reasons"])])
+        stages, result = self._all_pass_with_finalist()
+        stages[4] = _skipped("parameter_freeze")
+        report = build_acceptance_report(stages, result, "r1")
+        self.assertEqual(report["verdict"], "PASS")
 
     def test_skipped_only_pass(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
         ]
-        report = build_acceptance_report(stages, {"finalist": {"hypothesis_id": "H001"}}, "r1")
+        report = build_acceptance_report(stages, {
+            "candidates": ["H001"], "finalist": {"hypothesis_id": "H001"}
+        }, "r1")
         self.assertEqual(report["verdict"], "PASS")
+
+    def test_skipped_freeze_without_finalist(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
+        ]
+        report = build_acceptance_report(stages, {"candidates": []}, "r1")
+        self.assertEqual(report["verdict"], "NO_CANDIDATE")
 
     def test_no_finalist_reject_from_critic(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="feature_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
-            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
-                        errors=["costs: t=-3.55 <= 2.0"]),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _skipped("parameter_freeze"),
+            _reject("critic", "costs: t=-3.55 <= 2.0"),
         ]
         report = build_acceptance_report(stages, {"candidates": [], "finalist": None}, "r1")
         self.assertEqual(report["verdict"], "REJECT")
-        self.assertEqual(report["finalist"], None)
+        self.assertIsNone(report["finalist"])
         self.assertEqual(report["candidates"], [])
+
+
+class TestAcceptanceReportPriority(unittest.TestCase):
+
+    def _base_stages(self):
+        return [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ]
+
+    def _result_with_finalist(self):
+        return {"candidates": ["H001"], "finalist": {"hypothesis_id": "H001"}}
+
+    def test_error_overrides_pass(self):
+        stages = self._base_stages()
+        stages[0] = _error("data_loading", "No events produced")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+
+    def test_pass_then_error(self):
+        stages = self._base_stages()
+        stages[5] = _error("critic", "exception in review")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+
+    def test_stop_overrides_pass(self):
+        stages = self._base_stages()
+        stages[0] = _stop("data_validation", "insufficient events")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "STOP")
+
+    def test_pass_then_stop(self):
+        stages = self._base_stages()
+        stages[3] = _stop("oos_gate", "no OOS data")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "STOP")
+
+    def test_reject_overrides_pass(self):
+        stages = self._base_stages()
+        stages[2] = _reject("validation_gate", "t too low")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+
+    def test_pass_then_reject(self):
+        stages = self._base_stages()
+        stages[5] = _reject("critic", "temporal instability")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+
+    def test_error_beats_stop(self):
+        stages = self._base_stages()
+        stages[0] = _stop("data_validation", "too few events")
+        stages[5] = _error("critic", "exception")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+
+    def test_error_beats_reject(self):
+        stages = self._base_stages()
+        stages[2] = _reject("validation_gate", "t too low")
+        stages[5] = _error("critic", "exception")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+
+    def test_stop_beats_reject(self):
+        stages = self._base_stages()
+        stages[2] = _reject("validation_gate", "t too low")
+        stages[3] = _stop("oos_gate", "no data")
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "STOP")
+
+    def test_order_independent_error_first(self):
+        stages = [_error("data_loading", "err"), _pass("data_validation"),
+                  _pass("feature_validation"), _pass("validation_gate"),
+                  _pass("oos_gate"), _pass("parameter_freeze"),
+                  _pass("critic")]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+
+    def test_order_independent_error_last(self):
+        stages = [_pass("data_validation"), _pass("feature_validation"),
+                  _pass("validation_gate"), _pass("oos_gate"),
+                  _pass("parameter_freeze"), _pass("critic"),
+                  _error("data_loading", "err")]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+
+    def test_order_independent_stop_first(self):
+        stages = [_stop("data_validation", "stop"), _pass("feature_validation"),
+                  _pass("validation_gate"), _pass("oos_gate"),
+                  _pass("parameter_freeze"), _pass("critic")]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "STOP")
+
+    def test_order_independent_stop_last(self):
+        stages = [_pass("data_validation"), _pass("feature_validation"),
+                  _pass("validation_gate"), _pass("oos_gate"),
+                  _pass("parameter_freeze"), _pass("critic"),
+                  _stop("oos_gate", "stop")]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "STOP")
+
+    def test_order_independent_reject_first(self):
+        stages = [_reject("validation_gate", "low t"), _pass("data_validation"),
+                  _pass("feature_validation"), _pass("oos_gate"),
+                  _pass("parameter_freeze"), _pass("critic")]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+
+    def test_order_independent_reject_last(self):
+        stages = [_pass("data_validation"), _pass("feature_validation"),
+                  _pass("validation_gate"), _pass("oos_gate"),
+                  _pass("parameter_freeze"), _pass("critic"),
+                  _reject("critic", "low t")]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+
+
+class TestAcceptanceReportMissingStages(unittest.TestCase):
+
+    def _result_with_finalist(self):
+        return {"candidates": ["H001"], "finalist": {"hypothesis_id": "H001"}}
+
+    def test_missing_always_required_stage(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("parameter_freeze"),
+        ]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+        self.assertTrue(any("missing required stage: critic" in r
+                            for r in report["reject_reasons"]))
+
+    def test_missing_candidate_required_stage(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+        self.assertTrue(any("missing required stage: oos_gate" in r
+                            for r in report["reject_reasons"]))
+
+    def test_missing_multiple_stages(self):
+        stages = [_pass("data_validation")]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+        missing = [r for r in report["reject_reasons"] if "missing required stage" in r]
+        self.assertTrue(len(missing) >= 3)
+
+    def test_no_candidates_skips_candidate_required(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
+        ]
+        report = build_acceptance_report(stages, {"candidates": []}, "r1")
+        self.assertEqual(report["verdict"], "NO_CANDIDATE")
+        self.assertFalse(any("missing required stage" in r
+                             for r in report["reject_reasons"]))
+
+    def test_missing_stage_beats_pass(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ]
+        report = build_acceptance_report(stages, self._result_with_finalist(), "r1")
+        self.assertEqual(report["verdict"], "ERROR")
+
+
+class TestAcceptanceReportFinalist(unittest.TestCase):
+
+    def test_empty_finalist_rejected(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ]
+        report = build_acceptance_report(stages, {
+            "candidates": ["H001"], "finalist": {}
+        }, "r1")
+        self.assertEqual(report["verdict"], "NO_CANDIDATE")
+
+    def test_none_finalist_no_pass(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ]
+        report = build_acceptance_report(stages, {
+            "candidates": ["H001"], "finalist": None
+        }, "r1")
+        self.assertEqual(report["verdict"], "NO_CANDIDATE")
+
+    def test_valid_finalist_pass(self):
+        stages = [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ]
+        report = build_acceptance_report(stages, {
+            "candidates": ["H001"],
+            "finalist": {"hypothesis_id": "H001", "entry_side": "long"}
+        }, "r1")
+        self.assertEqual(report["verdict"], "PASS")
 
 
 def _critic_events(n=200, relative_volume=4.0, is_green=True):
@@ -456,10 +712,10 @@ class TestFinalistFormation(unittest.TestCase):
 
     def test_verdict_deterministic(self):
         stages_a = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
-            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
-                        errors=["costs fail"]),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _skipped("parameter_freeze"),
+            _reject("critic", "costs fail"),
         ]
         stages_b = list(stages_a)
         r1 = build_acceptance_report(stages_a, {"candidates": []}, "r1")
@@ -474,10 +730,10 @@ class TestAcceptanceReportVerdict(unittest.TestCase):
 
     def test_no_candidate_not_pass(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
-            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
-                        errors=["costs: t=-3.55"]),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _skipped("parameter_freeze"),
+            _reject("critic", "costs: t=-3.55"),
         ]
         report = build_acceptance_report(stages, {"candidates": []}, "r1")
         self.assertEqual(report["verdict"], "REJECT")
@@ -485,47 +741,58 @@ class TestAcceptanceReportVerdict(unittest.TestCase):
 
     def test_no_candidate_all_stages_pass(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
         ]
         report = build_acceptance_report(stages, {"candidates": []}, "r1")
         self.assertEqual(report["verdict"], "NO_CANDIDATE")
 
     def test_candidate_val_reject_not_pass(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="validation_gate", status=StageStatus.REJECT, run_id="r1",
-                        errors=["t_stat=1.5 < 2.0"]),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _reject("validation_gate", "t_stat=1.5 < 2.0"),
+            _pass("oos_gate"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
         ]
         report = build_acceptance_report(stages, {"candidates": ["H001"]}, "r1")
         self.assertEqual(report["verdict"], "REJECT")
 
     def test_candidate_oos_reject_not_pass(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="validation_gate", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="oos_gate", status=StageStatus.REJECT, run_id="r1",
-                        errors=["t_stat=1.2 < 2.0"]),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _reject("oos_gate", "t_stat=1.2 < 2.0"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
         ]
         report = build_acceptance_report(stages, {"candidates": ["H001"]}, "r1")
         self.assertEqual(report["verdict"], "REJECT")
 
     def test_no_finalist_not_pass(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
         ]
         report = build_acceptance_report(stages, {"candidates": ["H001"], "finalist": None}, "r1")
         self.assertEqual(report["verdict"], "NO_CANDIDATE")
 
     def test_finalist_critic_reject(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="critic", status=StageStatus.REJECT, run_id="r1",
-                        errors=["temporal_stability: нестабильно"]),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _reject("critic", "temporal_stability: нестабильно"),
         ]
         report = build_acceptance_report(stages, {
             "candidates": ["H001"],
@@ -535,11 +802,12 @@ class TestAcceptanceReportVerdict(unittest.TestCase):
 
     def test_finalist_all_pass(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="validation_gate", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="oos_gate", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="critic", status=StageStatus.PASS, run_id="r1"),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
         ]
         report = build_acceptance_report(stages, {
             "candidates": ["H001"],
@@ -549,25 +817,31 @@ class TestAcceptanceReportVerdict(unittest.TestCase):
 
     def test_skipped_freeze_no_error(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="parameter_freeze", status=StageStatus.SKIPPED, run_id="r1"),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _skipped("parameter_freeze"),
+            _pass("critic"),
         ]
         report = build_acceptance_report(stages, {"candidates": []}, "r1")
         self.assertNotEqual(report["verdict"], "ERROR")
 
     def test_any_error_is_error(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.PASS, run_id="r1"),
-            StageResult(stage="data_loading", status=StageStatus.ERROR, run_id="r1",
-                        errors=["No events produced"]),
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+            _error("data_loading", "No events produced"),
         ]
         report = build_acceptance_report(stages, {}, "r1")
         self.assertEqual(report["verdict"], "ERROR")
 
     def test_stop_is_stop(self):
         stages = [
-            StageResult(stage="data_validation", status=StageStatus.STOP, run_id="r1",
-                        errors=["insufficient events"]),
+            _stop("data_validation", "insufficient events"),
+            _pass("feature_validation"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
         ]
         report = build_acceptance_report(stages, {}, "r1")
         self.assertEqual(report["verdict"], "STOP")

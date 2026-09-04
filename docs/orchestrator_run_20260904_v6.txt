@@ -1,0 +1,49 @@
+2026-09-04 12:14:52,867 INFO orchestrator === ORCHESTRATOR: 2026-09-04T09:14:52.867486+00:00 (run_id=20260904T091452Z) ===
+2026-09-04 12:15:09,979 INFO data Юниверс ликвидности: 72 символов из 1383 (окно=30d порог=$5M устойчивость>=80%)
+2026-09-04 12:15:09,982 INFO orchestrator Universe: 10 symbols
+2026-09-04 12:15:52,711 INFO orchestrator Events: 540270
+2026-09-04 12:15:52,725 INFO orchestrator STAGE data_validation: PASS (OK)
+2026-09-04 12:15:56,889 INFO orchestrator STAGE feature_validation: PASS (OK)
+2026-09-04 12:16:00,186 INFO orchestrator Hypotheses: 37
+2026-09-04 12:16:01,474 INFO research research: 1/37 H001
+2026-09-04 12:16:10,690 INFO research research: 2/37 H002
+2026-09-04 12:16:18,871 INFO research research: 3/37 H003
+2026-09-04 12:16:22,535 INFO research research: 4/37 H004
+2026-09-04 12:16:22,784 INFO research research: 5/37 H005
+2026-09-04 12:16:28,366 INFO research research: 6/37 H006
+2026-09-04 12:16:28,386 INFO research research: 7/37 H007
+2026-09-04 12:16:28,553 INFO research research: 8/37 H008
+2026-09-04 12:16:28,707 INFO research research: 9/37 HG001
+2026-09-04 12:16:48,222 INFO research research: 10/37 HG002
+2026-09-04 12:17:06,946 INFO research research: 11/37 HG003
+2026-09-04 12:17:26,760 INFO research research: 12/37 HG004
+2026-09-04 12:17:34,871 INFO research research: 13/37 HG005
+2026-09-04 12:17:43,021 INFO research research: 14/37 HG006
+2026-09-04 12:17:49,299 INFO research research: 15/37 HG007
+2026-09-04 12:17:54,049 INFO research research: 16/37 HG008
+2026-09-04 12:17:54,984 INFO research research: 17/37 HG009
+2026-09-04 12:17:55,934 INFO research research: 18/37 HG010
+2026-09-04 12:18:01,473 INFO research research: 19/37 HG011
+2026-09-04 12:18:06,956 INFO research research: 20/37 HG012
+2026-09-04 12:18:07,726 INFO research research: 21/37 HG013
+2026-09-04 12:18:08,528 INFO research research: 22/37 HG014
+2026-09-04 12:18:09,461 INFO research research: 23/37 HG015
+2026-09-04 12:18:10,311 INFO research research: 24/37 HG016
+2026-09-04 12:18:11,842 INFO research research: 25/37 HG017
+2026-09-04 12:18:13,350 INFO research research: 26/37 HG018
+2026-09-04 12:18:20,331 INFO research research: 27/37 HG019
+2026-09-04 12:18:28,503 INFO research research: 28/37 HG020
+2026-09-04 12:18:29,696 INFO research research: 29/37 HG021
+2026-09-04 12:18:31,058 INFO research research: 30/37 HG022
+2026-09-04 12:18:48,035 INFO research research: 31/37 HG023
+2026-09-04 12:19:04,840 INFO research research: 32/37 HG024
+2026-09-04 12:19:20,565 INFO research research: 33/37 HG025
+2026-09-04 12:19:36,610 INFO research research: 34/37 HG026
+2026-09-04 12:19:46,578 INFO research research: 35/37 HG027
+2026-09-04 12:19:55,448 INFO research research: 36/37 HG028
+2026-09-04 12:20:03,213 INFO research research: 37/37 HG029
+2026-09-04 12:20:09,668 INFO orchestrator Research research_20260904T092009Z: candidates=[]
+2026-09-04 12:20:09,675 INFO orchestrator STAGE parameter_freeze: SKIPPED (OK)
+2026-09-04 12:20:09,675 INFO orchestrator STAGE critic: REJECT (costs: сильнейший discovery t=-3.55 <= 2.0 (порог: > 2.0, нужен положительный t), издержки 0.20% кругового оборота; сетка стресса: [0.001, 0.0015, 0.002, 0.003])
+2026-09-04 12:20:09,677 INFO orchestrator Acceptance report: /home/vlad/Документы/построение/data/research/results/acceptance_20260904T091452Z.json (verdict=REJECT)
+2026-09-04 12:20:09,677 INFO orchestrator === DONE in 316.8s: verdict=REJECT ===

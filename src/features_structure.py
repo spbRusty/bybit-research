@@ -65,9 +65,9 @@ def add_structure_features(df: pl.DataFrame) -> pl.DataFrame:
     out = out.with_columns([
         (c > rh20).cast(pl.Int8).alias("breakout_20"),
         (c / rh20.clip(1e-12) - 1).alias("breakout_magnitude"),
-        ((c > rh20).cast(pl.Int8) & (pl.col("candle_close_pos") > 0.5))
+        ((c > rh20) & (pl.col("candle_close_pos") > 0.5))
         .cast(pl.Int8).alias("breakout_continuation"),
-        ((c < rh20).cast(pl.Int8) & (pl.col("rolling_high_20") > rh20))
+        ((c < rh20) & (pl.col("rolling_high_20") > rh20))
         .cast(pl.Int8).alias("breakout_failure"),
         ((rh60 - rl60) / c.clip(1e-12)).alias("range_width"),
         pl.when((c > rl60 * 1.001) & (c < rh60 * 0.999)).then(1).otherwise(0)

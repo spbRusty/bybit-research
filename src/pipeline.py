@@ -386,31 +386,66 @@ def stage_parameter_freeze(
 # Structured acceptance report
 # --------------------------------------------------------------------------
 
+ALWAYS_REQUIRED = {"data_validation", "feature_validation", "critic", "parameter_freeze"}
+CANDIDATE_REQUIRED = {"validation_gate", "oos_gate"}
+
+_VERDICT_PRIORITY = {
+    "ERROR": 0,
+    "STOP": 1,
+    "REJECT": 2,
+    "NO_CANDIDATE": 3,
+    "PASS": 4,
+}
+
+
 def build_acceptance_report(
     stages: list[StageResult],
     result: dict,
     run_id: str,
 ) -> dict:
-    verdict = "PASS"
-    reject_reasons = []
+    reject_reasons: list[str] = []
+    present_stages: set[str] = set()
+
     for s in stages:
+        present_stages.add(s.stage)
         if s.status == StageStatus.SKIPPED:
             continue
         if not s.passed:
-            verdict = s.status.value
             reject_reasons.extend(s.errors)
 
     has_finalist = bool(result.get("finalist"))
     has_candidates = bool(result.get("candidates"))
+    present_errors: list[str] = []
 
-    if verdict == "PASS" and not has_finalist:
-        verdict = "NO_CANDIDATE"
+    for req in ALWAYS_REQUIRED:
+        if req not in present_stages:
+            present_errors.append(f"missing required stage: {req}")
+    if has_candidates:
+        for req in CANDIDATE_REQUIRED:
+            if req not in present_stages:
+                present_errors.append(f"missing required stage: {req}")
+
+    worst = "PASS"
+    for s in stages:
+        if s.status == StageStatus.SKIPPED:
+            continue
+        if not s.passed:
+            sv = s.status.value
+            if _VERDICT_PRIORITY.get(sv, 99) < _VERDICT_PRIORITY.get(worst, 99):
+                worst = sv
+
+    if present_errors:
+        worst = "ERROR"
+        reject_reasons.extend(present_errors)
+
+    if worst == "PASS" and not has_finalist:
+        worst = "NO_CANDIDATE"
 
     return {
         "run_id": run_id,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "config_hash": compute_config_hash(),
-        "verdict": verdict,
+        "verdict": worst,
         "provenance": result.get("provenance", {}),
         "stages": [s.to_dict() for s in stages],
         "candidates": result.get("candidates", []),
