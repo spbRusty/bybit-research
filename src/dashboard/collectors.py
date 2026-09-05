@@ -526,7 +526,69 @@ def get_signals() -> dict:
     return _cached("signals", 30, _load)
 
 
-# ─── 13. System Status ─────────────────────────────────────────────
+# ─── 13. Orderbook Captures ─────────────────────────────────────────
+
+def get_captures() -> dict:
+    """Orderbook capture status: pending triggers + completed captures."""
+    from config.settings import MARKET_DATA_DIR
+
+    triggers_dir = MARKET_DATA_DIR.parent / "triggers"
+    captures_dir = MARKET_DATA_DIR / "orderbook" / "captures"
+
+    # Pending triggers
+    pending = []
+    if triggers_dir.exists():
+        for f in sorted(triggers_dir.glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+                pending.append({
+                    "event_id": data.get("event_id", f.stem),
+                    "symbol": data.get("symbol", "?"),
+                    "created_at": data.get("created_at"),
+                    "duration_sec": data.get("capture_duration_sec", 0),
+                })
+            except Exception:
+                pending.append({"event_id": f.stem, "symbol": "?"})
+
+    # Completed captures (directories with meta.json)
+    captures = []
+    if captures_dir.exists():
+        dirs = sorted(captures_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True)
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            meta_path = d / "meta.json"
+            meta = {}
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except Exception:
+                    pass
+            parquet_count = len(list(d.glob("*.parquet")))
+            size_mb = round(sum(f.stat().st_size for f in d.glob("*.parquet")) / 1e6, 2)
+            captures.append({
+                "event_id": meta.get("event_id", d.name),
+                "symbol": meta.get("symbol", d.name.split("_")[1] if "_" in d.name else "?"),
+                "started_at": meta.get("started_at"),
+                "duration_sec": meta.get("capture_duration_sec", 0),
+                "parquet_count": parquet_count,
+                "size_mb": size_mb,
+                "age_min": round((time.time() - d.stat().st_mtime) / 60, 1),
+            })
+
+    cfg = _load_toml("orderbook_capture.toml")
+    return {
+        "pending_count": len(pending),
+        "pending": pending,
+        "captures_count": len(captures),
+        "captures": captures[:20],
+        "max_concurrent": cfg.get("capture", {}).get("max_concurrent", 10),
+        "cooldown_sec": cfg.get("cooldown_sec", 300),
+        "duration_sec": cfg.get("capture", {}).get("duration_sec", 1200),
+    }
+
+
+# ─── 14. System Status ─────────────────────────────────────────────
 
 def get_system_status() -> dict:
     log_files = {

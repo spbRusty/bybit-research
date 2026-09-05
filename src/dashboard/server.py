@@ -88,6 +88,11 @@ async def api_signals():
     return JSONResponse(collectors.get_signals())
 
 
+@app.get("/api/captures")
+async def api_captures():
+    return JSONResponse(collectors.get_captures())
+
+
 @app.get("/api/status")
 async def api_status():
     return JSONResponse(collectors.get_system_status())

@@ -114,7 +114,19 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </div>
 </div>
 
-<!-- ═══════ ROW 7: Logs ═══════ -->
+<!-- ═══════ ROW 7: Orderbook Captures ═══════ -->
+<div class="grid g2">
+<div class="card">
+<h2>Orderbook Captures</h2>
+<div id="captures-summary">Loading...</div>
+</div>
+<div class="card">
+<h2>Pending Triggers</h2>
+<div id="triggers-list">Loading...</div>
+</div>
+</div>
+
+<!-- ═══════ ROW 8: Logs ═══════ -->
 <div class="card" style="margin-bottom:0">
 <h2>Logs</h2>
 <div class="log-box" id="log-content">Loading...</div>
@@ -338,7 +350,35 @@ async function renderHypotheses() {
   setIf('hyp-content', html);
 }
 
-// ═══════ 11. System Status + Logs ═══════
+// ═══════ 11. Orderbook Captures ═══════
+async function renderCaptures() {
+  const d = await fetchJSON('/captures');
+  if (!d) return;
+  const sc = d.captures_count > 0 ? 'status-ok' : 'status-na';
+  let html = `<div style="font-size:20px;font-weight:700" class="${sc}">${d.captures_count}</div><div class="sub">completed | ${d.pending_count} pending | max ${d.max_concurrent} concurrent | cooldown ${d.cooldown_sec}s</div>`;
+  if (d.captures && d.captures.length) {
+    html += '<table style="margin-top:4px"><tr><th>Symbol</th><th>Event</th><th>Size</th><th>Age</th></tr>';
+    for (const c of d.captures.slice(0, 10)) {
+      html += `<tr><td class="mono">${c.symbol}</td><td class="mono" title="${c.event_id}">${(c.event_id || '').slice(0, 22)}</td><td>${c.size_mb} MB</td><td>${c.age_min < 60 ? Math.round(c.age_min) + 'm' : Math.round(c.age_min / 60) + 'h'}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  setIf('captures-summary', html);
+
+  let trig = '';
+  if (d.pending && d.pending.length) {
+    trig = '<table><tr><th>Symbol</th><th>Event</th><th>Created</th></tr>';
+    for (const t of d.pending.slice(0, 10)) {
+      trig += `<tr><td class="mono">${t.symbol}</td><td class="mono">${(t.event_id || '').slice(0, 22)}</td><td>${fmt(t.created_at)}</td></tr>`;
+    }
+    trig += '</table>';
+  } else {
+    trig = '<div class="sub">No pending triggers</div>';
+  }
+  setIf('triggers-list', trig);
+}
+
+// ═══════ 12. System Status + Logs ═══════
 async function renderStatus() {
   const d = await fetchJSON('/status');
   if (!d) return;
@@ -376,7 +416,7 @@ async function refreshAll() {
   await Promise.all([
     renderPaper(), renderRisk(), renderStakes(), renderWinrate(),
     renderInstruments(), renderPipeline(), renderData(), renderStreams(),
-    renderSignals(), renderHypotheses(), renderStatus(), renderLogsPoll()
+    renderSignals(), renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll()
   ]);
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
   countdown = 3;

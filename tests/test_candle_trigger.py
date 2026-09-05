@@ -237,5 +237,98 @@ class TestRulesLoaded(unittest.TestCase):
             self.assertIsInstance(rule.horizons, list)
 
 
+class TestCaptureLifecycle(unittest.TestCase):
+    def test_full_lifecycle_write_read_cleanup(self):
+        trigger = TriggerFile(
+            event_id="20260905T120000Z_BTCUSDT_a1b2c3",
+            symbol="BTCUSDT",
+            category="linear",
+            trigger_params={"relative_volume": {"value": 5.0, "operator": "gt", "threshold": 3.0}},
+            horizons=[5, 10],
+            capture_duration_sec=1200,
+        )
+        path = trigger.write(_TRIGGERS_DIR)
+        try:
+            pending = list_pending_triggers(_TRIGGERS_DIR)
+            self.assertTrue(any(p.name == "20260905T120000Z_BTCUSDT_a1b2c3.json" for p in pending))
+
+            data = json.loads(path.read_text())
+            self.assertEqual(data["event_id"], "20260905T120000Z_BTCUSDT_a1b2c3")
+            self.assertEqual(data["trigger_version"], CONFIG_VERSION)
+            self.assertIn("created_at", data)
+        finally:
+            cleanup_processed_trigger("20260905T120000Z_BTCUSDT_a1b2c3", _TRIGGERS_DIR)
+
+        self.assertFalse(path.exists())
+
+    def test_no_event_no_trigger(self):
+        df = pl.DataFrame({
+            "symbol": ["BTCUSDT"],
+            "category": ["linear"],
+            "relative_volume": [1.0],
+            "relative_range": [1.0],
+        })
+        cd = CooldownTracker(cooldown_sec=0)
+        trigger = evaluate_trigger(df, "BTCUSDT", "linear", cooldown=cd)
+        self.assertIsNone(trigger)
+
+    def test_duplicate_event_id_prevented_by_cooldown(self):
+        df = pl.DataFrame({
+            "symbol": ["BTCUSDT"],
+            "category": ["linear"],
+            "relative_volume": [5.0],
+            "relative_range": [4.0],
+        })
+        cd = CooldownTracker(cooldown_sec=600)
+        t1 = evaluate_trigger(df, "BTCUSDT", "linear", cooldown=cd)
+        self.assertIsNotNone(t1)
+
+        t2 = evaluate_trigger(df, "BTCUSDT", "linear", cooldown=cd)
+        self.assertIsNone(t2)
+
+    def test_trigger_contains_all_provenance_fields(self):
+        df = pl.DataFrame({
+            "symbol": ["ETHUSDT"],
+            "category": ["linear"],
+            "relative_volume": [10.0],
+            "relative_range": [6.0],
+        })
+        cd = CooldownTracker(cooldown_sec=0)
+        trigger = evaluate_trigger(df, "ETHUSDT", "linear", cooldown=cd)
+        self.assertIsNotNone(trigger)
+
+        path = trigger.write(_TRIGGERS_DIR)
+        try:
+            data = json.loads(path.read_text())
+            required = ["event_id", "symbol", "category", "trigger_type", "trigger_version",
+                        "trigger_config_hash", "trigger_params", "horizons", "capture_duration_sec", "created_at"]
+            for field in required:
+                self.assertIn(field, data, f"Missing provenance field: {field}")
+        finally:
+            cleanup_processed_trigger(trigger.event_id, _TRIGGERS_DIR)
+
+
+class TestCaptureMetricsCollector(unittest.TestCase):
+    def test_get_captures_structure(self):
+        from src.dashboard.collectors import get_captures
+        result = get_captures()
+        self.assertIn("pending_count", result)
+        self.assertIn("captures_count", result)
+        self.assertIn("pending", result)
+        self.assertIn("captures", result)
+        self.assertIn("max_concurrent", result)
+        self.assertIn("cooldown_sec", result)
+        self.assertIn("duration_sec", result)
+        self.assertIsInstance(result["pending"], list)
+        self.assertIsInstance(result["captures"], list)
+
+    def test_get_captures_values_match_config(self):
+        from src.dashboard.collectors import get_captures
+        result = get_captures()
+        self.assertEqual(result["max_concurrent"], 10)
+        self.assertEqual(result["cooldown_sec"], 300)
+        self.assertEqual(result["duration_sec"], 1200)
+
+
 if __name__ == "__main__":
     unittest.main()
