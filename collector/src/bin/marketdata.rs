@@ -277,7 +277,7 @@ async fn ws_loop(stream: Stream, syms: Arc<Vec<String>>, tx: mpsc::Sender<(Strin
             Err(e) => {
                 eprintln!("[ws {}] {e:#}; переподключение через {backoff}с", stream.dir());
                 sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(30);
+                backoff = (backoff * 2).min(60);
             }
         }
     }
@@ -483,6 +483,10 @@ async fn ob_capture_once(
     eprintln!("[ob_capture] подписан на orderbook.50.{symbol}");
 
     loop {
+        if std::time::Instant::now() >= *deadline {
+            let _ = sink.send(Message::Text(json!({"op":"unsubscribe","args":[topic]}).to_string().into())).await;
+            break;
+        }
         tokio::select! {
             msg = stream_ws.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
@@ -500,13 +504,7 @@ async fn ob_capture_once(
                 Some(Err(e)) => return Err(e.into()),
                 None => break,
             },
-            _ = sleep(Duration::from_secs(2)) => {
-                if std::time::Instant::now() >= *deadline {
-                    // Отписываемся перед выходом
-                    let _ = sink.send(Message::Text(json!({"op":"unsubscribe","args":[topic]}).to_string().into())).await;
-                    break;
-                }
-            }
+            _ = sleep(Duration::from_millis(500)) => {}
         }
     }
     Ok(())
@@ -552,8 +550,8 @@ async fn ob_capture_task(trigger: TriggerFile) {
         tokio::select! {
             maybe = buf_rx.recv() => match maybe {
                 Some((_key, rows)) => {
-                    if all_rows.len() == rows.len() {
-                        for (i, (_, col)) in rows.into_iter().enumerate() {
+                    for (i, (_, col)) in rows.into_iter().enumerate() {
+                        if i < all_rows.len() {
                             all_rows[i].1.extend(col);
                         }
                     }

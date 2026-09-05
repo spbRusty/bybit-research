@@ -553,27 +553,31 @@ def get_captures() -> dict:
     # Completed captures (directories with meta.json)
     captures = []
     if captures_dir.exists():
-        dirs = sorted(captures_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True)
-        for d in dirs:
-            if not d.is_dir():
-                continue
-            meta_path = d / "meta.json"
+        entries = sorted(captures_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True)
+
+        parquet_files = [e for e in entries if e.is_file() and e.suffix == ".parquet"]
+        meta_files = {e.stem: e for e in entries if e.is_file() and e.name.endswith(".meta.json")}
+
+        for pf in parquet_files:
+            event_id = pf.stem
             meta = {}
-            if meta_path.exists():
+            mf = meta_files.get(f"{event_id}.meta")
+            if not mf:
+                mf = captures_dir / f"{event_id}.meta.json"
+            if mf.exists():
                 try:
-                    meta = json.loads(meta_path.read_text())
+                    meta = json.loads(mf.read_text())
                 except Exception:
                     pass
-            parquet_count = len(list(d.glob("*.parquet")))
-            size_mb = round(sum(f.stat().st_size for f in d.glob("*.parquet")) / 1e6, 2)
+            size_mb = round(pf.stat().st_size / 1e6, 2)
             captures.append({
-                "event_id": meta.get("event_id", d.name),
-                "symbol": meta.get("symbol", d.name.split("_")[1] if "_" in d.name else "?"),
+                "event_id": meta.get("event_id", event_id),
+                "symbol": meta.get("symbol", event_id.split("_")[1] if "_" in event_id else "?"),
                 "started_at": meta.get("started_at"),
                 "duration_sec": meta.get("capture_duration_sec", 0),
-                "parquet_count": parquet_count,
+                "records": meta.get("records", 0),
                 "size_mb": size_mb,
-                "age_min": round((time.time() - d.stat().st_mtime) / 60, 1),
+                "age_min": round((time.time() - pf.stat().st_mtime) / 60, 1),
             })
 
     cfg = _load_toml("orderbook_capture.toml")
