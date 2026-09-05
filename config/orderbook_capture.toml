@@ -1,0 +1,29 @@
+# Захват orderbook по сигналу свечи (ТЗ §3-§7)
+# Приложение A, B — candle trigger
+
+trigger_version = "1.0"          # версия конфигурации триггера
+cooldown_sec = 300               # минимум между триггерами для одного символа (сек)
+max_concurrent_triggers = 20     # макс. одновременных кандидатов в очереди
+
+[capture]
+duration_sec = 1200              # время захвата (сек). ~20 минут
+max_concurrent = 10              # макс. одновременных захватов orderbook
+save_dir = "collector/data/market/orderbook/captures"
+
+# Правила candle trigger
+# Каждое правило оценивает признаки свечи и запускает захват
+# feature: имя признака (из features.toml / features_market.py)
+# operator: gt, lt, ge, le, eq
+# threshold: пороговое значение
+# horizons: список горизонтов для future_returns (мин)
+[[rules]]
+feature = "relative_volume"
+operator = "gt"
+threshold = 3.0
+horizons = [5, 10]
+
+[[rules]]
+feature = "relative_range"
+operator = "gt"
+threshold = 3.0
+horizons = [5, 10]

@@ -2,17 +2,22 @@
 //!
 //! Собирает parquet-файлы для групп признаков ТЗ §12-§15:
 //!   - trades     : publicTrade.{sym}  -> data/market/trades/linear/{sym}.parquet  (§13 order flow)
-//!   - orderbook  : orderbook.50.{sym} -> data/market/orderbook/linear/{sym}.parquet (§12 стакан, top-N)
+//!   - orderbook  : event-driven capture -> data/market/orderbook/captures/{event_id}.parquet (§3 candle trigger)
 //!   - futures    : tickers.{sym}      -> data/market/futures/linear/{sym}.parquet  (§14 funding/OI, §15 basis)
 //!   - liquidation: allLiquidation.{sym} -> data/market/liquidation/linear/{sym}.parquet
 //!   - ratio      : REST account-ratio (поллинг) -> data/market/ratio/linear/{sym}.parquet
 //!
-//! WS-соединения шардируются по лимитам Bybit (orderbook-глубина ~10/соединение,
-//! обычные topic ~100/соединение); общий mpsc-буфер, сброс раз в FLUSH_SEC.
+//! Архитектура orderbook (§3-§7):
+//!   Python candle_trigger.py создаёт JSON-файлы в data/triggers/
+//!   -> trigger_watcher обнаруживает новый триггер
+//!   -> ob_capture_task подключается к WS, подписывается на orderbook.50.{symbol}
+//!   -> собирает данные capture_duration_sec
+//!   -> сохраняет parquet с event_id в имени файла
+//!   -> удаляет JSON-файл триггера
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +30,7 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
@@ -38,10 +44,9 @@ const RATIO_POLL_SEC: u64 = 300;
 const FUTURES_POLL_SEC: u64 = 60;
 const SUB_CHUNK: usize = 100;
 const DATA_ROOT: &str = "data/market";
-// Bybit WS caps: orderbook-глубина ~10 потоков/соединение; обычные topic ~200/соединение.
-const OB_PER_CONN: usize = 10;
-const TOPIC_PER_CONN: usize = 100;
-const OB_UNIVERSE: usize = 50;
+const TRIGGERS_DIR: &str = "data/triggers";
+const CAPTURES_DIR: &str = "data/market/orderbook/captures";
+
 
 /// Один элемент столбца.
 #[derive(Debug, Clone)]
@@ -299,12 +304,11 @@ async fn ws_run(stream: Stream, url: &str, syms: &Arc<Vec<String>>, tx: &mpsc::S
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
-                None => break,
+                None => break Ok(()),
             },
             _ = sleep(Duration::from_secs(60)) => subscribe_all(&mut sink, stream, syms).await?,
         }
     }
-    Ok(())
 }
 
 async fn flush_loop(mut rx: mpsc::Receiver<(String, Table)>) {
@@ -409,6 +413,250 @@ async fn ratio_loop(syms: Arc<Vec<String>>, client: Arc<Client>, tokens: Arc<Mut
     }
 }
 
+// ---------- Trigger + Capture ----------
+
+/// JSON-файл триггера от Python candle_trigger.py.
+#[derive(Debug, Deserialize)]
+struct TriggerFile {
+    event_id: String,
+    symbol: String,
+    #[allow(dead_code)]
+    category: String,
+    #[allow(dead_code)]
+    trigger_type: String,
+    #[allow(dead_code)]
+    trigger_version: String,
+    #[allow(dead_code)]
+    trigger_config_hash: String,
+    #[allow(dead_code)]
+    trigger_params: serde_json::Value,
+    #[allow(dead_code)]
+    horizons: Vec<u64>,
+    capture_duration_sec: u64,
+    #[allow(dead_code)]
+    created_at: String,
+}
+
+/// Наблюдатель за директорией триггеров. Обнаруживает новые JSON-файлы.
+async fn trigger_watcher(tx: mpsc::Sender<PathBuf>) {
+    let dir = Path::new(TRIGGERS_DIR);
+    let mut known: HashMap<String, bool> = HashMap::new();
+
+    loop {
+        if dir.exists() {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "json") {
+                        let key = path.to_string_lossy().to_string();
+                        if !known.contains_key(&key) {
+                            known.insert(key, true);
+                            // Читаем и парсим чтобы убедиться что это валидный триггер
+                            if let Ok(contents) = fs::read_to_string(&path) {
+                                if serde_json::from_str::<TriggerFile>(&contents).is_ok() {
+                                    if tx.send(path).await.is_err() { return; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        known.retain(|k, _| Path::new(k).exists());
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Запуск WS для orderbook capture на один символ.
+async fn ob_capture_once(
+    symbol: &str,
+    tx: &mpsc::Sender<(String, Table)>,
+    deadline: &std::time::Instant,
+) -> Result<()> {
+    let url = "wss://stream.bybit.com/v5/public/linear";
+    let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+    let (mut sink, mut stream_ws) = ws.split();
+
+    // Подписываемся на orderbook
+    let topic = format!("orderbook.50.{symbol}");
+    sink.send(Message::Text(json!({"op":"subscribe","args":[topic]}).to_string().into())).await?;
+    eprintln!("[ob_capture] подписан на orderbook.50.{symbol}");
+
+    loop {
+        tokio::select! {
+            msg = stream_ws.next() => match msg {
+                Some(Ok(Message::Text(t))) => {
+                    let v: Value = serde_json::from_str(t.as_str())?;
+                    if v["op"].as_str() == Some("ping") {
+                        sink.send(Message::Text(json!({"op":"pong"}).to_string().into())).await?;
+                        continue;
+                    }
+                    if v.get("topic").is_none() { continue; }
+                    if let Some((sym, rows)) = parse_message(Stream::Orderbook, &v) {
+                        tx.send((format!("orderbook_captures/{sym}"), rows)).await?;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            },
+            _ = sleep(Duration::from_secs(2)) => {
+                if std::time::Instant::now() >= *deadline {
+                    // Отписываемся перед выходом
+                    let _ = sink.send(Message::Text(json!({"op":"unsubscribe","args":[topic]}).to_string().into())).await;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Обработка одного триггера: WS, сбор данных в буфер, сохранение parquet.
+async fn ob_capture_task(trigger: TriggerFile) {
+    let event_id = trigger.event_id.clone();
+    let symbol = trigger.symbol.clone();
+    let duration = Duration::from_secs(trigger.capture_duration_sec);
+
+    eprintln!("[capture] старт: {event_id} для {symbol} ({}с)", duration.as_secs());
+
+    let deadline = std::time::Instant::now() + duration;
+    let mut backoff = 1u64;
+
+    // Собираем данные в буфер через отдельный канал
+    let (buf_tx, mut buf_rx) = mpsc::channel::<(String, Table)>(1024);
+
+    // Запускаем WS в фоне
+    let sym = symbol.clone();
+    let ws_handle = tokio::spawn(async move {
+        loop {
+            match ob_capture_once(&sym, &buf_tx, &deadline).await {
+                Ok(()) => break,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline { break; }
+                    eprintln!("[ob_capture {sym}] {e:#}; retry через {backoff}с");
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(10);
+                }
+            }
+        }
+    });
+
+    // Собираем данные в буфер пока не истечёт время
+    let mut all_rows: Table = Table::from([
+        ("ts", Col::new()), ("seq", Col::new()), ("is_delta", Col::new()), ("level", Col::new()),
+        ("bid_px", Col::new()), ("bid_sz", Col::new()), ("ask_px", Col::new()), ("ask_sz", Col::new()),
+    ]);
+
+    loop {
+        tokio::select! {
+            maybe = buf_rx.recv() => match maybe {
+                Some((_key, rows)) => {
+                    if all_rows.len() == rows.len() {
+                        for (i, (_, col)) in rows.into_iter().enumerate() {
+                            all_rows[i].1.extend(col);
+                        }
+                    }
+                }
+                None => break,
+            },
+            _ = sleep(Duration::from_millis(500)) => {
+                if std::time::Instant::now() >= deadline { break; }
+            }
+        }
+    }
+
+    // Ждём завершения WS
+    let _ = ws_handle.await;
+
+    // Сохраняем parquet
+    let dir = Path::new(CAPTURES_DIR);
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!("[capture] ошибка создания директории: {e:#}");
+        return;
+    }
+
+    let n = len(&all_rows);
+    if n > 0 {
+        let path = dir.join(format!("{event_id}.parquet"));
+        if let Err(e) = write_parquet(&path, &all_rows) {
+            eprintln!("[capture] ошибка записи parquet: {e:#}");
+        } else {
+            eprintln!("[capture] сохранено: {event_id} ({n} записей)");
+        }
+
+        // Метаданные
+        let meta = json!({
+            "event_id": event_id,
+            "symbol": symbol,
+            "capture_duration_sec": duration.as_secs(),
+            "records": n,
+            "status": "completed",
+        });
+        let meta_path = dir.join(format!("{event_id}.meta.json"));
+        let _ = fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+    } else {
+        eprintln!("[capture] нет данных для {event_id}");
+        // Пишем метаданные с ошибкой
+        let meta = json!({
+            "event_id": event_id,
+            "symbol": symbol,
+            "capture_duration_sec": duration.as_secs(),
+            "records": 0,
+            "status": "no_data",
+        });
+        let meta_path = dir.join(format!("{event_id}.meta.json"));
+        let _ = fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+    }
+
+    // Удаляем JSON-файл триггера
+    let trigger_path = Path::new(TRIGGERS_DIR).join(format!("{event_id}.json"));
+    let _ = fs::remove_file(trigger_path);
+    eprintln!("[capture] завершено: {event_id}");
+}
+
+/// Основной цикл обработки триггеров. Максимум max_concurrent одновременных захватов.
+async fn capture_manager(
+    mut trigger_rx: mpsc::Receiver<PathBuf>,
+    _data_tx: mpsc::Sender<(String, Table)>,
+    max_concurrent: usize,
+) {
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    while let Some(path) = trigger_rx.recv().await {
+        // Чистим завершённые задачи
+        handles.retain(|h| !h.is_finished());
+
+        // Если достигли лимита — ждём
+        while handles.len() >= max_concurrent {
+            sleep(Duration::from_secs(1)).await;
+            handles.retain(|h| !h.is_finished());
+        }
+
+        // Читаем триггер
+        let contents = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[capture_manager] ошибка чтения {path:?}: {e:#}");
+                continue;
+            }
+        };
+        let trigger: TriggerFile = match serde_json::from_str(&contents) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[capture_manager] невалидный триггер {path:?}: {e:#}");
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+        };
+
+        let handle = tokio::spawn(async move {
+            ob_capture_task(trigger).await;
+        });
+        handles.push(handle);
+    }
+}
+
 // ---------- main ----------
 
 /// Получение торгуемых linear USDT-перпетуалов из REST (для авто-универсума).
@@ -435,25 +683,6 @@ async fn fetch_linear_symbols(client: &Client, tokens: &Arc<Mutex<mpsc::Receiver
         }
     }
     Ok(out)
-}
-
-/// Топ-N символов по 24h-обороту (для orderbook-подмножества).
-async fn fetch_top_symbols(client: &Client, tokens: &Arc<Mutex<mpsc::Receiver<()>>>, n: usize) -> Result<Vec<String>> {
-    {
-        let mut rx = tokens.lock().await;
-        if rx.recv().await.is_none() { return Ok(vec![]); }
-    }
-    let url = format!("{API}/v5/market/tickers?category=linear");
-    let resp = client.get(&url).send().await?.error_for_status()?.json::<Value>().await?;
-    let mut ranked: Vec<(String, f64)> = vec![];
-    for it in resp["result"]["list"].as_array().cloned().unwrap_or_default() {
-        let sym = it["symbol"].as_str().unwrap_or("");
-        if !sym.ends_with("USDT") { continue; }
-        let to = it["turnover24h"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-        ranked.push((sym.to_string(), to));
-    }
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(ranked.into_iter().take(n).map(|(s, _)| s).collect())
 }
 
 fn discover_symbols() -> Result<Vec<String>> {
@@ -503,32 +732,32 @@ async fn main() -> Result<()> {
     if syms.is_empty() {
         anyhow::bail!("нет символов: ни локального файла, ни REST-списка");
     }
-    // Подмножество для orderbook.50: топ-N по 24h-обороту (лимит глубины Bybit ~10/соединение).
-    let ob_syms = fetch_top_symbols(&client, &tokens, OB_UNIVERSE).await?;
-    for s in ["trades", "orderbook", "futures", "liquidation", "ratio"] {
+
+    // Создаём директории
+    for s in ["trades", "futures", "liquidation", "ratio"] {
         fs::create_dir_all(Path::new(DATA_ROOT).join(s).join("linear"))?;
     }
-    println!("marketdata: {} символов (linear), orderbook.50 на {} топ-символов", syms.len(), ob_syms.len());
+    fs::create_dir_all(Path::new(TRIGGERS_DIR))?;
+    fs::create_dir_all(Path::new(CAPTURES_DIR))?;
+
+    println!("marketdata: {} символов (linear), orderbook — event-driven capture (triggers/)", syms.len());
     let syms = Arc::new(syms);
-    let ob_syms = Arc::new(ob_syms);
 
     let (tx, rx) = mpsc::channel(16384);
-    let spawn = |stream: Stream, list: Arc<Vec<String>>, tx: &mpsc::Sender<(String, Table)>| {
-        if stream == Stream::Liquidation {
-            let tx = tx.clone();
-            tokio::spawn(async move { ws_loop(stream, list, tx).await });
-            return;
-        }
-        let per = if stream == Stream::Orderbook { OB_PER_CONN } else { TOPIC_PER_CONN };
-        for chunk in list.chunks(per) {
-            let tx = tx.clone();
-            let chunk: Vec<String> = chunk.to_vec();
-            tokio::spawn(async move { ws_loop(stream, Arc::new(chunk), tx).await });
-        }
-    };
-    spawn(Stream::Trades, syms.clone(), &tx);
-    spawn(Stream::Orderbook, ob_syms.clone(), &tx);
-    spawn(Stream::Liquidation, syms.clone(), &tx);
+
+    // Trades + Liquidation — постоянные подписки
+    {
+        let tx = tx.clone();
+        let syms = syms.clone();
+        tokio::spawn(async move { ws_loop(Stream::Trades, syms, tx).await });
+    }
+    {
+        let tx = tx.clone();
+        let syms = syms.clone();
+        tokio::spawn(async move { ws_loop(Stream::Liquidation, syms, tx).await });
+    }
+
+    // Futures + Ratio — REST polling
     {
         let syms = syms.clone();
         let client = client.clone();
@@ -541,6 +770,23 @@ async fn main() -> Result<()> {
         let tokens = tokens.clone();
         tokio::spawn(async move { ratio_loop(syms, client, tokens).await });
     }
+
+    // Orderbook — event-driven capture через trigger_watcher + capture_manager
+    let max_concurrent: usize = std::env::var("OB_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    {
+        let tx = tx.clone();
+        let (trigger_tx, trigger_rx) = mpsc::channel(64);
+        tokio::spawn(async move { trigger_watcher(trigger_tx).await });
+        tokio::spawn(async move { capture_manager(trigger_rx, tx, max_concurrent).await });
+    }
+
+    println!("marketdata: запущен. Orderbook capture: data/triggers/ -> data/market/orderbook/captures/");
+    println!("marketdata: max_concurrent captures = {max_concurrent}");
+
     drop(tx);
     flush_loop(rx).await;
     Ok(())
@@ -588,5 +834,25 @@ mod tests {
     #[test]
     fn orderbook_strip() {
         assert_eq!(Stream::Orderbook.strip("orderbook.50.ETHUSDT"), Some("ETHUSDT"));
+    }
+
+    #[test]
+    fn trigger_file_parse() {
+        let json_str = r#"{
+            "event_id": "20260905T120000Z_BTCUSDT_abc123",
+            "symbol": "BTCUSDT",
+            "category": "linear",
+            "trigger_type": "candle_features",
+            "trigger_version": "1.0",
+            "trigger_config_hash": "abc123def456",
+            "trigger_params": {"relative_volume": 5.0},
+            "horizons": [5, 10],
+            "capture_duration_sec": 1200,
+            "created_at": "2026-09-05T12:00:00Z"
+        }"#;
+        let trigger: TriggerFile = serde_json::from_str(json_str).unwrap();
+        assert_eq!(trigger.event_id, "20260905T120000Z_BTCUSDT_abc123");
+        assert_eq!(trigger.symbol, "BTCUSDT");
+        assert_eq!(trigger.capture_duration_sec, 1200);
     }
 }

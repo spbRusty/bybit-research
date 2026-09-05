@@ -20,6 +20,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.settings import LOGS_DIR, RESULTS_DIR, REPORTS_DIR, load_toml
+from src import candle_trigger as ct_mod
 from src import data as data_mod
 from src import events as events_mod
 from src import features as features_mod
@@ -117,7 +118,15 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     events = pl.concat(aligned)
     logger.info("Events: %d", events.height)
 
-    # --- 3. DATA VALIDATION GATE ---
+    # --- 3. CANDLE TRIGGER → ORDERBOOK CAPTURE ---
+    triggers = ct_mod.evaluate_all_triggers(events)
+    if triggers:
+        logger.info("Candle triggers fired: %d (orderbook captures queued)",
+                     len(triggers))
+    else:
+        logger.info("Candle triggers: none fired this run")
+
+    # --- 4. DATA VALIDATION GATE ---
     s = stage_data_validation(events, universe)
     stages.append(s)
     _log_stage(s)
