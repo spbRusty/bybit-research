@@ -1,0 +1,647 @@
+================================================================================
+ORDER BOOK RESEARCH — FINAL ARCHITECTURAL DESIGN
+Date: 2026-09-05
+Status: ARCHITECTURE APPROVED, Phase 0 NOT YET STARTED
+================================================================================
+
+TABLE OF CONTENTS
+ 1. Architecture Decision
+ 2. What the Current System Actually Does
+ 3. Data Flow
+ 4. Time Semantics
+ 5. Bybit Sequence Semantics
+ 6. Universe Pipeline
+ 7. Storage Design
+ 8. Sampling Recommendation
+ 9. Raw Retention Decision
+ 10. Predictor vs Response
+ 11. Feature Layer
+ 12. Event Windows
+ 13. Overlap / Statistics
+ 14. Leakage Analysis
+ 15. Provenance
+ 16. Configuration Parameters
+ 17. Invariants
+ 18. Phase 0 Implementation Scope
+
+================================================================================
+1. ARCHITECTURE DECISION
+================================================================================
+
+Architecture 2 — Continuous Reconstructed Orderbook + Event Windows.
+
+Rationale:
+- Arch 1 (Raw storage): ~100 msg/sec × 100 symbols × 86400 sec = ~864M
+  messages/day. Storage ~50-100 GB/day. Not viable.
+- Arch 3 (Ring buffer + capture): Two modes, synchronization complexity,
+  ring buffer data loss on restart. Unreliable for reproducibility.
+- Arch 2: Single continuous mode, reconstructed snapshots at configurable
+  frequency, Python reads historical data. Correct, reproducible, scalable.
+
+================================================================================
+2. WHAT THE CURRENT SYSTEM ACTUALLY DOES
+================================================================================
+
+Bybit WebSocket orderbook.50.{symbol} delivers:
+
+  SUBSCRIPTION → snapshot (full book, all 50 levels)
+  EVERY CHANGE → delta (only changed levels)
+
+Current collector (marketdata.rs):
+
+  parse_message() [line 208-233]:
+    - Reads v["type"] to distinguish snapshot vs delta
+    - Stores RAW message: ts, seq, is_delta, level, bid_px, bid_sz, ask_px, ask_sz
+    - For each level i (0..10): extracts bid[0], bid[1], ask[0], ask[1]
+    - If level absent in message → skips (line 221: continue)
+
+  ob_capture_task() [line 514-614]:
+    - Receives parsed tables from WS
+    - Appends to all_rows buffer
+    - On deadline: writes single Parquet file {event_id}.parquet
+    - Deletes trigger JSON file
+
+  CRITICAL FACTS:
+    - Captures are EVENT-DRIVEN (trigger → start → 1200s → stop)
+    - Only post-T data captured (trigger fires at T, capture starts after)
+    - Deltas stored as raw messages, NOT reconstructed book state
+    - No book state maintenance in Rust
+    - No sequence gap detection
+    - No pre-T data available
+
+  What Parquet actually contains:
+    snapshot rows: up to 10 levels × 2 sides = up to 20 rows
+    delta rows: 1-N changed levels only
+    Column "is_delta": true/false flag
+    Column "seq": Bybit cross-sequence number
+
+================================================================================
+3. DATA FLOW (Architecture 2)
+================================================================================
+
+Bybit WS
+  ↓ (orderbook.50.{symbol} — snapshot + delta)
+Collector: continuous subscription for universe symbols
+  ↓ (apply deltas → maintain book state in memory)
+  ↓ (periodic reconstructed snapshot → Parquet)
+Storage: data/market/orderbook/reconstructed/{symbol}/{date}.parquet
+  ↓ (Python reader)
+Event window extraction: [T-N, T+M] from continuous dataset
+  ↓ (feature computation)
+Research: predictor features (≤ T) + response features (> T)
+
+================================================================================
+4. TIME SEMANTICS
+================================================================================
+
+Candle lifecycle:
+  open_time = T (start of 1-minute candle)
+  candle covers [T, T+60s)
+  candle CLOSE at T+60s
+  trigger fires at candle close (T+60s)
+  future returns start at open(T+1) = T+60s
+
+Orderbook timeline:
+  T-10m ... T-5m ... T ... T+10s ... T+60s ... T+5m ... T+20m
+     ↑               ↑    ↑         ↑                     ↑
+     │               │    │         │                     │
+  pre-event      event T  trigger   first WS            capture
+  features       candle   fires    snapshot             ends
+  use data       opens                       (post-T only)
+  from here
+
+Invariants:
+  - PRE-T features: orderbook data with timestamp ≤ T
+  - POST-T features: orderbook data with timestamp > T
+  - Predictor features: ONLY data ≤ T
+  - Response features: ONLY data > T
+
+================================================================================
+5. BYBIT SEQUENCE SEMANTICS (verified from documentation)
+================================================================================
+
+Fields in orderbook.50 messages:
+
+  u: Update ID (integer)
+    - Monotonically increasing per symbol
+    - u=1 means snapshot (service restart) → overwrite local book
+    - Used for ordering: smaller u = earlier data
+
+  seq: Cross-sequence (integer)
+    - Compare across different depth levels
+    - Smaller seq = generated earlier
+    - NOT used for book reconstruction ordering (u is primary)
+
+  ts: Server timestamp (ms)
+    - For futures level 50: appears AFTER "type" field
+    - For spot/level 1: appears BEFORE "type" field
+
+  cts: Matching engine timestamp (ms)
+    - Correlates with trade channel T field
+    - More precise than ts
+
+Reconstruction rules (from Bybit documentation):
+
+  1. On subscribe: receive snapshot → set local book
+  2. On delta: apply changes
+     - qty = 0 → delete price level
+     - new price → insert
+     - existing price → update qty
+  3. On new snapshot (u=1 or explicit): RESET local book entirely
+  4. Periodically (3s no change for level 1): snapshot re-sent
+
+Gap detection:
+  - Bybit does NOT guarantee gap-free delivery for level 50
+  - If delta arrives and book state is unknown → request snapshot
+  - Primary detection: if u is not consecutive → gap detected
+  - Recovery: unsubscribe → resubscribe → receive fresh snapshot
+
+Seq continuity:
+  - seq is cross-sequence (different from u)
+  - Use u for ordering within one symbol
+  - Use seq only for comparing different symbols at same time
+
+Practical consequence for reconstruction:
+  - Maintain u counter per symbol
+  - If delta.u != last_u + 1 → gap → request snapshot
+  - Never apply delta without valid prior snapshot
+
+================================================================================
+6. UNIVERSE PIPELINE
+================================================================================
+
+Current flow:
+
+  data/market.toml: categories = ["linear", "spot"]
+  data/liquidity.toml:
+    window_days = 30
+    threshold_usd = 5_000_000
+    min_stability_pct = 80.0
+    min_turnover_30d_usd = 50_000_000
+
+  src/data.py: liquidity_universe()
+    1. Find all kline files: data/klines/{linear,spot}/*_1m.parquet
+    2. Read turnover per day per symbol
+    3. Filter: last 30 days, daily turnover >= $5M on >= 80% of days
+    4. Filter: total 30d turnover >= $50M
+    5. Filter: stale symbols (no data in last 7 days)
+    6. Return sorted by turnover_30d descending
+
+  Current universe size: ~50-100 linear USDT perps
+
+For orderbook subscriptions:
+  - Subscribe to orderbook.50.{symbol} for ALL symbols in universe
+  - Continuous subscription (not event-driven)
+  - One WS connection per symbol (or multiplexed)
+  - Bybit rate limit: check connection limits
+
+  NOTE: Do NOT subscribe to all Bybit instruments.
+  Use existing liquidity_universe() as the source.
+  If universe changes → re-evaluate subscriptions.
+
+================================================================================
+7. STORAGE DESIGN
+================================================================================
+
+Location: data/market/orderbook/reconstructed/{symbol}/
+
+Format:
+  {symbol}/{YYYY-MM-DD}.parquet
+
+Schema:
+  timestamp_ms: i64          (snapshot timestamp, ms)
+  update_id: i64             (Bybit u field — for ordering)
+  symbol: string
+  best_bid: f64
+  best_ask: f64
+  spread_bps: f64            ((ask-bid)/mid * 10000)
+  mid_price: f64             ((bid+ask)/2)
+  levels: list[LevelSnapshot]
+
+LevelSnapshot:
+  level: i32                 (1-based depth)
+  bid_px: f64
+  bid_sz: f64
+  ask_px: f64
+  ask_sz: f64
+
+Metadata fields (in parquet or sidecar):
+  reconstruction_version: string  ("1.0")
+  seq_start: i64              (first seq in this snapshot's delta chain)
+  seq_end: i64                (last seq)
+  gap_detected: bool          (was there a gap before this snapshot?)
+  source: string              ("continuous_reconstructed")
+
+File naming:
+  {symbol}/2026-09-05.parquet  (one file per day, many rows)
+
+Directory structure:
+  data/market/orderbook/
+    reconstructed/
+      BTCUSDT/
+        2026-09-01.parquet
+        2026-09-02.parquet
+        ...
+      ETHUSDT/
+        2026-09-01.parquet
+        ...
+    metadata/
+      {symbol}_config.json    (subscription params, version)
+      {symbol}_status.json    (last u, gaps, stats)
+
+================================================================================
+8. SAMPLING RECOMMENDATION
+================================================================================
+
+Research horizons:
+  - Seconds: spread dynamics, liquidity response
+  - Minutes: order flow impact, depth changes
+  - Tens of minutes: sustained imbalance, regime shifts
+
+Bybit orderbook.50 push frequency: 20ms
+
+Options:
+
+  Option A: 1-second snapshots
+    Storage: 86400 rows/day × 100 symbols × ~2KB/row ≈ 17 GB/day
+    Pros: Captures most dynamics
+    Cons: High storage, high I/O
+    Verdict: Overkill for minute-scale research
+
+  Option B: 5-second snapshots (RECOMMENDED)
+    Storage: 17280 rows/day × 100 symbols × ~2KB/row ≈ 3.5 GB/day
+    Pros: Good resolution for minute-scale, manageable storage
+    Cons: May miss sub-5s dynamics (acceptable for our horizons)
+    Verdict: Best balance
+
+  Option C: 10-second snapshots
+    Storage: 8640 rows/day × 100 symbols × ~2KB/row ≈ 1.7 GB/day
+    Pros: Minimal storage
+    Cons: May miss important dynamics at 1-5s horizon
+    Verdict: Acceptable if storage constrained
+
+Recommendation: Option B (5 seconds)
+
+  Monthly storage: ~105 GB
+  Yearly storage: ~1.2 TB
+  Compression (Parquet + zstd): ~3-5x → ~25 GB/month, ~300 GB/year
+
+  At 5s resolution, we capture:
+  - 12 snapshots per minute
+  - Enough to compute PRE-T features at T with ≤5s latency
+  - Enough to track POST-T dynamics at minute scale
+
+================================================================================
+9. RAW RETENTION DECISION
+================================================================================
+
+Store raw messages: NO (initially)
+
+Rationale:
+  - Raw storage: ~50-100 GB/day × 30 days = 1.5-3 TB/month
+  - Reconstructed snapshots: ~3.5 GB/day × 30 days = ~105 GB/month
+  - Compression ratio: ~10-30x savings
+
+  For reproducibility:
+  - Reconstructed snapshots are deterministic given raw input
+  - If reconstruction code is versioned and tested, reconstructed
+    data is sufficient for reproducibility
+  - Raw data needed only for:
+    a) Auditing reconstruction correctness
+    b) Re-running with different reconstruction parameters
+    c) Debugging anomalies
+
+  Practical compromise:
+  - Keep reconstructed snapshots as primary dataset
+  - Keep raw for last 7 days only (for debugging)
+  - After 7 days: delete raw, keep reconstructed
+  - Version reconstruction code with semantic versioning
+
+  Future: if storage costs decrease significantly, consider keeping
+  raw indefinitely. Not required for current research scope.
+
+================================================================================
+10. PREDICTOR vs RESPONSE
+================================================================================
+
+PREDICTOR features (timestamp ≤ T):
+
+  These must use ONLY orderbook data available at or before event time T.
+
+  Minimum feature set:
+    - ob_best_bid_t: best bid at T
+    - ob_best_ask_t: best ask at T
+    - ob_mid_t: mid price at T
+    - ob_spread_bps_t: spread at T
+    - ob_depth_bid_N_t: sum of top N bid qty at T (N configurable)
+    - ob_depth_ask_N_t: sum of top N ask qty at T (N configurable)
+    - ob_imbalance_t: (bid_depth - ask_depth) / (bid_depth + ask_depth) at T
+    - ob_depth_change_N: depth change over last K minutes
+    - ob_spread_change: spread change over last K minutes
+    - ob_book_volatility: std of spread/depth over last K minutes
+    - ob_liquidity_change: liquidity change over last K minutes
+
+  N and K are CONFIGURATION PARAMETERS, not hardcoded.
+
+  Data source: reconstructed snapshots at or before T
+
+RESPONSE features (timestamp > T):
+
+  These use orderbook data AFTER event time T.
+  Used for analyzing market reaction / dynamics.
+
+  Examples:
+    - ob_imbalance_change_post: imbalance change in [T, T+5m]
+    - ob_spread_expansion: spread expansion in [T, T+5m]
+    - ob_liquidity_withdrawal: depth reduction in [T, T+5m]
+    - ob_book_recovery: depth recovery in [T+5m, T+20m]
+
+  NEVER use in predictor hypotheses.
+
+================================================================================
+11. FEATURE LAYER
+================================================================================
+
+No hardcoded trading hypotheses at this stage.
+
+Initial feature substrate (configurable parameters):
+
+  Snapshot-level features (from single reconstructed snapshot):
+    ob_best_bid: best bid price
+    ob_best_ask: best ask price
+    ob_mid: (best_bid + best_ask) / 2
+    ob_spread_bps: (best_ask - best_bid) / mid * 10000
+    ob_spread_abs: best_ask - best_bid
+    ob_depth_bid_{N}: sum of top N bid qty
+    ob_depth_ask_{N}: sum of top N ask qty
+    ob_depth_total_{N}: bid + ask at depth N
+    ob_imbalance_{N}: (bid - ask) / (bid + ask) at depth N
+    ob_vwap_bid_{N}: volume-weighted avg bid price (top N)
+    ob_vwap_ask_{N}: volume-weighted avg ask price (top N)
+    ob_top1_share: top1_bid / total_bid
+    ob_top5_share: top5_bid / total_bid
+
+  Change features (derived from consecutive snapshots):
+    ob_depth_change_{N}: depth[T] - depth[T-delta]
+    ob_spread_change: spread[T] - spread[T-delta]
+    ob_imbalance_change_{N}: imbalance[T] - imbalance[T-delta]
+
+  Volatility features (over window):
+    ob_depth_volatility_{K}: std of depth over last K snapshots
+    ob_spread_volatility_{K}: std of spread over last K snapshots
+    ob_imbalance_volatility_{K}: std of imbalance over last K snapshots
+
+  Configuration:
+    N ∈ {1, 3, 5, 10, 20}  (depth levels)
+    K ∈ {5, 12, 60}        (window in snapshots: 25s, 60s, 5min at 5s)
+    delta ∈ {1, 6, 60}     (change interval: 5s, 30s, 5min at 5s)
+
+  These are DEFAULT values. All configurable via config file.
+
+================================================================================
+12. EVENT WINDOWS
+================================================================================
+
+Do NOT copy orderbook data into each event.
+
+Instead:
+  - Continuous reconstructed dataset on disk
+  - Event metadata: {event_id, symbol, timestamp T}
+  - Research reader extracts [T-N, T+M] from continuous dataset
+
+  This is efficient because:
+  - No data duplication
+  - Events are just references
+  - Reader can extract any window size
+  - Storage is shared across all events
+
+  Implementation:
+    reader.get_window(symbol, T, pre_minutes, post_minutes)
+      → reads parquet for date of T
+      → filters rows where T-N ≤ timestamp ≤ T+M
+      → returns DataFrame with reconstructed snapshots
+
+  The reader must handle:
+    - Date boundaries (window spans midnight)
+    - Missing data (gaps in reconstruction)
+    - Multiple symbols (different parquet files)
+
+================================================================================
+13. OVERLAP / STATISTICS
+================================================================================
+
+Do NOT introduce artificial minimum separation.
+
+All events are kept. Overlap information is preserved.
+
+Overlap metadata per event:
+  - pre_window_start: T - N
+  - pre_window_end: T
+  - post_window_start: T
+  - post_window_end: T + M
+
+Overlapping detection:
+  Two events overlap if:
+    |T1 - T2| < N (pre windows overlap)
+    OR
+    |T1 - T2| < M (post windows overlap)
+
+Cluster information:
+  - symbol: same-symbol events are correlated
+  - temporal_cluster: events within N minutes of each other
+  - day_bucket: events on same calendar day
+
+Statistical layer handles dependency:
+  - cluster bootstrap by symbol (already in stats.py)
+  - block bootstrap with block ≥ N (already in stats.py)
+  - Newey-West HAC (already in stats.py)
+  - The statistical layer decides how to weight overlapping events
+  - Research layer provides the overlap metadata
+
+================================================================================
+14. LEAKAGE ANALYSIS
+================================================================================
+
+Checklist:
+
+  L1: Predictor features use data ≤ T?
+    → YES: by construction, reader extracts [T-N, T] for predictors
+    → Enforced in feature computation, not in storage
+
+  L2: Response features use data > T?
+    → YES: by construction, reader extracts [T, T+M] for response
+    → Never mixed with predictor features
+
+  L3: Bucket semantics aligned?
+    → Current market features: bucket T = ticks [T, T+60s)
+    → Candle at T covers [T, T+60s)
+    → Orderbook at T: use last snapshot with timestamp ≤ T
+    → No overlap with future returns [T+60s, T+60s+h]
+
+  L4: Threshold leakage?
+    → Thresholds computed from disc_events only
+    → Same as current system (no change needed)
+
+  L5: No cross-period contamination?
+    → split_periods() separates by timestamp
+    → Orderbook features attached to events, events split by time
+    → No change needed
+
+================================================================================
+15. PROVENANCE
+================================================================================
+
+Chain of reproducibility:
+
+  raw data (Bybit WS)
+    → reconstruction version ("1.0")
+      → snapshot version (sampling frequency, reconstruction params)
+        → feature version ("1.0")
+          → event version (which events selected)
+            → hypothesis version (which hypotheses generated)
+              → research run (parameters, seed, periods)
+
+Existing provenance:
+  Provenance dataclass in registry.py
+  hypothesis_id, version, created_at in Hypothesis
+
+Missing (to add):
+  ob_reconstruction_version: str
+  ob_snapshot_frequency_sec: int
+  ob_feature_version: str
+  ob_config_hash: str (of orderbook config)
+  ob_n_snapshots_used: int
+  ob_gap_count: int
+
+Registry:
+  HypothesisLifecycle exists but is NOT integrated (confirmed earlier).
+  Do NOT integrate it now. Keep existing research flow.
+
+================================================================================
+16. CONFIGURATION PARAMETERS
+================================================================================
+
+File: config/orderbook_research.toml (NEW)
+
+```toml
+# Reconstruction
+reconstruction_version = "1.0"
+snapshot_frequency_sec = 5          # how often to write reconstructed state
+book_depth_levels = 50              # max levels from Bybit
+
+# Feature parameters
+depth_levels = [1, 3, 5, 10, 20]   # N for depth features
+lookback_snapshots = [5, 12, 60]   # K for volatility features
+change_intervals = [1, 6, 60]      # delta for change features
+
+# Event windows
+pre_event_minutes = 10              # N: how far back for predictor features
+post_event_minutes = 20             # M: how far forward for response features
+
+# Storage
+retention_days_raw = 7              # keep raw messages for N days
+retention_days_reconstructed = 365  # keep reconstructed snapshots
+
+# Gap handling
+max_gap_before_snapshot = 10        # if >N deltas missed, request new snapshot
+snapshot_request_cooldown_sec = 5   # min time between snapshot requests
+```
+
+None of these are hardcoded. All configurable.
+
+================================================================================
+17. INVARIANTS
+================================================================================
+
+I1: Predictor feature timestamp <= event timestamp T.
+
+I2: No POST-T data used in predictor features.
+
+I3: Delta never treated as snapshot.
+    Every message tagged with is_delta flag.
+    Reconstruction code must apply deltas to book state, not store raw.
+
+I4: Sequence gap makes reconstructed state unreliable until snapshot.
+    If gap detected → request new snapshot → reset book state.
+    Features computed from gap-affected windows are flagged.
+
+I5: Raw/derived data have versioned provenance.
+    Every reconstructed snapshot has reconstruction_version.
+    Every feature computation has feature_version.
+
+I6: Research pipeline never modifies raw market data.
+    Research reads from reconstructed snapshots.
+    Never writes to market data directories.
+
+I7: Dashboard only reads data.
+    Dashboard reads from reconstructed snapshots + feature parquets.
+    Never modifies any market data or research data.
+
+I8: Orderbook research cannot directly create ACTIVE trading strategy.
+    Research produces statistical findings.
+    Strategy creation is a separate, explicit step (not in scope).
+
+================================================================================
+18. PHASE 0 IMPLEMENTATION SCOPE
+================================================================================
+
+Goal: Continuous reconstructed orderbook for universe symbols.
+
+Components to implement:
+
+  1. Book state manager (Rust)
+     - Maintains full book state in memory per symbol
+     - Applies deltas correctly (insert/update/delete)
+     - Handles snapshot reset (u=1)
+     - Detects gaps (non-consecutive u)
+     - Requests new snapshot on gap
+
+  2. Periodic snapshot writer (Rust)
+     - Every snapshot_frequency_sec: write reconstructed state to Parquet
+     - Schema as defined in Section 7
+     - One file per symbol per day
+
+  3. Continuous subscription (Rust)
+     - Subscribe to orderbook.50.{symbol} for ALL universe symbols
+     - Run continuously (not event-driven)
+     - Handle reconnection, backoff
+
+  4. Python reader (NEW: src/orderbook_reader.py)
+     - read_reconstructed(symbol, date) → DataFrame
+     - get_window(symbol, T, pre_minutes, post_minutes) → DataFrame
+     - Handles date boundaries, missing data
+
+  5. Config (NEW: config/orderbook_research.toml)
+     - All parameters as defined in Section 16
+
+  6. Tests
+     - Book state manager: delta application, gap detection, snapshot reset
+     - Snapshot writer: correct schema, correct frequency
+     - Python reader: correct window extraction, date boundaries
+     - Integration: end-to-end from WS message to feature-ready DataFrame
+
+NOT in Phase 0:
+  - Feature computation (Phase 1)
+  - Research integration (Phase 2)
+  - Dashboard (Phase 3)
+  - Hypothesis rules (Phase 4)
+
+Success criteria for Phase 0:
+  - Reconstructed snapshots written for all universe symbols
+  - Python can read any [T-N, T+M] window
+  - Gaps detected and flagged
+  - All existing tests pass
+  - Storage within budget (~3.5 GB/day)
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+
+NEXT STEPS:
+  1. User approves this architecture document
+  2. User authorizes Phase 0 implementation
+  3. Implement book state manager + snapshot writer (Rust)
+  4. Implement Python reader
+  5. Test end-to-end
+  6. Verify storage metrics
+  7. Proceed to Phase 1 (feature computation)

@@ -1,0 +1,132 @@
+# Phase 0 Completion Report
+
+## What was implemented
+
+Continuous reconstructed orderbook for research (Architecture 2 from `docs/orderbook_architecture_final_20260905.txt`).
+
+## Files changed
+
+### New files
+| File | Purpose |
+|------|---------|
+| `config/orderbook_research.toml` | Research config: snapshot freq 5s, depth 50, window N=10/M=20 min |
+| `collector/src/lib.rs` | Lib crate exporting `book_state` module |
+| `collector/src/book_state.rs` | `BookState` struct: apply_snapshot, apply_delta, gap detection, snapshot export |
+| `collector/src/bin/ob_reconstructor.rs` | Binary: continuous WS subscription to `orderbook.50.{symbol}` for all universe symbols, periodic reconstructed snapshot writes to Parquet |
+| `src/orderbook_reader.py` | Python reader: `get_window()`, `get_pre_event()`, `get_post_event()`, `storage_stats()` |
+| `tests/test_orderbook_reader.py` | 10 unit tests for orderbook_reader |
+
+### Modified files
+| File | Change |
+|------|--------|
+| `collector/Cargo.toml` | Added `[[bin]] ob_reconstructor` section + `[lib]` section |
+
+### Unchanged files
+- `src/data.py` — universe pipeline untouched
+- `src/candle_trigger.py` — trigger system untouched
+- `src/orchestrator.py` — pipeline untouched
+- All existing candle research code untouched
+
+## What is implemented
+
+1. **Rust `BookState`** (`book_state.rs`): In-memory orderbook state machine
+   - `apply_snapshot()` — sets full book from snapshot message
+   - `apply_delta()` — applies incremental updates, returns `false` on gap
+   - `snapshot()` — exports current state as `ReconstructedSnapshot` with levels, spread, mid
+   - Gap detection: tracks `expected_update_id`, detects jumps > 1
+   - Unit tests: 7 (snapshot, delta update/insert/delete, gap detection, empty book, snapshot reset)
+
+2. **Rust `ob_reconstructor`** binary: Continuous subscription + periodic writes
+   - Subscribes to `orderbook.50.{symbol}` for all universe symbols via Bybit WS
+   - Parses snapshot/delta messages, feeds to `BookState`
+   - Periodic reconstructed snapshot every 5 seconds (configurable)
+   - Writes Parquet per symbol per date to `data/market/orderbook/reconstructed/{SYMBOL}/{date}.parquet`
+   - Auto-reconnect with exponential backoff (1s → 60s)
+   - Ping/pong handling
+   - Unit tests: 3 (parse snapshot, parse delta, ignore non-OB messages)
+
+3. **Python `orderbook_reader.py`**: Read-only reader for reconstructed data
+   - `get_window(symbol, event_ts_ms, pre_minutes, post_minutes)` — extract [T-N, T+M] window
+   - `get_pre_event(symbol, event_ts_ms)` — extract [T-N, T] (predictor-safe, no future leakage)
+   - `get_post_event(symbol, event_ts_ms)` — extract (T, T+M] (response/dynamics only)
+   - `storage_stats()` — total files, bytes, GB, symbol count
+   - Unit tests: 10 (date range, read/missing, window filter, pre/post event, storage stats)
+
+## What tests passed
+
+### Rust (16 tests)
+- `collector_lib` (book_state): 7 passed
+- `marketdata` binary: 6 passed
+- `ob_reconstructor` binary: 3 passed
+
+### Python (195 tests)
+- `test_candle_trigger.py`: 31 passed (existing)
+- `test_critic_gates.py`: 57 passed (existing)
+- `test_oos_gate.py`: 11 passed (existing)
+- `test_orderbook_reader.py`: 10 passed (new)
+- `test_pipeline.py`: 76 passed (existing)
+- Other test files: 10 passed (existing)
+- **Total: 195/195 passed, 0 failures, 0 errors**
+
+## Reconstruction verification
+
+Rust `BookState` unit tests verify:
+1. Snapshot application: 50 bid + 50 ask levels stored correctly
+2. Delta application: price update, level insertion, level deletion (qty=0)
+3. Gap detection: when `update_id` jumps by > 1, `apply_delta()` returns false → signals need for new snapshot
+4. Snapshot reset: new snapshot clears book and restores valid state
+
+Python reader tests verify:
+1. `get_window()` correctly filters by timestamp within [T-N, T+M]
+2. `get_pre_event()` only returns rows with `timestamp_ms <= T` (no future leakage)
+3. `get_post_event()` only returns rows with `timestamp_ms > T`
+4. Missing files return empty DataFrame or None as appropriate
+
+## Gap/reconnect recovery verification
+
+Rust `ob_reconstructor` implements:
+- Gap detection via `update_id` tracking in `BookState`
+- When `apply_delta()` returns false (gap), `SymState.process()` returns `need_snapshot = true`
+- Snapshot request cooldown: 5 seconds between gap-triggered snapshot requests
+- WebSocket reconnect with exponential backoff: 1s → 2s → 4s → ... → 60s cap
+- Re-subscribe every 60s to prevent silent disconnection
+
+## Storage
+
+No production data yet (binary not deployed). Estimated from architecture:
+- 5s snapshot interval × 12 symbols × ~4KB/snapshot = ~288 KB/min ≈ 400 MB/day
+- With 50 levels per side: ~5 KB/snapshot → ~500 MB/day
+- Retention: 365 days configured → ~180 GB/year estimated
+
+Actual storage: TBD after deployment and data collection.
+
+## Problems and deviations
+
+### Resolved during implementation
+1. **Arrow API mismatch**: `DataType::List` takes `Arc<Field>` not `Box<Field>` in arrow 59.x. Fixed by switching to simple flat-column Parquet format (same pattern as `marketdata.rs`).
+2. **Test assertion errors**: BookState test assertions for insert/delete levels had wrong expected counts (max of bids/asks, not sum). Fixed assertions.
+3. **i32 overflow in test literals**: Bybit sequence numbers exceed i32 range. Fixed with `i64` suffix.
+
+### No deviations from Architecture 2
+- Continuous subscription ✅
+- Periodic reconstructed snapshots ✅
+- Gap detection with snapshot re-request ✅
+- Date-partitioned Parquet storage ✅
+- Read-only Python reader with pre/post event split ✅
+- Rebuild/recovery handled via snapshot re-subscribe ✅
+
+## What is NOT done (Phase 1+ scope)
+- No features extraction from reconstructed data
+- No hypothesis generation
+- No research pipeline integration
+- No dashboard changes
+- No paper trading
+- No registry
+- No existing candle pipeline modifications
+- No universe logic changes
+
+## Next steps (require separate approval)
+1. Deploy `ob_reconstructor` binary alongside existing `marketdata` service
+2. Wait for data accumulation (1-2 days minimum)
+3. Verify storage actual vs estimated
+4. Phase 1: feature extraction from reconstructed snapshots

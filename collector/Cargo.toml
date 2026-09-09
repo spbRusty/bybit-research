@@ -11,10 +11,19 @@ path = "src/main.rs"
 name = "marketdata"
 path = "src/bin/marketdata.rs"
 
+[[bin]]
+name = "ob_reconstructor"
+path = "src/bin/ob_reconstructor.rs"
+
+[lib]
+name = "collector_lib"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 arrow = "59.2.0"
 chrono = "0.4.45"
+fs2 = "0.4.3"
 futures-util = "0.3.34"
 parquet = { version = "59.2.0", features = ["arrow"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }

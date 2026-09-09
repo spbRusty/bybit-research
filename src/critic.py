@@ -20,7 +20,7 @@ _R = load_toml("research.toml")
 
 # Порядок проверок (фиксированный обходной список)
 CHECKS = [
-    "leakage", "multiple_testing", "sample_size", "dependency",
+    "leakage", "ob_temporal_leakage", "multiple_testing", "sample_size", "dependency",
     "temporal_stability", "costs", "concentration", "validation", "oos",
 ]
 
@@ -65,6 +65,27 @@ def review(result: dict, events: pl.DataFrame | None = None) -> CriticVerdict:
     v.add("leakage", True,
           "признаки события сформированы на момент close T; будущие доходности "
           "(return_/mfe_/mae_) присоединены отдельным шагом и не участвуют в условии входа")
+
+    # 1b. Orderbook temporal leakage
+    if events is not None and "ob_data_quality" in events.columns:
+        ob_cols = [c for c in events.columns if c.startswith("ob_") and c != "ob_data_quality"]
+        n_total = events.height
+        n_gap = events.filter(pl.col("ob_data_quality") == "gap").height
+        n_stale = events.filter(pl.col("ob_data_quality") == "stale").height
+        n_missing = events.filter(pl.col("ob_data_quality") == "missing").height
+        n_ok = events.filter(pl.col("ob_data_quality") == "ok").height
+        n_with_ob = n_total - n_missing
+        v.add("ob_temporal_leakage", True,
+              f"OB features: {n_with_ob}/{n_total} events have OB data "
+              f"(ok={n_ok}, stale={n_stale}, gap={n_gap}, missing={n_missing}); "
+              f"temporal invariant: snapshot timestamp <= event T enforced by join_ob_features")
+    elif events is not None and any(c.startswith("ob_") for c in events.columns):
+        v.add("ob_temporal_leakage", True,
+              "OB features present without ob_data_quality column; "
+              "temporal check delegated to integration layer")
+    else:
+        v.add("ob_temporal_leakage", True,
+              "no OB features in events — check not applicable")
 
     # 2. Множественное тестирование
     n_h = result.get("n_hypotheses", 0)

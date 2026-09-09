@@ -103,6 +103,36 @@ async def api_logs(n: int = Query(default=30, ge=1, le=200)):
     return JSONResponse(collectors.get_logs(n=n))
 
 
+@app.get("/api/ob-collector")
+async def api_ob_collector():
+    return JSONResponse(collectors.get_ob_collector())
+
+
+@app.get("/api/candle-collector")
+async def api_candle_collector():
+    return JSONResponse(collectors.get_candle_collector())
+
+
+@app.get("/api/data-quality")
+async def api_data_quality():
+    return JSONResponse(collectors.get_data_quality())
+
+
+@app.get("/api/research-conclusion")
+async def api_research_conclusion():
+    return JSONResponse(collectors.get_research_conclusion())
+
+
+@app.get("/api/alerts")
+async def api_alerts():
+    return JSONResponse(collectors.get_alerts())
+
+
+@app.get("/api/shadow-paper")
+async def api_shadow_paper():
+    return JSONResponse(collectors.get_shadow_paper())
+
+
 @app.get("/api/stream")
 async def api_stream():
     from config.settings import LOGS_DIR, ROOT

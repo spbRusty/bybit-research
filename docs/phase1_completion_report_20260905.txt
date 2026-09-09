@@ -1,0 +1,169 @@
+# Phase 1 Completion Report — Orderbook Feature Extraction Layer
+
+## Files created/modified
+
+### New files
+| File | Purpose |
+|------|---------|
+| `src/orderbook_features.py` | Feature extraction: snapshot, change, volatility features with provenance |
+| `tests/test_orderbook_features.py` | 35 unit tests across 12 test categories |
+
+### Modified files
+| File | Change |
+|------|--------|
+| `collector/src/bin/ob_reconstructor.rs` | `snapshots_to_table()`: wide-format output with 20 levels (bid_px_1..20, bid_sz_1..20, ask_px_1..20, ask_sz_20) |
+
+### Unchanged files
+- `src/orderbook_reader.py` — reader unchanged, paths align via `MARKET_DATA_DIR`
+- `src/data.py` — universe pipeline untouched
+- `config/orderbook_research.toml` — config unchanged, all parameters consumed by features
+
+## Feature schema (103 ob_* features + 4 provenance = 107 total new columns)
+
+### Snapshot features (computed per snapshot)
+| Feature | Formula | Nulls when |
+|---------|---------|------------|
+| `ob_spread_bps` | (ask1 - bid1) / mid * 10000 | never (base cols) |
+| `ob_spread_abs` | ask1 - bid1 | never |
+| `ob_imbalance_{N}` | (bid_vol_N - ask_vol_N) / (bid_vol_N + ask_vol_N) | total == 0 |
+| `ob_depth_bid_{N}` | sum(bid_sz_1..N) | never |
+| `ob_depth_ask_{N}` | sum(ask_sz_1..N) | never |
+| `ob_depth_total_{N}` | bid_vol_N + ask_vol_N | never |
+| `ob_vwap_bid_{N}` | sum(bid_px_i * bid_sz_i) / sum(bid_sz_i) | den == 0 |
+| `ob_vwap_ask_{N}` | sum(ask_px_i * ask_sz_i) / sum(ask_sz_i) | den == 0 |
+| `ob_top1_share` | bid_sz_1 / (bid_sz_1 + ask_sz_1) | total == 0 |
+| `ob_top5_share` | sum(bid_sz_1..5) / sum(bid_sz_1..5 + ask_sz_1..5) | total == 0 |
+| `ob_best_bid` | alias of best_bid | never |
+| `ob_best_ask` | alias of best_ask | never |
+| `ob_mid` | alias of mid_price | never |
+
+Where N ∈ {1, 3, 5, 10, 20} from `depth_levels` config.
+
+### Change features (delta over snapshots)
+| Feature | Formula | Nulls when |
+|---------|---------|------------|
+| `ob_depth_change_{N}_{iv}` | diff(depth_total, iv) | first iv rows |
+| `ob_spread_change_{iv}` | diff(spread_bps, iv) | first iv rows |
+| `ob_imbalance_change_{N}_{iv}` | diff(imbalance, iv) | first iv rows |
+
+Where iv ∈ {1, 6, 60} from `change_intervals` config.
+
+### Volatility features (rolling std)
+| Feature | Formula | Nulls when |
+|---------|---------|------------|
+| `ob_depth_volatility_{N}_{lb}` | rolling_std(depth_total, lb) | < lb rows |
+| `ob_spread_volatility_{lb}` | rolling_std(spread_bps, lb) | < lb rows |
+| `ob_imbalance_volatility_{N}_{lb}` | rolling_std(imbalance, lb) | < lb rows |
+
+Where lb ∈ {5, 12, 60} from `lookback_snapshots` config.
+
+### Provenance columns
+| Column | Value |
+|--------|-------|
+| `feature_version` | "1.0" |
+| `reconstruction_version` | from config (currently "1.0") |
+| `snapshot_freq_sec` | from config (currently 5) |
+| `config_hash` | SHA256 of sorted config items, truncated to 12 hex chars |
+
+Total feature dimensions: 5 depths × 3 types + 5 depths × 3 intervals + 5 depths × 3 lookbacks + 3 spread types + 2 share types + 3 base + 4 provenance = 103 ob_* + 4 provenance = 107 new columns.
+
+## Exact temporal semantics
+
+### Predictor features (get_predictor_features)
+- Input: snapshots with `timestamp_ms <= T` (enforced by `get_pre_event`)
+- Change/volatility features computed from those snapshots only
+- **No forward leakage**: a predictor feature at time T uses only data from snapshots at or before T
+- First `max(change_intervals)` + `max(lookback_snapshots)` rows will have null change/volatility features
+
+### Response features (get_response_features)
+- Input: snapshots with `timestamp_ms > T` (enforced by `get_post_event`)
+- Used for dynamics analysis only — NOT for predictor features
+- First rows will have null change/volatility features
+
+### Change features
+- `diff(iv)` is Polars default: `value[i] - value[i - iv]`
+- First `iv` rows are null (no prior data to diff against)
+
+### Volatility features
+- `rolling_std(lb)` uses Polars default (unbiased, ddof=1)
+- First `lb - 1` rows are null (insufficient window)
+
+## Handling of gaps/missing data
+
+1. **Gap detection**: BookState detects gaps when `update_id` skips. `gap_detected` column is boolean per snapshot.
+2. **Post-gap invalidation**: After a gap, the reconstructed book state is invalid until a fresh snapshot arrives. `apply_delta()` returns false when `has_valid_state` is false → snapshot requested.
+3. **Null propagation**: Features that depend on gap-affected data inherit nulls naturally through Polars null semantics.
+4. **Zero-depth handling**: Division by zero → explicit null via `pl.when(total > 0).then(...).otherwise(None)`. No silent zeros in imbalance or VWAP.
+5. **Missing snapshots**: If a symbol has no data for a date, `read_reconstructed()` returns None → empty DataFrame → no features produced.
+
+## Provenance implementation
+
+- `feature_version`: hardcoded "1.0" in source code
+- `reconstruction_version`: from `orderbook_research.toml` config
+- `snapshot_freq_sec`: from config (5 seconds)
+- `config_hash`: deterministic hash of all config key-value pairs, allows detecting config drift between feature runs
+
+All provenance columns are added as `pl.lit()` literals in `compute_all_features()`.
+
+## Tests
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Spread | 2 | PASS |
+| VWAP | 2 | PASS |
+| Imbalance | 2 | PASS |
+| Depth totals | 1 | PASS |
+| Change features | 2 | PASS |
+| Volatility features | 3 | PASS |
+| Missing/invalid snapshots | 3 | PASS |
+| Zero depth handling | 3 | PASS |
+| Timestamp boundary | 2 | PASS |
+| Provenance | 5 | PASS |
+| Config hash | 2 | PASS |
+| Feature count | 3 | PASS |
+| **Total** | **35** | **ALL PASS** |
+
+Full test suite: **230/230 pass** (0 regressions).
+
+## Sample real-data feature output (BTCUSDT, 2026-09-05)
+
+```
+timestamp_ms,symbol,ob_mid,ob_spread_bps,ob_imbalance_1,ob_imbalance_5,ob_depth_total_1,ob_depth_total_5,ob_vwap_bid_1,ob_depth_change_1_1,ob_depth_volatility_1_5,ob_spread_volatility_5,feature_version,config_hash
+1788600502129,BTCUSDT,79655.55,0.0126,-0.0321,0.0209,3.893,4.361,79655.5,,,,,1.0,c93cbe98f000
+1788600502148,BTCUSDT,79655.55,0.0126,-0.0321,0.0209,3.893,4.361,79655.5,0.0,,,,1.0,c93cbe98f000
+1788600502209,BTCUSDT,79655.55,0.0126,-0.0321,0.0209,3.893,4.361,79655.5,0.0,,,,1.0,c93cbe98f000
+```
+
+- 25,578 rows (0.3 hours of BTCUSDT data, ~150 snapshots/sec during active trading)
+- 196 total columns (90 raw + 103 features + 3 provenance)
+- 103 ob_* feature columns
+
+## Storage consumption
+
+| Metric | Value |
+|--------|-------|
+| Symbols collecting | 28 (smoke universe) |
+| Data on disk | 17.6 MB (28 files) |
+| Collection duration | 0.3 hours |
+| Write rate | ~1650 MB/day |
+| Estimated 30-day | ~48 GB |
+
+Note: Rate is high because 20-level wide format is ~3× larger than best-bid/ask-only format. Full 850-symbol universe will require monitoring actual write rates.
+
+## Implementation notes
+
+1. **Three-pass Polars batching**: `compute_snapshot_features()` uses three sequential `with_columns` calls because Polars does not guarantee column evaluation order within a single batch. Pass 1: base aliases + depth_bid/ask. Pass 2: depth_total. Pass 3: imbalance + VWAP + shares.
+2. **tomllib.dumps removed**: Python 3.12's `tomllib` is read-only. Config hash uses sorted key-value string formatting instead.
+3. **Parquet format**: Wide-format (one row per snapshot, 90 columns) instead of long-format (one row per level). Simpler downstream, but larger files.
+
+## What was NOT implemented (per Phase 1 constraints)
+
+- No trading hypotheses
+- No thresholds or discovery
+- No OOS validation
+- No BH modifications
+- No gate modifications
+- No dashboard changes
+- No paper trading
+- No universe logic changes
+- No candle research changes

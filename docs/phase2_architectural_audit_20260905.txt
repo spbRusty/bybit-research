@@ -1,0 +1,391 @@
+# Phase 2 Architectural Audit — OB Features Integration
+
+## 1. Current Pipeline (from code)
+
+### Events creation
+- **File**: `src/events.py` → `build_events(df, symbol, category)`
+- `suspicious_candles(df)` filters candles where `relative_volume > 3.0` OR `relative_range > 3.0`
+- `_future_metrics(df)` computes `return_{h}m`, `mfe_{h}m`, `mae_{h}m` for horizons [1,3,5,10,15,30] min
+- Future metrics computed on FULL time series BEFORE filtering (avoids shift issues with sparse data)
+- Events get `symbol`, `category`, `event_id` (from open_time strftime)
+- Events without full future window dropped (null entry_price)
+
+### Feature dataset
+- **File**: `src/features.py` → `add_features(df, btc, eth, ...)`
+- Modules: candle → volume → volatility → momentum → structure → cross → regime → context → market → external
+- Features computed on candle DataFrame BEFORE event filtering
+- `features_market.py` reads raw tick data (trades, orderbook captures, futures, liquidation, ratio) and aggregates to minute buckets
+- Existing orderbook features in `features_market.py`: sparse top-5 level data from captures (NOT reconstructed)
+
+### Feature-event join
+- **File**: `src/orchestrator.py` lines 88-118
+- For each symbol: `add_features(df, ...)` adds features to candle data
+- `build_events(df, ...)` filters to events (suspicious candles are a SUBSET of df)
+- **Features are already IN the events DataFrame** — no explicit join; events are a filtered subset of the feature-enriched candle df
+- Alignment across symbols: columns are unioned, missing columns filled with None (lines 111-118)
+
+### Period split
+- **File**: `src/research.py` → `split_periods(events)`
+- Splits by `open_time` into discovery/validation/oos based on `config/research.toml`:
+  - discovery: 2025-12-25 to 2026-04-30
+  - validation: 2026-05-01 to 2026-06-30
+  - oos: 2026-07-01 to 2026-09-02
+
+### Hypothesis generation
+- **File**: `src/hypothesis_generator.py` → `generate_hypotheses(df, rules)`
+- Takes discovery events + `GenRule` whitelist (feature_id, operator, entry_side, horizons)
+- `_condition_from_rule()` builds polars expression string: `"pl.col('feature') > threshold"`
+- Thresholds: absolute (`_THR_ABS`) or percentile-based from discovery data distribution
+- Deduplication by (feature, operator, entry, horizon)
+- `filter_by_freq()` cheap filter: n >= min_events
+
+### BH correction
+- **File**: `src/research.py` → `benjamini_hochberg(p_values, q)`
+- Standard BH on ALL p-values from discovery sweep
+- q = 0.05 (FDR control)
+
+### Validation/OOS
+- **File**: `src/research.py` → `run_research()` lines 212-217
+- For each BH-candidate: `test_hypothesis(val, hyp, cost)` and `test_hypothesis(oos, hyp, cost)`
+- Same `Hypothesis` object used across all periods (parameter freeze)
+
+### Gates
+- **File**: `src/orchestrator.py` → `stage_validation_gate()`, `stage_oos_gate()`
+- Formal: mean_net > 0 AND n >= min_events AND t >= min_t_stat
+- Parameter freeze verifies hypothesis_id + condition unchanged between discovery/validation/OOS
+
+### Critic
+- **File**: `src/critic.py` → `review(result, events)`
+- 9 checks: leakage, multiple_testing, sample_size, dependency, temporal_stability, costs, concentration, validation, oos
+- All must pass for verdict = PASS
+
+---
+
+## 2. Integration Point
+
+### The problem
+
+Current architecture: candle features are computed ON the candle DataFrame, then events are a filtered subset. Everything is row-aligned by `open_time`.
+
+OB features come from a DIFFERENT data source (reconstructed orderbook snapshots at 5-second frequency, NOT 1-minute candles). They cannot be computed inside `add_features()` because:
+1. They require reading reconstructed parquet (different I/O path)
+2. They require temporal lookup (get snapshot at/before T, not compute from candles)
+3. They have their own version/config_hash provenance
+
+### Correct integration point
+
+```
+orchestrator.py:
+  1. universe → data → features → events (EXISTING, UNCHANGED)
+  2. events["open_time"] → event_ts_ms
+  3. FOR EACH event: get_pre_event(symbol, event_ts_ms) → OB features at T
+  4. LEFT JOIN OB features onto events BY (symbol, open_time)
+  5. events WITH OB features → hypothesis_generator → research (EXISTING, UNCHANGED)
+```
+
+**Exact location**: `orchestrator.py` between step 2 (events assembled, line 119) and step 4 (data validation, line 130).
+
+### Why LEFT JOIN, not row-alignment
+
+Candle events have ONE row per event (at open_time). OB features need the NEAREST snapshot at or before T. This is a temporal lookup, not a row-alignment. LEFT JOIN ensures:
+- Events with no OB data get NULL OB features (still usable for candle-only research)
+- Events with OB data get features from the closest snapshot ≤ T
+
+---
+
+## 3. Data Flow
+
+```
+[RECONSTRUCTED OB]                    [CANDLE DATA]
+    ↓                                      ↓
+read_reconstructed()              data.load_universe_data()
+    ↓                                      ↓
+get_pre_event(symbol, T)          features.add_events()
+    ↓                                      ↓
+compute_all_features()            events.build_events()
+    ↓                                      ↓
+DataFrame[ob_*]                          ↓
+    ↓                                      ↓
+    └──── LEFT JOIN ON (symbol, open_time) ──┘
+                    ↓
+           events WITH OB features
+                    ↓
+        hypothesis_generator.generate_hypotheses()
+                    ↓
+           research.run_research()
+                    ↓
+           discovery → BH → validation → OOS → gates
+```
+
+---
+
+## 4. Temporal Semantics
+
+### Event timestamp T
+- `T = events["open_time"]` — the open time of the candle that triggered the event
+- In milliseconds: `T_ms = int(T.timestamp() * 1000)`
+
+### OB snapshot at T
+- `get_pre_event(symbol, T_ms)` returns snapshots with `timestamp_ms <= T_ms`
+- **The LAST snapshot in this set is the OB state at T**
+- If `timestamp_ms` of last snapshot is far from T (> 60 seconds), quality degrades
+
+### Critical: which snapshot is "the state at T"
+
+**Rule**: `feature_timestamp <= T`
+
+Given reconstructed snapshots at 5-second intervals and 1-minute candles:
+- Candle open_time T is aligned to minute boundary
+- Last snapshot before T is typically at T-5s to T-0s
+- This is the OB state used for features
+
+**If no snapshot exists at or before T**:
+- `get_pre_event()` returns empty DataFrame → OB features are all NULL
+- Event is still valid for candle-only research
+
+**Off-by-one on minute boundary**:
+- Candle open_time is `datetime` with minute precision
+- Snapshot timestamp_ms is millisecond precision
+- `get_pre_event()` filters `timestamp_ms <= T_ms` where T_ms = open_time in ms
+- No off-by-one: the filter is exact on milliseconds
+
+### Future return computation
+- `return_{h}m = close(T+h) / open(T+1) - 1`
+- This is UNCHANGED by OB integration
+- OB features at T do NOT use any data after T
+
+---
+
+## 5. Missing / Gap Policy
+
+### No snapshot near T
+- `get_pre_event()` returns empty or stale data
+- OB features for this event: ALL NULL
+- **Action**: Event included with NULL OB features. Candle features still usable.
+- **Quality flag**: Add `ob_data_quality` column:
+  - `"ok"`: last snapshot within 30s of T
+  - `"stale"`: last snapshot 30-120s before T
+  - `"missing"`: no snapshot available
+
+### Gap in reconstructed book
+- `gap_detected=True` in snapshot → book state is unreliable until fresh snapshot
+- **Action**: If `gap_detected=True` for the snapshot used at T, set OB features to NULL for this event
+- **Quality flag**: `ob_data_quality = "gap"` 
+
+### Event with null OB features
+- Still valid for candle-only research
+- Hypothesis generator skips OB features for this event (Polars null semantics: condition evaluates to null → event not selected)
+- **NOT silently dropped**: event stays in the dataset, OB columns are just null
+
+### When event is unfit for OB research
+- Only when ALL OB features are NULL for that event
+- This is recorded in `ob_data_quality` column
+- Research can filter: `events.filter(pl.col("ob_data_quality") != "missing")` for OB-specific analysis
+
+---
+
+## 6. Multiple-Testing Flow
+
+### Existing flow (UNCHANGED)
+```
+discovery events → test all hypotheses → collect p-values → BH(q=0.05) → candidates
+candidates → test on validation → validation gate
+validation-passed → test on OOS → OOS gate
+```
+
+### OB hypotheses enter the SAME flow
+```
+Candle hypotheses (H001-H008 + generated HG*) + OB hypotheses (OB*)
+    → ALL tested on discovery period
+    → ALL p-values collected
+    → SINGLE BH correction across ALL hypotheses
+    → candidates (candle + OB mixed)
+    → validation → OOS → gates (same for all)
+```
+
+### No OB-specific shortcuts
+- OB hypotheses do NOT get separate BH
+- OB hypotheses do NOT skip validation/OOS
+- OB hypotheses do NOT use different cost assumptions
+- OB hypotheses do NOT have separate discovery period
+
+### Double-usage prevention
+- Discovery period used ONLY for threshold computation AND hypothesis testing
+- Validation/OOS used ONLY for out-of-sample verification
+- The same `split_periods()` function handles all hypotheses
+- `parameter_freeze` stage verifies hypothesis params unchanged across periods
+
+---
+
+## 7. Provenance
+
+### Chain (existing → add OB)
+```
+reconstruction_version (from ob_reconstructor binary)
+  → feature_version (from orderbook_features.py, currently "1.0")
+    → feature_config_hash (SHA256 of orderbook_research.toml)
+      → hypothesis_id (OB001, OB002, ...)
+        → research_run (run_id with config_hash)
+```
+
+### Fields to add to Provenance (src/registry.py)
+- `ob_feature_version`: "1.0" (from orderbook_features.FEATURE_VERSION)
+- `ob_config_hash`: from orderbook_features._config_hash()
+- `ob_reconstruction_version`: from config (currently "1.0")
+
+### Reproducibility guarantee
+Given reconstruction_version + feature_config_hash + hypothesis condition + cost + seed → identical results.
+
+---
+
+## 8. File Changes
+
+### New files
+| File | Purpose |
+|------|---------|
+| `src/orderbook_integration.py` | Joins OB features to events (get_pre_event + compute_all + LEFT JOIN) |
+| `tests/test_orderbook_integration.py` | Tests for temporal alignment, null handling, provenance |
+| `config/ob_hypothesis_rules.toml` | GenRule definitions for OB features (feature_id, operator, horizons) |
+
+### Modified files
+| File | Change |
+|------|--------|
+| `src/orchestrator.py` | Add OB integration step between events assembly and research (~15 lines) |
+| `src/hypothesis_generator.py` | Load OB rules from ob_hypothesis_rules.toml, merge with default rules |
+| `src/registry.py` | Add OB provenance fields to Provenance dataclass |
+| `src/critic.py` | Add OB-specific leakage check (verify no POST-T data in OB features) |
+| `src/research.py` | Add OB hypothesis IDs to Provenance (minor) |
+
+### Unchanged files (CRITICAL)
+- `src/events.py` — event creation UNCHANGED
+- `src/features.py` — candle feature computation UNCHANGED
+- `src/features_market.py` — existing market features UNCHANGED
+- `src/data.py` — universe pipeline UNCHANGED
+- `src/pipeline.py` — stage framework UNCHANGED
+- `src/orderbook_features.py` — feature extraction UNCHANGED (already correct)
+- `src/orderbook_reader.py` — reader UNCHANGED (already correct)
+- `config/research.toml` — research params UNCHANGED
+- `config/features.toml` — candle feature params UNCHANGED
+- All existing candle research results remain reproducible
+
+---
+
+## 9. What MUST NOT Change
+
+1. **Event selection**: `suspicious_candles()` filter unchanged
+2. **Future metrics**: `return_{h}m`, `mfe_{h}m`, `mae_{h}m` computation unchanged
+3. **Period split**: discovery/validation/oos boundaries unchanged
+4. **Cost model**: survival_cost, cost_grid unchanged
+5. **BH procedure**: single BH across all hypotheses unchanged
+6. **Gates**: validation_gate, oos_gate logic unchanged
+7. **Critic**: existing checks unchanged (add OB checks, don't modify existing)
+8. **Universe**: liquidity filter unchanged
+9. **Existing hypotheses**: H001-H008 unchanged
+10. **Existing results**: research_*.json remain reproducible
+
+---
+
+## 10. Phase 2 Implementation Scope
+
+### Step 1: orderbook_integration.py
+```python
+def join_ob_features(events: pl.DataFrame) -> pl.DataFrame:
+    """LEFT JOIN OB features onto events by (symbol, open_time)."""
+    # For each unique (symbol, open_time):
+    #   1. get_pre_event(symbol, open_time_ms) → ob_df
+    #   2. compute_all_features(ob_df) → features_df
+    #   3. Take last row (state at T)
+    #   4. Add ob_data_quality column
+    # LEFT JOIN back to events
+```
+
+### Step 2: ob_hypothesis_rules.toml
+```toml
+[[rules]]
+feature_id = "ob_imbalance_5"
+operator = "gt"
+entry_side = "long"
+horizons = [5, 10, 30]
+
+[[rules]]
+feature_id = "ob_spread_bps"
+operator = "gt"
+entry_side = "short"
+horizons = [5, 10]
+# ... etc (whitelist of OB features to test)
+```
+
+### Step 3: orchestrator.py integration
+```python
+# After line 119 (events assembled):
+from src.orderbook_integration import join_ob_features
+events = join_ob_features(events)
+```
+
+### Step 4: hypothesis_generator.py OB rules
+Load rules from ob_hypothesis_rules.toml, merge with default_rules().
+
+### Step 5: Provenance extension
+Add OB fields to Provenance dataclass.
+
+### Step 6: Critic OB check
+Add leakage check: verify OB features at T do not use data after T.
+
+---
+
+## 11. Tests Required
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_temporal_alignment` | OB snapshot at T has timestamp_ms <= T_ms |
+| `test_no_future_leakage` | OB features use only snapshots <= T |
+| `test_missing_snapshot` | Event with no OB data gets NULL features |
+| `test_gap_handling` | Gap-detected snapshot → NULL features for that event |
+| `test_stale_data` | Snapshot far from T → ob_data_quality = "stale" |
+| `test_left_join_preserves_events` | All events preserved, OB features are additional columns |
+| `test_candle_features_unchanged` | Existing candle features identical before/after OB join |
+| `test_provenance_chain` | reconstruction_version → feature_version → config_hash in output |
+| `test_hypothesis_count_increases` | OB hypotheses added to total count |
+| `test_bh_single_correction` | All hypotheses (candle + OB) go through same BH |
+| `test_existing_hypotheses_unchanged` | H001-H008 conditions identical |
+| `test_existing_results_reproducible` | Same research.toml → same results for candle-only |
+
+---
+
+## 12. Potential Blockers
+
+### 1. Performance: per-event OB read
+- `get_pre_event()` reads parquet per call
+- With 1000+ events, this means 1000+ parquet reads
+- **Mitigation**: Read full symbol date once, cache, slice per event. Or batch: group events by (symbol, date), read once, compute features once, split.
+
+### 2. OB data availability
+- Current smoke test has 28 symbols, ~0.3 hours of data
+- Full research needs 850 symbols × months of data
+- **Mitigation**: OB collection runs continuously; research uses whatever is available. NULL OB features for missing data.
+
+### 3. Feature count explosion
+- 103 OB features × hypotheses per feature × horizons × directions
+- **Mitigation**: Whitelist in ob_hypothesis_rules.toml controls which OB features enter discovery. max_conditions_per_hyp = 2 limits combinations.
+
+### 4. Existing market features overlap
+- `features_market.py` already has sparse OB features (mk_imb1, mk_depth_bid5, etc.)
+- New OB features (ob_imbalance_5, ob_depth_total_10, etc.) are from RECONSTRUCTED data, much richer
+- **Mitigation**: Keep both. Old features are sparse tick-aggregated. New features are reconstructed snapshot-based. Different data quality, different provenance.
+
+### 5. Temporal boundary precision
+- Candle open_time is minute-precision datetime
+- Snapshot timestamp_ms is millisecond-precision
+- **Mitigation**: Convert candle open_time to ms for comparison. No off-by-one if done correctly.
+
+---
+
+## Summary
+
+**Architecture decision**: OB features join as ADDITIONAL columns via LEFT JOIN on (symbol, open_time), using temporal lookup (get_pre_event ≤ T). No changes to existing candle research.
+
+**Integration point**: `orchestrator.py` line 119, after events assembly, before research.
+
+**Key invariant**: OB features at T use ONLY snapshots ≤ T. No future leakage. No changes to existing pipeline.
+
+**Scope**: ~6 files modified, 3 files created. No changes to events.py, features.py, data.py, pipeline.py, or existing research results.

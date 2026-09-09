@@ -42,6 +42,9 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 <body>
 <h1><span id="status-dot" class="ok"></span>Bybit Research Dashboard <span class="sub" style="font-weight:normal">| <span id="last-update">—</span> | <span id="timer">3</span>s</span></h1>
 
+<!-- ═══════ ALERTS ═══════ -->
+<div id="alerts-bar" style="margin-bottom:8px"></div>
+
 <!-- ═══════ ROW 1: Paper Wallet ═══════ -->
 <div class="grid g4" id="row-wallet">
 <div class="card g"><span>Paper Trading</span><div class="v" id="p-status">—</div><div class="sub" id="p-reason"></div></div>
@@ -50,7 +53,19 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 <div class="card g"><span>Win Rate</span><div class="v" id="p-winrate">—</div><div class="sub" id="p-trades"></div></div>
 </div>
 
-<!-- ═══════ ROW 2: Parameters + Costs ═══════ -->
+<!-- ═══════ ROW 2: Collectors ═══════ -->
+<div class="grid g2">
+<div class="card">
+<h2>Order Book Collector</h2>
+<div id="ob-collector">Loading...</div>
+</div>
+<div class="card">
+<h2>Candle Collector</h2>
+<div id="candle-collector">Loading...</div>
+</div>
+</div>
+
+<!-- ═══════ ROW 3: Parameters + Costs ═══════ -->
 <div class="grid g3">
 <div class="card">
 <h2>Risk Management</h2>
@@ -66,7 +81,7 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </div>
 </div>
 
-<!-- ═══════ ROW 3: Stakes + Win Rate by Stake + Instrument ═══════ -->
+<!-- ═══════ ROW 4: Stakes + Win Rate by Stake + Instrument ═══════ -->
 <div class="grid g3">
 <div class="card">
 <h2>Stake Levels</h2>
@@ -83,14 +98,26 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </div>
 </div>
 
-<!-- ═══════ ROW 4: Pipeline ═══════ -->
-<div class="card" style="margin-bottom:8px">
+<!-- ═══════ ROW 5: Pipeline + Research Conclusion ═══════ -->
+<div class="grid g2">
+<div class="card">
 <h2>Pipeline</h2>
 <div class="pipe" id="pipeline-flow"></div>
 <table id="t-pipeline" style="margin-top:4px"><tr><td class="sub">Loading...</td></tr></table>
 </div>
+<div class="card">
+<h2>Research Conclusion</h2>
+<div id="research-conclusion">Loading...</div>
+</div>
+</div>
 
-<!-- ═══════ ROW 5: Data + Market Streams ═══════ -->
+<!-- ═══════ ROW 6: Data Quality ═══════ -->
+<div class="card" style="margin-bottom:8px">
+<h2>Data Quality</h2>
+<div id="data-quality">Loading...</div>
+</div>
+
+<!-- ═══════ ROW 7: Data + Market Streams ═══════ -->
 <div class="grid g2">
 <div class="card">
 <h2>Data Download (Klines)</h2>
@@ -102,7 +129,7 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </div>
 </div>
 
-<!-- ═══════ ROW 6: Signals + Hypotheses ═══════ -->
+<!-- ═══════ ROW 8: Signals + Hypotheses ═══════ -->
 <div class="grid g2">
 <div class="card">
 <h2>Signals / Events</h2>
@@ -114,7 +141,7 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </div>
 </div>
 
-<!-- ═══════ ROW 7: Orderbook Captures ═══════ -->
+<!-- ═══════ ROW 9: Orderbook Captures ═══════ -->
 <div class="grid g2">
 <div class="card">
 <h2>Orderbook Captures</h2>
@@ -126,7 +153,7 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </div>
 </div>
 
-<!-- ═══════ ROW 8: Logs ═══════ -->
+<!-- ═══════ ROW 10: Logs ═══════ -->
 <div class="card" style="margin-bottom:0">
 <h2>Logs</h2>
 <div class="log-box" id="log-content">Loading...</div>
@@ -393,6 +420,95 @@ async function renderLogsPoll() {
   setIf('log-content', text);
 }
 
+// ═══════ 13. Alerts ═══════
+async function renderAlerts() {
+  const d = await fetchJSON('/alerts');
+  if (!d || !d.length) { setIf('alerts-bar', ''); return; }
+  let html = '';
+  for (const a of d) {
+    const bg = a.level === 'critical' ? '#da3633' : a.level === 'error' ? '#f85149' : a.level === 'warning' ? '#d29922' : '#30363d';
+    html += `<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;background:${bg};color:#fff;margin-right:4px">${a.source}: ${a.message}</span>`;
+  }
+  setIf('alerts-bar', html);
+}
+
+// ═══════ 14. Order Book Collector ═══════
+async function renderOBCollector() {
+  const d = await fetchJSON('/ob-collector');
+  if (!d) return;
+  const stClass = d.status === 'RUNNING' ? 'status-ok' : d.status === 'ERRORS' ? 'status-err' : 'status-na';
+  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${d.status}</div>`;
+  html += `<div class="sub">${d.symbols_count || 0} symbols | ${(d.total_updates || 0).toLocaleString()} updates | ${(d.total_rows || 0).toLocaleString()} rows</div>`;
+  if (d.disk_free_gb != null) {
+    const diskClass = d.disk_free_gb < 5 ? 'status-err' : d.disk_free_gb < 10 ? 'status-warn' : 'status-ok';
+    html += `<div class="sub">Disk: <span class="${diskClass}">${d.disk_free_gb.toFixed(1)} GB</span> free | Reconnects: ${d.total_reconnects || 0} | Errors: ${d.total_errors || 0}</div>`;
+  }
+  if (d.symbols && d.symbols.length) {
+    html += '<table style="margin-top:4px"><tr><th>Symbol</th><th>Status</th><th>Updates</th><th>Rows</th><th>Errors</th></tr>';
+    for (const s of d.symbols.slice(0, 8)) {
+      const sc = s.status === 'OK' ? 'tag-pass' : s.status === 'GAP' ? 'tag-stop' : 'tag-na';
+      html += `<tr><td class="mono">${s.symbol}</td><td><span class="tag ${sc}">${s.status}</span></td><td>${s.updates.toLocaleString()}</td><td>${s.rows.toLocaleString()}</td><td>${s.errors}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  setIf('ob-collector', html);
+}
+
+// ═══════ 15. Candle Collector ═══════
+async function renderCandleCollector() {
+  const d = await fetchJSON('/candle-collector');
+  if (!d) return;
+  const stClass = d.status === 'RUNNING' ? 'status-ok' : 'status-na';
+  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${d.status}</div>`;
+  html += `<div class="sub">${d.total_files || 0} files | ${(d.total_size_mb || 0).toFixed(1)} MB</div>`;
+  if (d.categories) {
+    html += '<table style="margin-top:4px"><tr><th>Category</th><th>Files</th><th>Size</th><th>Newest</th><th>Lag</th><th>Status</th></tr>';
+    for (const [cat, info] of Object.entries(d.categories)) {
+      const sc = info.status === 'LIVE' ? 'tag-pass' : info.status === 'STALE' ? 'tag-stop' : 'tag-na';
+      const lag = info.lag_min != null ? (info.lag_min < 60 ? Math.round(info.lag_min) + 'm' : Math.round(info.lag_min / 60) + 'h') : '—';
+      const newest = info.newest ? info.newest.slice(0, 16) : '—';
+      html += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td><td class="mono">${newest}</td><td>${lag}</td><td><span class="tag ${sc}">${info.status}</span></td></tr>`;
+    }
+    html += '</table>';
+  }
+  setIf('candle-collector', html);
+}
+
+// ═══════ 16. Data Quality ═══════
+async function renderDataQuality() {
+  const d = await fetchJSON('/data-quality');
+  if (!d) return;
+  let html = '<div style="display:flex;gap:16px">';
+  if (d.orderbook) {
+    html += '<div><div class="sub">Orderbook</div>';
+    html += `<span class="tag tag-pass">OK: ${d.orderbook.ok}</span> `;
+    html += `<span class="tag tag-stop">Gap: ${d.orderbook.gap}</span> `;
+    html += `<span class="tag tag-reject">Stale: ${d.orderbook.stale}</span>`;
+    html += '</div>';
+  }
+  if (d.klines) {
+    html += '<div><div class="sub">Klines</div>';
+    html += `<span class="tag tag-pass">OK: ${d.klines.ok}</span> `;
+    html += `<span class="tag tag-stop">Stale: ${d.klines.stale}</span> `;
+    html += `<span class="tag tag-reject">Missing: ${d.klines.missing}</span>`;
+    html += '</div>';
+  }
+  html += '</div>';
+  setIf('data-quality', html);
+}
+
+// ═══════ 17. Research Conclusion ═══════
+async function renderResearchConclusion() {
+  const d = await fetchJSON('/research-conclusion');
+  if (!d) return;
+  const stClass = d.verdict === 'PASS' ? 'status-ok' : d.verdict === 'NO_CANDIDATE' ? 'status-na' : 'status-warn';
+  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${d.status || 'NO DATA'}</div>`;
+  if (d.reason) html += `<div class="sub">${d.reason}</div>`;
+  if (d.n_hypotheses) html += `<div class="sub">Tested ${d.n_hypotheses} hypotheses, ${d.n_candidates || 0} candidates</div>`;
+  if (d.finalist) html += `<div class="sub">Finalist: <span class="mono">${d.finalist.hypothesis_id || 'N/A'}</span></div>`;
+  setIf('research-conclusion', html);
+}
+
 function startSSE() {
   if (sseActive) return;
   try {
@@ -416,7 +532,8 @@ async function refreshAll() {
   await Promise.all([
     renderPaper(), renderRisk(), renderStakes(), renderWinrate(),
     renderInstruments(), renderPipeline(), renderData(), renderStreams(),
-    renderSignals(), renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll()
+    renderSignals(), renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll(),
+    renderAlerts(), renderOBCollector(), renderCandleCollector(), renderDataQuality(), renderResearchConclusion()
   ]);
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
   countdown = 3;

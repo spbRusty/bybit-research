@@ -1,0 +1,496 @@
+PHASE 3 VERDICT: INSUFFICIENT DATA — NO STATISTICAL CONCLUSIONS POSSIBLE
+
+========================================================================
+1. EXECUTIVE SUMMARY
+========================================================================
+
+Phase 3 attempted to statistically validate Order Book (OB) hypotheses
+using the existing discovery framework on reconstructed OB data.
+
+RESULT: The available OB data (15 minutes on a single day, 2026-09-05
+09:28-09:43 UTC) is fundamentally insufficient for statistical testing.
+
+Key numbers:
+- 28 symbols have reconstructed OB parquet data
+- 82 events pass the prefilter AND have quality=ok OB data
+- These span 23 symbols but only 1 day (15-minute window)
+- 0 OB hypotheses survive the min_events=100 gate
+- 0 OB hypotheses survive the min_months=3 gate
+- No validation or OOS period is possible
+
+Even without gates, the "significant" OB hypotheses found (n=8-9,
+p<0.01) ALL have negative net returns (winrate < 0.12), indicating
+they are small-sample noise artifacts, not genuine signals.
+
+CONCLUSION: No edge found. Data collection must continue before
+any statistical conclusions about OB predictive power are possible.
+
+========================================================================
+2. DATA COVERAGE
+========================================================================
+
+OB Data Coverage (2026-09-05):
+  Symbols: 28
+  Time range: 09:28:22 UTC to 09:43:45 UTC (15 min 23 sec)
+  Gaps detected: 0 (all symbols)
+
+Candle kline data:
+  All 28 OB symbols have full 1m kline data (~365K rows each)
+  Candle events on 2026-09-05: ~715 per symbol
+
+Event-OB overlap:
+  After prefilter (relative_volume>3 OR relative_range>3):
+  - 139 events fall within the OB time window
+  - 130 get quality=ok (OB snapshot within 120s)
+  - 9 get quality=missing (OB snapshot >600s away)
+  - 0 stale, 0 gap
+
+Coverage table (quality=ok only):
+  Symbol           Total  InWindow  Ok
+  -------------------------------------------
+  ARBUSDT          63864       15   15
+  GUNUSDT          92161       16   14
+  SIRENUSDT        76959       11   11
+  OPUSDT           63012        9    9
+  MERLUSDT         87551        9    8
+  RAVEUSDT         78525        8    6
+  ESPORTSUSDT      98321        8    7
+  ETHUSDT          57710        7    7
+  DYDXUSDT         75516        6    6
+  PIPPINUSDT       66103        6    6
+  DEXEUSDT         85122        5    5
+  NEARUSDT         55324        5    4
+  APTUSDT          68156        4    4
+  SAHARAUSDT       86599        4    3
+  BEATUSDT         53261        3    3
+  BTCUSDT          53801        3    3
+  ENJUSDT         102563        3    3
+  TAOUSDT          64353        3    3
+  ZECUSDT          62112        3    3
+  DOTUSDT          59290        2    2
+  MONUSDT          77505        2    2
+  VVVUSDT          66672        2    2
+  ZKUSDT           81389        1    1
+  -------------------------------------------
+  TOTAL                          139  130
+
+  HYPEUSDT: 0 events in window
+  XRPUSDT:  0 events in window
+
+CRITICAL LIMITATION:
+  All 130 ok events span a SINGLE 15-minute window on ONE day.
+  Statistical methodology requires multi-month data for:
+  - min_months=3 (discovery period split)
+  - Temporal stability assessment
+  - Generalizability beyond a single market regime
+
+========================================================================
+3. DATA QUALITY
+========================================================================
+
+Quality distribution (after ms/sec bug fix):
+  ok:     130  (93.5%)
+  missing:   9  ( 6.5%)
+  stale:     0  ( 0.0%)
+  gap:       0  ( 0.0%)
+
+OB feature null rates in ok events:
+  ob_best_bid:     0/130 null
+  ob_best_ask:     0/130 null
+  ob_spread_bps:   0/130 null
+  ob_mid:          0/130 null
+  ob_imbalance_5:  0/130 null
+
+All ok events have complete OB features with no nulls.
+Feature variance is present (e.g., ob_spread_bps std=3.68, range 0.01-13.0).
+
+========================================================================
+4. TEMPORAL LEAKAGE AUDIT
+========================================================================
+
+Code-level verification:
+  [PASS] join_ob_features uses snapshot_ms <= event_t_ms
+  [PASS] post-T snapshots are rejected (pre.height==0 → missing)
+  [PASS] change/volatility features use only pre-T data
+  [PASS] targets (return_*, mfe_*, mae_*) never modified
+  [PASS] OB features never used as hypothesis targets
+
+Unit tests (39 tests in test_orderbook_integration.py):
+  - TestLatestSnapshotLeT: snapshot before T → ok
+  - TestRejectsSnapshotAfterT: snapshot after T → missing
+  - TestExactTimestampT: snapshot at exact T → ok
+  - TestPostTSnapshotNeverUsed: future snapshot ignored
+  - TestMixedBeforeAfterUsesLatestPreT: only pre-T used
+  - TestMissingFeaturesAreNull: missing → features NULL
+  - TestGapFeaturesAreNull: gap → features NULL
+  - TestTemporalEdgeCases: T+1ms rejected, T-1ms accepted
+  - TestStaleFeaturesPopulated: stale quality → features present (design)
+
+Real-data correlation check:
+  OB features show some correlation with returns (max |r|=0.35),
+  but with n=82 this is expected under null (random correlations
+  in small samples can reach 0.3-0.4).
+
+VERDICT: No temporal leakage detected at code or data level.
+
+========================================================================
+5. HYPOTHESIS UNIVERSE
+========================================================================
+
+Rules loaded: 30 (all_rules() = default_rules() + ob_rules())
+  Candle rules: 14 (default_rules)
+  OB rules: 16 (ob_hypothesis_rules.toml)
+
+Generated hypotheses (relaxed, no min_events filter):
+  Total: 63 generated + 8 baseline (H001-H008) = 71
+  Candle generated: 29
+  OB generated: 34
+
+Generated hypotheses (with min_events=100 filter):
+  Total: 0 generated + 8 baseline = 8
+  (All generated hypotheses filtered out — only 130 ok events)
+
+Default analysis uses the min_events=100 filter, so only 8 baseline
+hypotheses are tested. This is by design — hypotheses must have
+sufficient statistical power.
+
+========================================================================
+6. DISCOVERY RESULTS
+========================================================================
+
+Standard analysis (min_events=100):
+  Hypotheses tested: 8 (H001-H008 only)
+  OB hypotheses tested: 0
+  n>=100: 0/8
+  BH survivors: 1 (H002, candle-only)
+  Candidates: 0 (fails min_months=3)
+
+Relaxed analysis (all hypotheses, no min_events filter):
+  Hypotheses tested: 71
+  With n>0: 67
+  With n>=30: ~15
+  BH survivors (q=0.05): 10
+
+Top OB hypotheses by p-value (RELAXED — NOT CANDIDATES):
+  HG032: ob_spread_bps < 0.742, n=8, p=0.00002, net=-0.002
+  HG048: ob_top1_share > 0.928, n=8, p=0.00004, net=-0.003
+  HG044: ob_imbalance_10 > 0.271, n=8, p=0.00028, net=-0.002
+  HG034: ob_imbalance_1 > 0.857, n=9, p=0.00547, net=-0.003
+  HG035: ob_imbalance_1 > 0.857, n=9, p=0.00467, net=-0.003
+  HG049: ob_top1_share > 0.928, n=8, p=0.00400, net=-0.003
+
+ALL OB BH survivors have:
+  - n=8-9 (far below min_events=100)
+  - Negative net returns (loss-making even at zero cost)
+  - Winrate < 12% (overwhelmingly losing trades)
+  - Single-day data (no temporal stability)
+
+VERDICT: These are SMALL-SAMPLE NOISE, not genuine signals.
+
+========================================================================
+7. BH CORRECTION
+========================================================================
+
+Unified BH on all 71 hypotheses (candle + OB):
+  Total p-values: 71
+  BH q: 0.05
+  Survivors: 10
+
+The BH correction is applied to the unified set — no separate
+alpha budget for OB. This is correct.
+
+However, 10 BH survivors out of 71 with n=8-9 and negative returns
+is CONSISTENT WITH RANDOM NOISE under multiple testing.
+
+At cost=0.0020 (survival cost):
+  BH survivors: 10
+  Positive mean: 18/71 (25%)
+  Most "significant" hypotheses are SHORT (negative return)
+
+At cost=0.0030:
+  BH survivors: 16 (more "significant" because cost amplifies negative t-stats)
+  Positive mean: 9/71 (13%)
+
+The increase in BH survivors at HIGHER costs confirms these are
+NOT economically viable signals.
+
+========================================================================
+8. VALIDATION
+========================================================================
+
+Validation period: 2026-05-01 to 2026-06-30 (from research.toml)
+
+Events in validation period: 0
+  All OB data is from 2026-09-05, which falls AFTER the OOS period.
+  No events can be tested in validation.
+
+VERDICT: Validation is IMPOSSIBLE with current data.
+
+========================================================================
+9. OOS
+========================================================================
+
+OOS period: 2026-07-01 to 2026-09-02 (from research.toml)
+
+Events in OOS period: 0
+  All OB data is from 2026-09-05 (day 3 of OOS, but only 15 min).
+  OOS requires the SAME hypotheses to be tested on held-out data,
+  but there are no OB events in the OOS window.
+
+VERDICT: OOS is IMPOSSIBLE with current data.
+
+========================================================================
+10. COST STRESS
+========================================================================
+
+Grid: [0.0010, 0.0015, 0.0020, 0.0030]
+
+  cost=0.0010: BH survivors=1,  positive_mean=25/71
+  cost=0.0015: BH survivors=5,  positive_mean=21/71
+  cost=0.0020: BH survivors=10, positive_mean=18/71
+  cost=0.0030: BH survivors=16, positive_mean=9/71
+
+INTERPRETATION:
+  At cost=0.0010 (lowest): only 1 BH survivor, 25% have positive mean
+  At cost=0.0030 (highest): 16 BH survivors, only 13% have positive mean
+
+  The pattern is INVERTED from what a genuine signal would show:
+  - Real signals should show FEWER survivors at higher costs
+  - Here, MORE survive at higher costs
+
+  This happens because higher costs make negative returns more
+  negative, inflating t-stats for SHORT hypotheses. The "signal"
+  is actually an artifact of cost amplification on loss-making
+  hypotheses.
+
+VERDICT: No cost scenario produces viable OB signals.
+
+========================================================================
+11. SYMBOL CONCENTRATION
+========================================================================
+
+Top OB BH survivors by symbol distribution:
+
+  HG032 (ob_spread_bps < 0.742):
+    4 symbols, top=ZECUSDT (37.5%), n=8
+
+  HG048 (ob_top1_share > 0.928):
+    6 symbols, top=APTUSDT (25.0%), n=8
+
+  HG044 (ob_imbalance_10 > 0.271):
+    6 symbols, top=ZECUSDT (25.0%), n=8
+
+  HG034 (ob_imbalance_1 > 0.857):
+    7 symbols, top=GUNUSDT (22.2%), n=9
+
+  H002 (candle, relative_volume>3 & red):
+    19 symbols, top=PIPPINUSDT (8.8%), n=34
+
+CONCENTRATION:
+  - Most OB hypotheses concentrated in 4-7 symbols
+  - ZECUSDT, APTUSDT, GUNUSDT appear frequently
+  - Max concentration: 37.5% (one symbol)
+  - Threshold: max_symbol_concentration=0.5 (from config)
+
+  With n=8-9, concentration metrics are unreliable.
+  A single additional event from any symbol would shift
+  concentration by 10+ percentage points.
+
+VERDICT: Cannot assess concentration meaningfully with n<100.
+
+========================================================================
+12. TEMPORAL STABILITY
+========================================================================
+
+Data spans: 1 day (2026-09-05, 09:28-09:43 UTC)
+
+  INSUFFICIENT DATA FOR TEMPORAL STABILITY CONCLUSION
+
+  Temporal stability requires:
+  - Multiple non-overlapping periods
+  - At least 3 months for min_months gate
+  - Ability to detect regime changes
+
+  With 15 minutes of data on a single day, temporal stability
+  cannot be assessed.
+
+========================================================================
+13. CANDLE vs OB COMPARISON
+========================================================================
+
+Candle hypotheses: 37 (8 baseline + 29 generated)
+OB hypotheses: 34
+
+Hypotheses with n>0:
+  Candle: 35
+  OB: 32
+
+Unified BH survivors (q=0.05):
+  Candle: 4
+  OB: 6
+
+Median p-value:
+  Candle: ~0.15
+  OB: ~0.10
+
+INTERPRETATION:
+  OB hypotheses show slightly more "significance" than candle
+  hypotheses in this sample, but this is LIKELY AN ARTIFACT of:
+  1. Smaller sample sizes (n=8-9 vs n=18-34 for candle)
+  2. More extreme t-stats from low-n instability
+  3. Selection bias (OB features have more degrees of freedom)
+
+  With n=8-9, t-stats are inherently more extreme than with n=30+,
+  producing artificially low p-values.
+
+  To properly compare candle vs OB signal, we need:
+  - Multi-month OB data
+  - Comparable sample sizes
+  - Same temporal coverage
+
+VERDICT: Cannot compare candle vs OB with current data.
+
+========================================================================
+14. SURVIVING HYPOTHESES
+========================================================================
+
+Standard analysis (min_events=100):
+  NONE — 0 OB hypotheses survive all gates
+
+Relaxed analysis (no min_events filter):
+  10 BH survivors, ALL with negative net returns:
+  - HG032: n=8, net=-0.002 (LOSS)
+  - HG048: n=8, net=-0.003 (LOSS)
+  - HG044: n=8, net=-0.002 (LOSS)
+  - HG034: n=9, net=-0.003 (LOSS)
+  - HG035: n=9, net=-0.003 (LOSS)
+  - HG049: n=8, net=-0.003 (LOSS)
+  - H002: n=34, net=-0.003 (LOSS, candle)
+  - HG011: n=18, net=-0.005 (LOSS, candle)
+  - HG025: n=10, net=-0.002 (LOSS, candle)
+  - HG020: n=18, net=-0.007 (LOSS, candle)
+
+NONE of these are economically viable. ALL lose money after costs.
+
+========================================================================
+15. FAILED HYPOTHESES
+========================================================================
+
+71 hypotheses tested, 0 candidates.
+
+Failure modes:
+  1. Insufficient events: 0/71 have n>=100
+  2. Insufficient symbols: most have <7 symbols
+  3. Insufficient months: 0/71 have months>=3
+  4. Negative returns: all "significant" hypotheses lose money
+  5. No temporal stability: single-day data
+
+========================================================================
+16. LIMITATIONS
+========================================================================
+
+CRITICAL LIMITATIONS:
+  1. 15 minutes of OB data on 1 day — orders of magnitude below
+     what's needed for statistical testing
+  2. 82 quality=ok events — below min_events=100 threshold
+  3. 1 day — below min_months=3 threshold
+  4. 0 validation/OOS events — cannot validate any finding
+  5. No temporal stability possible
+  6. Single market regime (15-min snapshot of market microstructure)
+
+METHODOLOGICAL LIMITATIONS:
+  1. OB features are snapshot-based (5s intervals), not continuous
+  2. Reconstruction quality depends on WS message completeness
+  3. OB microstructure may differ across symbols (BTC vs altcoins)
+  4. Feature correlations within OB features create additional
+     multiple-testing burden
+
+WHAT WOULD BE NEEDED:
+  1. Minimum 3 months of OB data (2026-06-05 to 2026-09-05)
+  2. At least 1000 quality=ok events
+  3. At least 50 symbols with OB data
+  4. Multiple market regimes (trending, ranging, volatile, calm)
+  5. Full validation + OOS periods covered
+
+========================================================================
+17. STATISTICAL CONCLUSIONS
+========================================================================
+
+1. NO EDGE FOUND in Order Book features with current data.
+
+2. The 15-minute OB window is INSUFFICIENT for statistical testing.
+   Any "significant" results are small-sample artifacts.
+
+3. All OB BH survivors have negative net returns, confirming
+   they are noise rather than genuine signals.
+
+4. The statistical framework (BH, validation, OOS) is correctly
+   implemented and working — the issue is purely data availability.
+
+5. No OB-specific methodology deviations occurred. OB hypotheses
+   were tested through the same pipeline as candle hypotheses.
+
+6. The ms/sec bug and quality=null bug found in Phase 0 of this
+   session were critical — they would have produced completely
+   wrong results if left unfixed.
+
+========================================================================
+18. RECOMMENDATIONS FOR NEXT PHASE
+========================================================================
+
+IMMEDIATE:
+  1. Continue OB data collection for all 850 symbols
+  2. Target: 3+ months of data (minimum)
+  3. Monitor reconstruction quality and coverage
+
+WHEN SUFFICIENT DATA EXISTS:
+  1. Re-run Phase 3 with multi-month data
+  2. Validate any surviving hypotheses on held-out data
+  3. Assess temporal stability across market regimes
+  4. Compare OB signal to candle signal with comparable data
+
+DO NOT:
+  - Tune OB features to fit 15-minute data
+  - Manually select "promising" OB hypotheses
+  - Lower statistical thresholds to get results
+  - Interpret small-sample significance as genuine
+
+========================================================================
+19. BUGS FOUND AND FIXED IN THIS SESSION
+========================================================================
+
+BUG 1: quality=missing/gap still populated features
+  File: src/orderbook_integration.py:128-140
+  Problem: When quality="missing" or "gap", features came from
+    the stale snapshot instead of being NULLed out.
+  Fix: Added conditional — quality in ("ok","stale") → populate,
+    else → NULL all features.
+  Tests: TestMissingFeaturesAreNull (3 tests)
+
+BUG 2: ms/sec mismatch in _process_symbol
+  File: src/orderbook_integration.py:86
+  Problem: events["open_time"].cast(pl.Int64) // 1_000 divided
+    already-millisecond timestamps by 1000, producing seconds.
+    OB timestamp_ms is in milliseconds. Comparison always failed.
+  Fix: events["open_time"].cast(pl.Datetime("ms")).cast(pl.Int64)
+  Tests: All existing tests now produce correct results (was 0 ok,
+    now 130 ok)
+
+BUG 3: Schema inference for mixed None/float rows
+  File: src/orderbook_integration.py:155
+  Problem: pl.DataFrame(rows) failed when rows mixed None (missing)
+    and float (ok) values due to inconsistent schema.
+  Fix: Explicit schema specification for ob_df construction.
+
+Total tests: 272/272 PASS
+
+========================================================================
+PHASE 3 FINAL: INSUFFICIENT DATA — NO EDGE FOUND
+========================================================================
+
+The statistical framework is working correctly. The issue is
+purely data availability. 15 minutes of OB data cannot support
+any statistical conclusions. Data collection must continue.
+
+Next authorized step: None. Do not proceed to Phase 4 without
+separate authorization and sufficient data.

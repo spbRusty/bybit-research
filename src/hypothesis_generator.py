@@ -19,27 +19,25 @@ from src.research import Hypothesis
 logger = logging.getLogger(__name__)
 
 _G = load_toml("hypothesis_generator.toml")
+_OB_RULES = load_toml("ob_hypothesis_rules.toml")
 
-# Направление и горизонт по умолчанию (если не переопределено)
 DEFAULT_HORIZONS = (5, 10, 30)
 DEFAULT_ENTRY = "long"
 
 
 @dataclass
 class GenRule:
-    """Правило генерации: feature + сравнение + направление + max_conditions."""
     feature_id: str
-    operator: str            # gt | lt | in_range
+    operator: str
     entry_side: str = "long"
     horizons: tuple[int, ...] = DEFAULT_HORIZONS
     max_conditions: int = 1
-    min_event_share: float = 0.001   # событие не реже доли всех свечей
+    min_event_share: float = 0.001
 
     def to_record(self):
         return asdict(self)
 
 
-# Правила генерации (whitelist §38). Семантически осмысленные признаки.
 def default_rules() -> list[GenRule]:
     return [
         GenRule("relative_volume_60", "gt", "long", (5, 10, 30)),
@@ -59,6 +57,23 @@ def default_rules() -> list[GenRule]:
     ]
 
 
+def ob_rules() -> list[GenRule]:
+    rules = []
+    for r in _OB_RULES.get("ob_features", []):
+        rules.append(GenRule(
+            feature_id=r["feature_id"],
+            operator=r["operator"],
+            entry_side=r.get("entry_side", "long"),
+            horizons=tuple(r.get("horizons", [5, 10])),
+            max_conditions=r.get("max_conditions", 2),
+        ))
+    return rules
+
+
+def all_rules() -> list[GenRule]:
+    return default_rules() + ob_rules()
+
+
 def _threshold(feature_id: str, operator: str, df: pl.DataFrame) -> float:
     """Порог по распределению признака (процентиль, параметризован в конфиге)."""
     cfg = _G.get("thresholds", {})
@@ -67,6 +82,8 @@ def _threshold(feature_id: str, operator: str, df: pl.DataFrame) -> float:
         # дефолт: 90-й процентиль для gt, 10-й для lt
         pct = 0.9 if operator == "gt" else 0.1
     q = df[feature_id].drop_nulls().quantile(pct)
+    if q is None:
+        return None
     return float(q)
 
 
@@ -96,11 +113,15 @@ def _condition_from_rule(rule: GenRule, df: pl.DataFrame) -> str:
         thr = _THR_ABS.get(fid)
         if thr is None:
             thr = _threshold(fid, "gt", df)
+        if thr is None:
+            return None
         return f"pl.col('{fid}') > {thr:.6g}"
     if rule.operator == "lt":
         thr = _THR_ABS.get(fid)
         if thr is None:
             thr = _threshold(fid, "lt", df)
+        if thr is None:
+            return None
         return f"pl.col('{fid}') < {thr:.6g}"
     if rule.operator == "in_range":
         if fid == "volatility_regime":
@@ -109,6 +130,8 @@ def _condition_from_rule(rule: GenRule, df: pl.DataFrame) -> str:
         # числовой диапазон: 0.1 < x < 0.9 процентиль
         lo = df[fid].drop_nulls().quantile(0.1)
         hi = df[fid].drop_nulls().quantile(0.9)
+        if lo is None or hi is None:
+            return None
         return f"(pl.col('{fid}') > {lo:.6g}) & (pl.col('{fid}') < {hi:.6g})"
     return None
 

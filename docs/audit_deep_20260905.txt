@@ -1,0 +1,478 @@
+================================================================================
+DEEP AUDIT — 10 POINTS, EVIDENCE-BASED — 2026-09-05
+================================================================================
+
+================================================================================
+1. ORDERBOOK: COLUMN ALIGNMENT
+================================================================================
+
+Тип Table (marketdata.rs:59-60):
+  type Col = Vec<Cell>;
+  type Table = Vec<(&'static str, Col)>;
+
+Table = Vec кортежей (name, column_data). Порядок элементов в Vec = порядок
+колонок.
+
+Источник данных — единственный parse_message(Stream::Orderbook, ...) (lines 214-217):
+  let mut t = Table::from([
+      ("ts", Col::new()), ("seq", Col::new()), ("is_delta", Col::new()),
+      ("level", Col::new()),
+      ("bid_px", Col::new()), ("bid_sz", Col::new()),
+      ("ask_px", Col::new()), ("ask_sz", Col::new()),
+  ]);
+
+Получатель — ob_capture_task (lines 544-547):
+  let mut all_rows: Table = Table::from([
+      ("ts", Col::new()), ("seq", Col::new()), ("is_delta", Col::new()),
+      ("level", Col::new()),
+      ("bid_px", Col::new()), ("bid_sz", Col::new()),
+      ("ask_px", Col::new()), ("ask_sz", Col::new()),
+  ]);
+
+Merge (lines 552-556):
+  for (i, (_, col)) in rows.into_iter().enumerate() {
+      if i < all_rows.len() { all_rows[i].1.extend(col); }
+  }
+
+Позиционный merge. Обе стороны используют идентичный Table::from([...])
+literal. Единственный producer в buf_rx — это ob_capture_once → parse_message.
+Нет другого источника данных.
+
+'&static str' имена — это метаданные в кортеже, не используются в merge.
+
+Цепочка доказательства:
+1. parse_message → всегда Table::from([("ts",..), ("seq",..), ...,
+   ("ask_sz",..)]) — хардкод
+2. ob_capture_once → передаёт через buf_tx без модификации
+3. ob_capture_task → получает из buf_rx, merge по позиции
+4. Позиции совпадают гарантированно (одинаковый literal)
+
+Причины, почему предыдущий аудит ошибся: предыдущий аудит предположил, что
+parse_message может вернуть колонки в другом порядке. Но Table::from([...])
+на литерале массива гарантирует фиксированный порядок. Нет условной логики,
+нет динамического построения.
+
+> VERDICT: FALSE POSITIVE
+> Колонки гарантированно совпадают. Design fragile (позиционная связь),
+> но не баг.
+
+================================================================================
+2. ORDERBOOK: SNAPSHOT -> DELTA -> BOOK STATE
+================================================================================
+
+Это самый критический пункт.
+
+Bybit WS protocol (orderbook.50.{symbol}):
+  type: "snapshot" -> data.b = полный стакан (все уровни):
+    [["50000","1.5"], ["49999","2.0"], ...]
+  type: "delta" -> data.b = ИЗМЕНЕНИЯ:
+    [["50000","0"]] (удаление), [["50100","0.5"]] (обновление)
+
+Код parse_message (lines 208-232):
+  let is_delta = v["type"].as_str() == Some("delta");
+  for i in 0..OB_LEVELS {   // OB_LEVELS = 10
+      let bp = bids.get(i).and_then(|x| x.as_array());
+      let ap = asks.get(i).and_then(|x| x.as_array());
+      if bp.is_none() && ap.is_none() { continue; }
+      t[3].1.push(Cell::I(i as i64 + 1));  // level = i+1
+      t[4].1.push(Cell::F(pf(bp...a.get(0))));  // bid_px
+      t[5].1.push(Cell::F(pf(bp...a.get(1))));  // bid_sz
+
+Ключевая проблема: Код итерирует i in 0..10 и читает bids[i] — позиционно.
+
+  Snapshot: bids = [["50000","1.5"], ["49999","2.0"], ...]
+    bids[0] = лучший bid, bids[1] = второй. Позиционный доступ КОРРЕКТЕН.
+
+  Delta: bids = [["50000","0"]] (удаление уровня 50000)
+    bids[0] = первый ИЗМЕНЁННЫЙ уровень.
+    Код записывает level=1, bid_px=50000, bid_sz=0.
+    Это НЕ level 1 — это изменение произвольного уровня.
+
+Что происходит с is_delta: Флаг записывается в parquet, но НИГДЕ не
+используется для реконструкции. Нет book state machine. Нет sequence gap
+detection.
+
+ob_capture_task (lines 549-564):
+  Some((_key, rows)) => {
+      for (i, (_, col)) in rows.into_iter().enumerate() {
+          all_rows[i].1.extend(col);
+      }
+  }
+
+Все строки (snapshot + delta) конкатенируются в all_rows. Parquet содержит
+смесь snapshot-строк и delta-строк с одинаковой схемой.
+
+Потребляет ли pipeline захваченные данные?
+
+features_market.py читает из:
+  MARKET_DATA_DIR / "orderbook" / "linear" / f"{sym}.parquet"
+Захваты сохраняются в:
+  CAPTURES_DIR / f"{event_id}.parquet"
+
+Это РАЗНЫЕ пути. Данные захватов НЕ потребляются pipeline.
+
+Цепочка доказательства:
+1. Delta обрабатывается как snapshot (позиционный доступ) — level колонка
+   содержит позицию в delta-массиве, а не реальный уровень книги
+2. Book state не реконструируется (нет state machine)
+3. is_delta флаг хранится, но не используется
+4. Данные захватов не читаются features_market.py (другой путь)
+
+> VERDICT: CONFIRMED BUG
+> Delta-сообщения хранятся как snapshot. Реконструкция стакана невозможна.
+> Однако данные захватов НЕ потребляются текущим pipeline -> impact на
+> research = ZERO. Это BLOCKER для будущего использования orderbook captures,
+> но не для текущих результатов.
+
+================================================================================
+3. HYPOTHESIS GENERATION / LEAKAGE
+================================================================================
+
+Полный трейс:
+
+orchestrator.py lines 145-149:
+  disc_events = research_mod.split_periods(events)["discovery"]
+  generated = hgen_mod.generate_hypotheses(disc_events)
+  generated = hgen_mod.filter_by_freq(generated, disc_events, _R["min_events"])
+
+generate_hypotheses(df) получает df = disc_events (только discovery).
+
+Внутри _condition_from_rule(rule, df) (line 96-99):
+  thr = _THR_ABS.get(fid)
+  if thr is None:
+      thr = _threshold(fid, "gt", df)  # df = disc_events
+
+_threshold(feature_id, "gt", df) (line 69):
+  q = df[feature_id].drop_nulls().quantile(pct)  # df = disc_events
+
+Threshold вычисляется ТОЛЬКО на discovery данных.
+
+filter_by_freq(generated, disc_events, ...) — тоже только discovery.
+
+Затем run_research(events, hypotheses=hypotheses) (line 154):
+  periods = split_periods(events)
+  disc, val, oos = periods["discovery"], periods["validation"], periods["oos"]
+  for i, hyp in enumerate(hypotheses):
+      m = test_hypothesis(disc, hyp, cost_survival)  # discovery sweep
+
+Validation/OOS тестируют те же гипотезы (с теми же thresholds) на своих
+периодах.
+
+Цепочка доказательства:
+1. disc_events = split_periods(events)["discovery"] — только discovery period
+2. generate_hypotheses(disc_events) — threshold из discovery
+3. filter_by_freq(generated, disc_events) — фильтрация по discovery
+4. run_research -> split_periods -> test_hypothesis(disc, ...) — sweep
+   по discovery
+5. test_hypothesis(val, ...) — validation (те же fixed thresholds)
+6. test_hypothesis(oos, ...) — OOS (те же fixed thresholds)
+
+Нет ни одного пути, по которому validation/OOS данные попадают в вычисление
+thresholds.
+
+> VERDICT: NO LEAKAGE
+> Thresholds frozen на discovery. Validation/OOS не влияют на выбор
+> параметров.
+
+================================================================================
+4. REGISTRY LIFECYCLE
+================================================================================
+
+Grep по всем .py файлам:
+  HypothesisLifecycle — только в registry.py (строка 113)
+  transition — только в registry.py (строка 135)
+
+Grep по HypothesisStatus:
+  orchestrator.py:187: result["verdict"] = "CANDIDATE" — строка, не enum
+  research.py:46: status: str = "CANDIDATE" — поле dataclass
+  pipeline.py:390,396,424,442: строковые константы
+
+Ни один файл не импортирует HypothesisLifecycle.
+Ни один файл не вызывает transition().
+Файл data/research/registry.json не существует на диске.
+
+> VERDICT: NOT INTEGRATED
+> HypothesisLifecycle реализована полностью (register, transition,
+> get_status, persistence), но нигде не подключена. Мёртвый код.
+
+================================================================================
+5. PAPER TRADING
+================================================================================
+
+paper_run вызывается только из paper.py (grep: 1 совпадение).
+Orchestrator НЕ вызывает paper_run.
+
+Трейс execution lifecycle:
+
+  entry = open(T+1)                     # из events
+  stop_dist = stop_k_vol * vol * entry  # 2.0 * vol_gk_30d * entry
+  stop = entry - side * stop_dist
+  take = entry + side * 1.5 * stop_dist
+  qty = floor(risk_usd / stop_dist / step) * step   # risk_usd = balance * 1%
+
+Stop/take priority (_outcome):
+  if side > 0:  # long
+      if h_low <= stop: return "stop", stop    # СНАЧАЛА стоп
+      if h_high >= take: return "take", take
+
+Stop проверяется ПЕРВЫМ — консервативно.
+
+Verified behavior (from runtime test):
+  long, both hit (h_high>take, h_low<stop): reason=stop  OK (stop first)
+  short, both hit: reason=stop  OK
+  long, take only: reason=take  OK
+  long, close: reason=close  OK
+
+Position sizing:
+  entry=100, stop=98, equity=10000: qty=50.0  OK (1% risk = $100, dist=2)
+  entry=100, stop=99.999, equity=10000: qty=99999.999
+  -- dist=0.001, qty взрывается. Нет max qty guard.
+
+Fee: fee_round_trip = 0.0015 применяется ОДИН раз к fill_entry * qty —
+это simplification (вместо отдельных fee на entry/exit), но корректно по
+сумме.
+
+Slippage: entry*(1+slip) для входа, exit*(1-slip) для выхода — корректно.
+
+Множественные позиции: НЕТ. Trades обрабатываются последовательно.
+Каждая сделка использует текущий state["balance"]. Нет concurrency.
+open_positions в state не заполняется.
+
+Look-ahead при определении результата: НЕТ. mfe/mae/return_{h}m — это
+FUTURE metrics, вычисленные в events.py. Paper trading использует их для
+SIMULATION (backtesting), не для принятия решения о входе. Вход决定 by
+prefilter at time T, entry at open(T+1).
+
+Research vs paper cost assumptions:
+  Research: survival_cost = 0.002 (flat)
+  Paper: fee=0.0015 + slippage=0.0002 = ~0.0017
+  Research использует БОЛЬШУЮ стоимость -> консервативнее. Если гипотеза
+  проходит research, она пройдёт и paper.
+
+> VERDICT: PARTIALLY INTEGRATED
+> Модуль реализован корректно (position sizing, fees, slippage, stop/take),
+> но paper_run НЕ вызывается из orchestrator. Standalone модуль. Нет max
+> qty guard (LOW).
+
+================================================================================
+6. FORWARD FILL / STALE MARKET DATA
+================================================================================
+
+Forward-filled колонки (features_market.py:177-180):
+  state_cols = ["mk_best_bid", "mk_best_ask", "mk_funding_rate", "mk_oi",
+                "mk_mark_px", "mk_buy_ratio", "mk_depth_bid5", "mk_depth_ask5"]
+  out = out.with_columns([pl.col(c).forward_fill() for c in state_cols])
+
+forward_fill() БЕЗ limit — Polars заполняет ВСЕ последующие null последним
+известным значением бесконечно.
+
+Частота обновления данных:
+  mk_funding_rate, mk_oi, mk_mark_px: REST poll каждые 60с (FUTURES_POLL_SEC)
+  mk_buy_ratio: REST poll каждые 300с (RATIO_POLL_SEC)
+  mk_best_bid/ask, mk_depth_bid5/ask5: orderbook — не собирается permanent
+    (event-driven only) -> всегда null
+
+Что происходит при multi-hour gap:
+  Колпетер падает на 2 часа
+  При перезапуске: первый бакет с данными получает forward-filled значение
+  ДО gap. Значение живёт пока не придёт новый tick.
+
+Для funding_rate: funding меняется каждые 8ч -> 2ч gap = acceptable staleness
+Для OI: меняется часто, но не драматично -> 2ч staleness = MEDIUM
+Для mark_px: меняется непрерывно -> 2ч staleness = HIGH (may be significantly
+  stale)
+
+Look-ahead? НЕТ. Forward-fill использует ПРОШЛЫЕ данные. Feature на бакете
+T использует данные <= T. Это НЕ leakage — это staleness (данные старше,
+чем должны быть).
+
+> VERDICT: MEDIUM ISSUE (data quality, not leakage)
+> Forward-fill без limit -> значения могут жить бесконечно. Во время простоя
+> колпетера features используют устаревшие данные. Не влияет на корректность
+> period split, но снижает качество features.
+
+================================================================================
+7. CRASH RECOVERY ORDERBOOK CAPTURE
+================================================================================
+
+Lifecycle trigger-файла:
+1. Python: trigger.write(_TRIGGERS_DIR) -> {event_id}.json
+2. Rust trigger_watcher (2s scan) -> обнаруживает JSON -> отправляет в
+   capture_manager
+3. capture_manager -> ob_capture_task -> WS capture -> parquet ->
+   fs::remove_file(trigger_path)
+
+Crash during capture (step 3, до удаления):
+  Trigger JSON остаётся в data/triggers/
+  trigger_watcher starting with empty known map (in-memory only)
+  Scan находит существующий JSON -> treated as NEW
+  ob_capture_task запускается повторно
+  Пишет в тот же {event_id}.parquet -> OVERWRITE предыдущего
+
+Crash after deletion: trigger удалён -> нет дубликата.
+
+Evidence:
+  known map: HashMap<String, bool> в trigger_watcher — не персистится
+  (line 443)
+  known.retain(|k, _| Path::new(k).exists()) — на restart known пуст ->
+  все файлы = new
+  write_parquet пишет в {event_id}.parquet через atomic rename -> overwrite
+
+Duplicate capture после restart = DATA OVERWRITE.
+Первая capture теряется, заменяется второй.
+
+> VERDICT: CONFIRMED BUG
+> Orphaned triggers -> duplicate capture -> data overwrite. Impact: MEDIUM
+> (в худшем случае capture перезаписывается другими market data). Не
+> catastrophic для research, но нарушает data provenance.
+
+================================================================================
+8. TEST COUNT
+================================================================================
+
+Результат запуска:
+  Ran 185 tests in 0.190s
+  OK
+
+Тестовые файлы (7):
+  tests/test_candle_trigger.py
+  tests/test_critic_gates.py
+  tests/test_e2e.py
+  tests/test_features.py
+  tests/test_leakage.py
+  tests/test_oos_gate.py
+  tests/test_pipeline.py
+
+Команда: unittest discover -s tests -p "test_*.py" — находит ВСЕ test_*.py
+в tests/.
+
+Rust тесты (6): в collector/src/bin/marketdata.rs — запускаются через
+cargo test, отдельно.
+
+Почему было 208/209 ранее: вероятно, до реорганизации тестов
+(удалены/переименованы). Текущее состояние — 185 Python tests + 6 Rust
+tests = 191 total.
+
+> VERDICT: 185/185 is the complete Python test suite.
+> discover -s tests -p "test_*.py" находит 7 файлов, 185 тестов. Все
+> проходят. Полный suite.
+
+================================================================================
+9. MULTIPLE TESTING
+================================================================================
+
+Полный трейс:
+
+run_research (research.py:163-219):
+  # 1. Discovery sweep — ВСЕ гипотезы
+  rows = []
+  for i, hyp in enumerate(hypotheses):
+      m = test_hypothesis(disc, hyp, cost_survival)
+      rows.append(m)
+  df = pl.DataFrame(rows)
+
+  # 2. BH correction — ко ВСЕМ discovery p-values
+  p_arr = np.nan_to_num(df["p_value"].to_numpy(), nan=1.0)
+  sig_bh = benjamini_hochberg(p_arr, q)  # q=0.05
+
+  # 3. Gate mask — BH + min_events + min_symbols + min_months + t_stat +
+  #    mean_net>0
+  mask = (sig_bh &
+          (df["n"].to_numpy() >= _R["min_events"]) &
+          (df["n_symbols"].to_numpy() >= _R["min_unique_symbols"]) &
+          (df["n_months"].to_numpy() >= _R["min_months"]) &
+          (df["t_stat"].to_numpy() >= _R["min_t_stat"]) &
+          (df["mean_net"].to_numpy() > 0))
+  candidates = df.filter(pl.Series(mask))
+
+  # 4. Validation — только прошедшие discovery
+  for cid in out["candidates"]:
+      mv = test_hypothesis(val, hyp, cost_survival)
+      mo = test_hypothesis(oos, hyp, cost_survival)
+
+Ключевые проверки:
+1. BH применяется ко ВСЕМ discovery p-values? ДА — p_arr содержит все
+   p-values
+2. Повторный выбор после BH? НЕТ — candidates выбираются ОДИН раз
+3. Validation используется для выбора параметров? НЕТ — тестирует те же
+   conditions
+4. Параметры frozen до OOS? ДА — condition строка фиксирована при
+   генерации
+
+> VERDICT: CORRECT
+> BH -> gate mask -> validation -> OOS. Нет re-selection. Параметры frozen.
+> Корректная multiple-testing correction.
+
+================================================================================
+10. ИТОГОВАЯ ТАБЛИЦА
+================================================================================
+
+| Приоритет | Проблема                       | Доказательство                                          | Влияние на research  | Что делать                              |
+|-----------|--------------------------------|---------------------------------------------------------|----------------------|-----------------------------------------|
+| HIGH      | Orderbook delta как snapshot   | parse_message позиционно; book state не реконструируется | ZERO (не потребляется)| Исправить ИЛИ задокументировать как raw |
+| HIGH      | Crash: orphaned triggers       | known in-memory; overwrite при restart                  | LOW (overwrite)      | Persist known ИЛИ dedup по event_id     |
+| MEDIUM    | Paper trading не integrated    | paper_run нигде не вызывается                           | N/A (не блокирует)   | Wire into pipeline ИЛИ задокументировать|
+| MEDIUM    | Forward-fill без limit         | forward_fill() без limit; staleness indefinitely        | LOW (misleading)     | Добавить limit parameter                |
+| MEDIUM    | HypothesisLifecycle dead code  | Определён, нигде не вызывается; registry.json нет      | N/A (dead code)      | Удалить ИЛИ подключить                  |
+| LOW       | Нет max qty guard              | Tiny stop_dist -> enormous qty (verified: 99999.999)    | LOW (unlikely)       | Добавить max_qty guard                  |
+
+================================================================================
+BLOCKERS
+================================================================================
+
+Нет. Статистические результаты исследования достоверны:
+  - No leakage (thresholds frozen on discovery)
+  - Multiple testing corrected (BH applied to all)
+  - Periods correctly split (disjoint, no overlap)
+  - Parameter freeze verified (hash comparison)
+  - Critic has 9 gates including temporal stability, concentration,
+    validation, OOS
+
+================================================================================
+NON-BLOCKERS
+================================================================================
+
+1. Orderbook delta bug (data quality, не потребляется)
+2. Crash recovery duplicate captures (data overwrite, не loss)
+3. Paper trading not wired into orchestrator
+4. Forward-fill staleness
+5. HypothesisLifecycle dead code
+6. No max qty guard in paper trading
+
+================================================================================
+VERIFIED CORRECT
+================================================================================
+
+1. Column alignment — Table::from([...]) хардкод, позиционный merge безопасен
+2. No leakage — disc_events -> generate_hypotheses -> thresholds frozen
+3. Multiple testing — BH -> gate mask -> validation -> OOS, no re-selection
+4. Period split — open_time >= start AND < end, disjoint
+5. Parameter freeze — hash comparison в stage_parameter_freeze
+6. Test suite — 185/185 Python + 6 Rust = полный suite
+7. Critic gates — 9 checks, UNKNOWN != PASS
+8. Stop/take priority — stop checked first (conservative, verified at runtime)
+9. Position sizing — risk/stop_distance, floor rounding, min_lot guard
+
+================================================================================
+NEXT STEP (5 изменений, по приоритету)
+================================================================================
+
+1. Orderbook delta — либо исправить parse_message для поддержки book state
+   reconstruction, либо задокументировать captures как raw unprocessed data
+   и НЕ использовать их в features. Второй вариант проще и достаточен.
+
+2. Crash recovery — добавить dedup: ob_capture_task проверяет
+   {event_id}.parquet перед записью; или persist known map в файл.
+
+3. Forward fill limit — forward_fill(limit=300) (5 минут) для
+   mk_best_bid/ask, forward_fill(limit=3600) для funding/OI/ratio.
+   Ограничить staleness.
+
+4. Paper trading integration — вызов paper_run из orchestrator после
+   stage_critic (если PASS).
+
+5. Max qty guard — min(qty, max_position_usd / entry) в _position_size.
+
+================================================================================
+END OF DEEP AUDIT
+================================================================================

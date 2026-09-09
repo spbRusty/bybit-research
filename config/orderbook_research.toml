@@ -1,0 +1,28 @@
+# Orderbook Research — Phase 0 configuration
+# Continuous reconstructed orderbook for research
+
+# Reconstruction
+reconstruction_version = "1.0"
+snapshot_frequency_sec = 5          # how often to write reconstructed state
+book_depth_levels = 50              # max levels from Bybit orderbook.50
+
+# Feature parameters (Phase 1 will use these)
+depth_levels = [1, 3, 5, 10, 20]   # N for depth features
+lookback_snapshots = [5, 12, 60]   # K for volatility features (in snapshots)
+change_intervals = [1, 6, 60]      # delta for change features (in snapshots)
+
+# Event windows (Phase 1+)
+pre_event_minutes = 10              # N: how far back for predictor features
+post_event_minutes = 20             # M: how far forward for response features
+
+# Storage
+retention_days_raw = 7              # keep raw WS messages for N days (debug)
+retention_days_reconstructed = 365  # keep reconstructed snapshots
+
+# Gap handling
+max_gap_before_snapshot = 10        # if >N updates missed, request new snapshot
+snapshot_request_cooldown_sec = 5   # min time between snapshot requests
+
+# Bybit WebSocket
+ws_url = "wss://stream.bybit.com/v5/public/linear"
+topic_prefix = "orderbook.50."

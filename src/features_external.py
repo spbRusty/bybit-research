@@ -89,7 +89,7 @@ def add_external_features(df: pl.DataFrame, crypto_key: str | None = None) -> pl
         df = df.with_columns(pl.col("open_time").dt.date().alias("_ext_date"))
         df = df.join(fng, on="_ext_date", how="left").drop("_ext_date")
     else:
-        df = df.with_columns(pl.lit(None, dtype=pl.Int32).alias("fng_value"))
+        df = df.with_columns(pl.lit(None, dtype=pl.Int64).alias("fng_value"))
 
     # 2. CoinGecko /global (дневной)
     cg = fetch_coingecko_global()

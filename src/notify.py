@@ -56,3 +56,32 @@ def notify_trade(paper: dict) -> None:
            f"net {paper['net_pnl']:+.2f} USDT; просадка {paper['max_drawdown']:.2%}; "
            f"баланс {paper['balance_end']:.2f} USDT")
     notify("PAPER TRADE CLOSED", msg, tags="chart")
+
+
+def notify_hypothesis_candidate(hyp_id: str, description: str) -> None:
+    """Уведомление о новом кандидате-гипотезе."""
+    notify("HYPOTHESIS CANDIDATE", f"{hyp_id}: {description}", tags="thought_balloon")
+
+
+def notify_hypothesis_validated(hyp_id: str, description: str) -> None:
+    """Уведомление о валидации гипотезы (все gates пройдены)."""
+    notify("HYPOTHESIS VALIDATED", f"{hyp_id}: {description} — все gates пройдены",
+           tags="white_check_mark")
+
+
+def notify_paper_started(mode: str, hyp_id: str) -> None:
+    """Уведомление о запуске paper trading."""
+    notify("PAPER STARTED", f"Mode: {mode}, Hypothesis: {hyp_id}",
+           tags="rocket")
+
+
+def notify_paper_stopped(reason: str) -> None:
+    """Уведомление об остановке paper trading."""
+    notify("PAPER STOPPED", f"Reason: {reason}", tags="octagonal_sign")
+
+
+def notify_shadow_summary(trades: int, pnl: float, balance: float) -> None:
+    """Сводка по shadow paper за цикл."""
+    msg = (f"Shadow trades: {trades}; PnL: {pnl:+.4f} USDT; "
+           f"Balance: {balance:.2f} USDT")
+    notify("SHADOW SUMMARY", msg, tags="bar_chart")

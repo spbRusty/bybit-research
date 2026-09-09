@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,11 @@ from src import features_breadth as breadth_mod
 from src import hypothesis_generator as hgen_mod
 from src import research as research_mod
 from src import volatility as vol_mod
+from src.orderbook_integration import (
+    join_ob_features,
+    get_ob_provenance,
+    _get_ob_columns,
+)
 from src.pipeline import (
     StageResult,
     StageStatus,
@@ -40,6 +46,20 @@ from src.pipeline import (
     stage_oos_gate,
     stage_parameter_freeze,
     stage_validation_gate,
+)
+from src.registry import (
+    HypothesisLifecycle,
+    HypothesisStatus,
+    update_from_research,
+    get_eligible_for_paper,
+    get_shadow_eligible,
+)
+
+from src.notify import (
+    notify_hypothesis_candidate,
+    notify_hypothesis_validated,
+    notify_paper_started,
+    notify_shadow_summary,
 )
 
 logger = logging.getLogger("orchestrator")
@@ -59,6 +79,48 @@ def setup_logging() -> None:
 def _log_stage(s: StageResult) -> None:
     logger.info("STAGE %s: %s (%s)", s.stage, s.status.value,
                 "; ".join(s.errors) if s.errors else "OK")
+
+
+_COND_COL_RE = re.compile(r"pl\.col\('([^']+)'\)")
+
+
+def _condition_cols(condition: str) -> set[str]:
+    """Колонки, упомянутые в polars-условии гипотезы (pl.col('X'))."""
+    return set(_COND_COL_RE.findall(condition))
+
+
+def _required_columns() -> list[str]:
+    """Колонки, реально потребляемые downstream (research, critic, shadow, triggers).
+
+    Выводятся из фактических потребителей, НЕ хардкодятся:
+      - baseline H001-H008 (research.HYPOTHESES) condition columns;
+      - mr-control условия;
+      - feature_ids правил генерации (hgen.all_rules: default + OB-правила);
+      - фичи candle trigger (orderbook_capture.toml RULES);
+      - таргеты return_/mfe_/mae_{h}m из features.toml future_horizons_min;
+      - мета: open_time, symbol, category, event_id, entry_price;
+      - vol_gk_30d (consumer: paper.shadow_run / paper_run_backtest — риск-стоп);
+      - OB feature columns (_get_ob_columns) + ob_data_quality.
+    """
+    cols: set[str] = set()
+    # 1. Условия гипотез (baseline + mr-control)
+    for hyp in list(research_mod.HYPOTHESES) + _mr_hypotheses():
+        cols |= _condition_cols(hyp.condition)
+    # 2. Правила генерации гипотез (candle + OB)
+    for rule in hgen_mod.all_rules():
+        cols.add(rule.feature_id)
+    # 3. Candle trigger правила (фичи, читаемые по последней свече)
+    for rule in ct_mod.RULES:
+        cols.add(rule.feature)
+    # 4. Таргеты
+    for h in _FEAT["future_horizons_min"]:
+        cols |= {f"return_{h}m", f"mfe_{h}m", f"mae_{h}m"}
+    # 5. Мета + OB-качество
+    cols |= {"open_time", "symbol", "category", "event_id", "entry_price"}
+    # 6. Риск-колонка для paper (shadow_run / paper_run_backtest)
+    cols |= {"vol_gk_30d"}
+    cols |= set(_get_ob_columns()) | {"ob_data_quality"}
+    return sorted(cols)
 
 
 def run_pipeline(limit: int | None = None, category: str | None = None,
@@ -83,10 +145,12 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     eth = _load_symbol(_FEAT["eth_symbol"], "linear")
     univ_dfs = data_mod.load_universe_data(universe)
     breadth = breadth_mod.compute_breadth(univ_dfs)
+    required_cols = _required_columns()
     all_events = []
     n_loaded = 0
+    full_cols: set[str] = set()
     for row in universe.iter_rows(named=True):
-        df = univ_dfs.get((row["symbol"], row["category"]))
+        df = univ_dfs.pop((row["symbol"], row["category"]), None)
         if df is None:
             continue
         df = features_mod.add_features(df, btc, eth,
@@ -97,8 +161,12 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
                      right_on="date", how="left")
         ev = events_mod.build_events(df, row["symbol"], row["category"])
         if ev.height:
+            full_cols |= set(ev.columns)
+            ev = ev.select([c for c in required_cols if c in ev.columns])
             all_events.append(ev)
+        del df, ev
         n_loaded += 1
+    del univ_dfs, breadth, btc, eth
 
     if not all_events:
         s = StageResult(stage="data_loading", status=StageStatus.ERROR,
@@ -116,7 +184,23 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
             ev = ev.with_columns(pl.lit(None).alias(c))
         aligned.append(ev.select(all_cols))
     events = pl.concat(aligned)
-    logger.info("Events: %d", events.height)
+    del all_events, aligned
+    logger.info("Events: %d (candle features only)", events.height)
+
+    # --- 2b. ORDERBOOK FEATURE INTEGRATION ---
+    events = join_ob_features(events)
+    ob_cols = [c for c in events.columns if c.startswith("ob_")]
+    logger.info("OB integration: %d OB columns added", len(ob_cols))
+
+    # Assert: каждая колонка, реально требуемая downstream и существовавшая в
+    # полном (не-slim) событии хотя бы для одного символа, присутствует в slim.
+    missing_req = sorted(set(required_cols) & full_cols - set(events.columns))
+    if missing_req:
+        raise RuntimeError(f"Slimming dropped required columns: {missing_req}")
+    missing_ob = sorted((set(_get_ob_columns()) | {"ob_data_quality"})
+                        - set(events.columns))
+    if missing_ob:
+        raise RuntimeError(f"OB columns missing after join: {missing_ob}")
 
     # --- 3. CANDLE TRIGGER → ORDERBOOK CAPTURE ---
     triggers = ct_mod.evaluate_all_triggers(events)
@@ -144,7 +228,7 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     else:
         baseline = research_mod.HYPOTHESES
         disc_events = research_mod.split_periods(events)["discovery"]
-        generated = hgen_mod.generate_hypotheses(disc_events)
+        generated = hgen_mod.generate_hypotheses(disc_events, rules=hgen_mod.all_rules())
         generated = hgen_mod.filter_by_freq(generated, disc_events,
                                             _R["min_events"])
         hypotheses = list(baseline) + generated
@@ -154,6 +238,14 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     result = research_mod.run_research(events, hypotheses=hypotheses)
     rid = research_mod.save_result(result)
     logger.info("Research %s: candidates=%s", rid, result["candidates"])
+
+    for cid in result.get("candidates", []):
+        hyp = next((h for h in hypotheses if h.hypothesis_id == cid), None)
+        if hyp:
+            try:
+                notify_hypothesis_candidate(cid, hyp.description)
+            except Exception as e:
+                logger.warning("notify_candidate failed: %s", e)
 
     # --- 7. VALIDATION GATE (per candidate) ---
     passed_val: list[str] = []
@@ -198,6 +290,29 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     stages.append(s)
     _log_stage(s)
 
+    # --- 11b. REGISTRY UPDATE (AFTER Critic) ---
+    critic_passed = (s.status == StageStatus.PASS)
+    registry = HypothesisLifecycle()
+    if critic_passed:
+        transitions = update_from_research(registry, result)
+        if transitions:
+            for t in transitions:
+                logger.info("Lifecycle: %s %s -> %s", t["hypothesis_id"], t["from"], t["to"])
+                if t["to"] == "VALIDATED":
+                    hyp = next((h for h in hypotheses if h.hypothesis_id == t["hypothesis_id"]), None)
+                    if hyp:
+                        try:
+                            notify_hypothesis_validated(t["hypothesis_id"], hyp.description)
+                        except Exception as e:
+                            logger.warning("notify_validated failed: %s", e)
+    else:
+        logger.warning("Critic REJECT — skipping registry update (no VALIDATED transitions)")
+        transitions = []
+    eligible_a = get_eligible_for_paper(registry)
+    eligible_b = get_shadow_eligible(registry)
+    logger.info("Registry: %d validated (MODE A), %d candidates (MODE B)",
+                len(eligible_a), len(eligible_b))
+
     # --- 12. ACCEPTANCE REPORT ---
     report = build_acceptance_report(stages, result, run_id)
     report_path = RESULTS_DIR / f"acceptance_{run_id}.json"
@@ -205,6 +320,42 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
                                       default=str))
     logger.info("Acceptance report: %s (verdict=%s)", report_path,
                 report["verdict"])
+
+    # --- 13. SHADOW PAPER (MODE B) ---
+    if eligible_b:
+        try:
+            from src.paper import shadow_run
+            shadow_hyps = [h for h in hypotheses if h.hypothesis_id in eligible_b]
+            if shadow_hyps:
+                shadow_result = shadow_run(events, shadow_hyps)
+                logger.info("Shadow paper: %d trades, PnL=%.4f",
+                            shadow_result["trades_executed"],
+                            shadow_result["realized_pnl"])
+                report["shadow_paper"] = shadow_result
+                try:
+                    notify_shadow_summary(
+                        shadow_result["trades_executed"],
+                        shadow_result["realized_pnl"],
+                        shadow_result["balance"],
+                    )
+                except Exception as e:
+                    logger.warning("notify_shadow_summary failed: %s", e)
+        except Exception as e:
+            logger.warning("Shadow paper failed: %s", e)
+
+    # --- 14. AUTO TRIGGER MODE A ---
+    if eligible_a:
+        try:
+            triggered = auto_paper_trigger(registry)
+            if triggered:
+                logger.info("AUTO TRIGGER: Started MODE A for %s", triggered)
+                report["auto_triggered"] = triggered
+                try:
+                    notify_paper_started("VALIDATED", triggered[0])
+                except Exception as e:
+                    logger.warning("notify_paper_started failed: %s", e)
+        except Exception as e:
+            logger.warning("Auto paper trigger failed: %s", e)
 
     dt = (datetime.now(tz=timezone.utc) - t0).total_seconds()
     logger.info("=== DONE in %.1fs: verdict=%s ===", dt, report["verdict"])
@@ -236,6 +387,130 @@ def _mr_hypotheses() -> list[research_mod.Hypothesis]:
     return hyps
 
 
+def auto_research_loop(interval_sec: int = 3600, limit: int | None = None) -> None:
+    """Run pipeline on schedule. Blocks until interrupted.
+
+    Args:
+        interval_sec: Seconds between pipeline runs (default: 3600 = 1 hour)
+        limit: Max symbols to process (None = all)
+    """
+    import time
+    from src.paper import shadow_run
+    from src.registry import get_shadow_eligible
+
+    logger.info("=== AUTO RESEARCH LOOP: interval=%ds ===", interval_sec)
+    run_count = 0
+
+    while True:
+        try:
+            run_count += 1
+            logger.info("--- Run %d starting ---", run_count)
+
+            report = run_pipeline(limit=limit)
+            logger.info("Run %d: verdict=%s", run_count, report["verdict"])
+
+            # Shadow paper: execute trades for CANDIDATE hypotheses
+            if report.get("candidates"):
+                try:
+                    events = _load_latest_events()
+                    if events is not None and events.height > 0:
+                        registry = HypothesisLifecycle()
+                        shadow_ids = get_shadow_eligible(registry)
+                        if shadow_ids:
+                            from src.research import HYPOTHESES
+                            shadow_hyps = [h for h in HYPOTHESES
+                                          if h.hypothesis_id in shadow_ids]
+                            if shadow_hyps:
+                                shadow_result = shadow_run(events, shadow_hyps)
+                                logger.info("Shadow paper: %d trades, PnL=%.4f",
+                                            shadow_result["trades_executed"],
+                                            shadow_result["realized_pnl"])
+                except Exception as e:
+                    logger.warning("Shadow paper failed: %s", e)
+
+            logger.info("--- Run %d done ---", run_count)
+
+        except Exception as e:
+            logger.error("Pipeline error: %s", e)
+
+        logger.info("Sleeping %ds until next run...", interval_sec)
+        time.sleep(interval_sec)
+
+
+def _load_latest_events():
+    from config.settings import EVENTS_DIR
+    files = sorted(EVENTS_DIR.glob("*_events.parquet"))
+    if not files:
+        return None
+    return pl.read_parquet(files[-1])
+
+
+def auto_paper_trigger(registry: HypothesisLifecycle | None = None) -> list[str]:
+    """Start MODE A paper for newly VALIDATED hypotheses.
+
+    Returns list of hypothesis IDs that were triggered.
+    """
+    from src.paper import load_state, save_state
+    from src.registry import get_eligible_for_paper
+
+    if registry is None:
+        registry = HypothesisLifecycle()
+
+    eligible = get_eligible_for_paper(registry)
+    if not eligible:
+        return []
+
+    state = load_state()
+    already_active = state.get("hypothesis_id")
+    triggered = []
+
+    for hyp_id in eligible:
+        if already_active == hyp_id:
+            continue
+
+        logger.info("AUTO TRIGGER: Starting MODE A paper for %s", hyp_id)
+        state["mode"] = "VALIDATED"
+        state["hypothesis_id"] = hyp_id
+        state["started_at"] = datetime.now(tz=timezone.utc).isoformat()
+        save_state(state)
+        triggered.append(hyp_id)
+        break
+
+    return triggered
+
+
+def premature_paper_guard(report: dict) -> tuple[bool, str]:
+    """Block paper trading unless full pipeline completed.
+
+    Returns (allowed, reason).
+    """
+    verdict = report.get("verdict")
+    has_finalist = report.get("finalist") is not None
+    has_candidates = bool(report.get("candidates"))
+
+    if verdict == "STOP":
+        return False, "Pipeline stopped (data validation failed)"
+    if verdict == "ERROR":
+        return False, "Pipeline error"
+    if verdict == "NO_CANDIDATE":
+        return False, "No candidates passed discovery"
+    if has_candidates and not has_finalist:
+        return False, "Candidates exist but none passed all gates"
+    if not has_finalist:
+        return False, "No finalist"
+    if verdict not in ("PASS", "REJECT"):
+        return False, f"Unexpected verdict: {verdict}"
+
+    stages = report.get("stages", [])
+    required = {"data_validation", "feature_validation", "critic", "parameter_freeze"}
+    present = {s.get("stage") for s in stages}
+    missing = required - present
+    if missing:
+        return False, f"Missing required stages: {missing}"
+
+    return True, "All gates passed"
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="Unified orchestrator: full pipeline with structured stages")
@@ -244,8 +519,16 @@ if __name__ == "__main__":
                     choices=["linear", "spot"])
     ap.add_argument("--mr-control", action="store_true",
                     help="Run MR hypothesis control test only")
+    ap.add_argument("--auto", action="store_true",
+                    help="Run in auto-loop mode (continuous pipeline execution)")
+    ap.add_argument("--interval", type=int, default=3600,
+                    help="Interval in seconds for auto-loop (default: 3600)")
     args = ap.parse_args()
     setup_logging()
-    report = run_pipeline(limit=args.limit, category=args.category,
-                          mr_control=args.mr_control)
-    sys.exit(0 if report["verdict"] in ("PASS", "REJECT") else 1)
+
+    if args.auto:
+        auto_research_loop(interval_sec=args.interval, limit=args.limit)
+    else:
+        report = run_pipeline(limit=args.limit, category=args.category,
+                              mr_control=args.mr_control)
+        sys.exit(0 if report["verdict"] in ("PASS", "REJECT") else 1)

@@ -1,0 +1,40 @@
+# Orderbook Hypothesis Rules — Phase 2
+# Whitelist of OB features eligible for hypothesis generation.
+# Controls combinatorial explosion by limiting which OB features enter discovery.
+
+# OB feature whitelist — only these features become hypothesis candidates.
+# Format: feature_id, operator (gt/lt/in_range), entry_side, horizons, max_conditions
+# max_conditions limits compound hypotheses (e.g. "ob_spread > X AND ob_imbalance < Y")
+
+ob_features = [
+    # Spread
+    { feature_id = "ob_spread_bps", operator = "gt", entry_side = "short", horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_spread_bps", operator = "lt", entry_side = "long",  horizons = [5, 10], max_conditions = 2 },
+
+    # Imbalance at key depth levels
+    { feature_id = "ob_imbalance_1",  operator = "gt", entry_side = "long",  horizons = [5, 10, 30], max_conditions = 2 },
+    { feature_id = "ob_imbalance_1",  operator = "lt", entry_side = "short", horizons = [5, 10, 30], max_conditions = 2 },
+    { feature_id = "ob_imbalance_5",  operator = "gt", entry_side = "long",  horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_imbalance_5",  operator = "lt", entry_side = "short", horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_imbalance_10", operator = "gt", entry_side = "long",  horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_imbalance_10", operator = "lt", entry_side = "short", horizons = [5, 10], max_conditions = 2 },
+
+    # Top-of-book share
+    { feature_id = "ob_top1_share", operator = "gt", entry_side = "long",  horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_top1_share", operator = "lt", entry_side = "short", horizons = [5, 10], max_conditions = 2 },
+
+    # Depth change (momentum proxy)
+    { feature_id = "ob_depth_change_5_1",  operator = "gt", entry_side = "long",  horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_depth_change_5_1",  operator = "lt", entry_side = "short", horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_depth_change_10_1", operator = "gt", entry_side = "long",  horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_depth_change_10_1", operator = "lt", entry_side = "short", horizons = [5, 10], max_conditions = 2 },
+
+    # Spread change
+    { feature_id = "ob_spread_change_1", operator = "gt", entry_side = "short", horizons = [5, 10], max_conditions = 2 },
+    { feature_id = "ob_spread_change_1", operator = "lt", entry_side = "long",  horizons = [5, 10], max_conditions = 2 },
+]
+
+# Global limits for OB hypotheses
+max_conditions_per_hyp = 2
+max_features_per_hyp = 2
+dedup_by = "condition"

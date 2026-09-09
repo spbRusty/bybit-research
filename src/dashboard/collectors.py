@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from config.settings import (
     RAW_KLINES_DIR, MARKET_DATA_DIR, CLEAN_CANDLES, FEATURES_DIR,
     EVENTS_DIR, HYPOTHESES_DIR, RESULTS_DIR, REPORTS_DIR,
-    PAPER_DIR, PAPER_PORTFOLIO, PAPER_TRADES, LOGS_DIR, ROOT,
+    PAPER_DIR, PAPER_PORTFOLIO, PAPER_SHADOW, PAPER_TRADES, LOGS_DIR, ROOT,
 )
 
 _cache: dict[str, tuple[float, object]] = {}
@@ -627,27 +627,389 @@ def get_system_status() -> dict:
     }
 
 
-# ─── 14. Logs ──────────────────────────────────────────────────────
+# ─── 15. Order Book Collector ──────────────────────────────────────
 
-def get_logs(n: int = 30) -> dict:
-    out = {}
-    for name in ("orchestrator", "pipeline"):
-        path = LOGS_DIR / f"{name}.log"
-        if not path.exists():
-            out[name] = []
+def get_ob_collector() -> dict:
+    """Order Book collector metrics from _metrics.jsonl (live MARKET_DATA_DIR tree)."""
+    metrics_path = MARKET_DATA_DIR / "orderbook" / "reconstructed" / "_metrics.jsonl"
+    
+    if not metrics_path.exists():
+        return {
+            "status": "NOT RUNNING",
+            "reason": "No metrics file found",
+            "symbols": [],
+            "total_updates": 0,
+            "total_rows": 0,
+            "total_reconnects": 0,
+            "total_errors": 0,
+            "disk_free_gb": None,
+        }
+    
+    entries = []
+    try:
+        with open(metrics_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return {"status": "ERROR", "reason": "Cannot read metrics file"}
+    
+    if not entries:
+        return {"status": "NO DATA", "reason": "Metrics file empty"}
+    
+    by_symbol = {}
+    for e in entries:
+        sym = e.get("symbol", "?")
+        if sym not in by_symbol:
+            by_symbol[sym] = []
+        by_symbol[sym].append(e)
+    
+    symbols = []
+    total_updates = 0
+    total_rows = 0
+    total_reconnects = 0
+    total_errors = 0
+    disk_free = None
+    latest_ts = None
+    
+    for sym, sym_entries in by_symbol.items():
+        sym_entries.sort(key=lambda x: x.get("timestamp", ""))
+        last = sym_entries[-1]
+        
+        updates = last.get("updates_received", 0)
+        rows = last.get("rows_written", 0)
+        reconnects = last.get("reconnects", 0)
+        errors = last.get("errors", 0)
+        is_valid = last.get("is_valid", False)
+        jumps = last.get("update_id_jumps", 0)
+        invalid_secs = last.get("invalid_state_duration_secs", 0)
+        
+        total_updates += updates
+        total_rows += rows
+        total_reconnects += reconnects
+        total_errors += errors
+        
+        if disk_free is None and last.get("disk_free_gb") is not None:
+            disk_free = last["disk_free_gb"]
+        
+        ts = last.get("timestamp")
+        if ts and (latest_ts is None or ts > latest_ts):
+            latest_ts = ts
+        
+        status = "OK" if is_valid else "NO DATA"
+        if invalid_secs > 60:
+            status = "GAP"
+        
+        symbols.append({
+            "symbol": sym,
+            "status": status,
+            "updates": updates,
+            "rows": rows,
+            "reconnects": reconnects,
+            "errors": errors,
+            "update_id_jumps": jumps,
+            "invalid_state_secs": invalid_secs,
+            "is_valid": is_valid,
+            "last_timestamp": ts,
+        })
+    
+    symbols.sort(key=lambda x: x["updates"], reverse=True)
+    
+    overall_status = "RUNNING" if any(s["is_valid"] for s in symbols) else "NO DATA"
+    if total_errors > 0:
+        overall_status = "ERRORS"
+    
+    return {
+        "status": overall_status,
+        "symbols_count": len(symbols),
+        "total_updates": total_updates,
+        "total_rows": total_rows,
+        "total_reconnects": total_reconnects,
+        "total_errors": total_errors,
+        "disk_free_gb": disk_free,
+        "latest_timestamp": latest_ts,
+        "symbols": symbols[:30],
+    }
+
+
+# ─── 16. Candle Collector ──────────────────────────────────────────
+
+def get_candle_collector() -> dict:
+    """Candle collector status from kline files."""
+    stats = {}
+    total_files = 0
+    total_size = 0
+    total_records = 0
+    
+    for cat in ("linear", "spot"):
+        cat_dir = RAW_KLINES_DIR / cat
+        if not cat_dir.exists():
+            stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
             continue
+        
+        files = sorted(cat_dir.glob("*_1m.parquet"))
+        if not files:
+            stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
+            continue
+        
+        sizes = sum(f.stat().st_size for f in files)
+        total_files += len(files)
+        total_size += sizes
+        
+        oldest_ts = newest_ts = None
+        cat_records = 0
         try:
-            lines = path.read_text().splitlines()
-            out[name] = lines[-n:]
+            first = pl.read_parquet(files[0], columns=["open_time"])
+            oldest_ts = str(first["open_time"].min())
         except Exception:
-            out[name] = []
-    collector_log = ROOT / "collector" / "logs" / "marketdata.log"
-    if collector_log.exists():
+            pass
         try:
-            lines = collector_log.read_text().splitlines()
-            out["collector"] = lines[-10:]
+            last = pl.read_parquet(files[-1], columns=["open_time"])
+            newest_ts = str(last["open_time"].max())
         except Exception:
-            out["collector"] = []
+            pass
+        
+        lag_min = None
+        status = "UNKNOWN"
+        if newest_ts:
+            try:
+                newest_dt = datetime.fromisoformat(newest_ts.replace("Z", "+00:00"))
+                lag_s = (datetime.now(timezone.utc) - newest_dt).total_seconds()
+                lag_min = round(lag_s / 60, 1)
+                if lag_min < 60:
+                    status = "LIVE"
+                elif lag_min < 60 * 24:
+                    status = "STALE"
+                else:
+                    status = "OLD"
+            except Exception:
+                pass
+        
+        stats[cat] = {
+            "files": len(files),
+            "total_size_mb": round(sizes / 1e6, 1),
+            "newest": newest_ts,
+            "oldest": oldest_ts,
+            "lag_min": lag_min,
+            "status": status,
+        }
+    
+    return {
+        "status": "RUNNING" if total_files > 0 else "NO DATA",
+        "categories": stats,
+        "total_files": total_files,
+        "total_size_mb": round(total_size / 1e6, 1),
+    }
+
+
+# ─── 17. Data Quality ──────────────────────────────────────────────
+
+def get_data_quality() -> dict:
+    """Data quality metrics from orderbook and kline data."""
+    quality = {
+        "orderbook": {"ok": 0, "stale": 0, "gap": 0, "missing": 0},
+        "klines": {"ok": 0, "stale": 0, "missing": 0},
+    }
+    
+    # Check OB quality from metrics
+    metrics_path = MARKET_DATA_DIR / "orderbook" / "reconstructed" / "_metrics.jsonl"
+    if metrics_path.exists():
+        try:
+            with open(metrics_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                        if e.get("is_valid"):
+                            quality["orderbook"]["ok"] += 1
+                        else:
+                            quality["orderbook"]["gap"] += 1
+                        if e.get("invalid_state_duration_secs", 0) > 60:
+                            quality["orderbook"]["stale"] += 1
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            pass
+    
+    for cat in ("linear", "spot"):
+        cat_dir = RAW_KLINES_DIR / cat
+        if not cat_dir.exists():
+            continue
+        for f in cat_dir.glob("*_1m.parquet"):
+            try:
+                df = pl.read_parquet(f, columns=["open_time"])
+                if df.height == 0:
+                    quality["klines"]["missing"] += 1
+                    continue
+                last_ts = df["open_time"].max()
+                lag = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds() / 60
+                if lag < 60:
+                    quality["klines"]["ok"] += 1
+                elif lag < 60 * 24:
+                    quality["klines"]["stale"] += 1
+                else:
+                    quality["klines"]["missing"] += 1
+            except Exception:
+                quality["klines"]["missing"] += 1
+    
+    return quality
+
+
+# ─── 18. Research Conclusion ───────────────────────────────────────
+
+def get_research_conclusion() -> dict:
+    """Current research conclusion from pipeline results."""
+    results_files = sorted(RESULTS_DIR.glob("acceptance_*.json"), reverse=True)
+    
+    if not results_files:
+        return {
+            "status": "NO DATA",
+            "reason": "No acceptance reports found",
+            "verdict": None,
+        }
+    
+    try:
+        report = json.loads(results_files[0].read_text())
+    except Exception:
+        return {"status": "ERROR", "reason": "Cannot read acceptance report"}
+    
+    verdict = report.get("verdict", "UNKNOWN")
+    reject_reasons = report.get("reject_reasons", [])
+    candidates = report.get("candidates", [])
+    finalist = report.get("finalist")
+    n_hyp = report.get("n_hypotheses", 0)
+    n_events = report.get("n_events_total", 0)
+    
+    if verdict == "PASS" and finalist:
+        conclusion = "VALIDATED EDGE FOUND"
+        reason = f"Finalist: {finalist.get('hypothesis_id', 'N/A')}"
+    elif verdict == "NO_CANDIDATE":
+        conclusion = "NO STATISTICALLY VALIDATED EDGE"
+        reason = f"Tested {n_hyp} hypotheses, {len(candidates)} candidates, 0 survived all gates"
+    elif verdict == "REJECT":
+        conclusion = "CANDIDATES REJECTED"
+        reason = reject_reasons[0] if reject_reasons else "Unknown rejection reason"
+    elif verdict == "STOP":
+        conclusion = "PIPELINE STOPPED"
+        reason = reject_reasons[0] if reject_reasons else "Data validation failed"
     else:
-        out["collector"] = []
-    return out
+        conclusion = "UNKNOWN"
+        reason = f"Verdict: {verdict}"
+    
+    return {
+        "status": conclusion,
+        "reason": reason,
+        "verdict": verdict,
+        "n_hypotheses": n_hyp,
+        "n_events": n_events,
+        "n_candidates": len(candidates),
+        "candidates": candidates[:5],
+        "finalist": finalist,
+        "reject_reasons": reject_reasons[:3],
+        "timestamp": report.get("timestamp"),
+    }
+
+
+# ─── 19. Alerts ────────────────────────────────────────────────────
+
+def get_alerts() -> list[dict]:
+    """Active alerts based on system state."""
+    alerts = []
+    
+    # Check OB collector
+    ob = get_ob_collector()
+    if ob["status"] == "NOT RUNNING":
+        alerts.append({"level": "error", "source": "OB Collector", "message": "Collector not running"})
+    elif ob["status"] == "NO DATA":
+        alerts.append({"level": "warning", "source": "OB Collector", "message": "No data received"})
+    elif ob["status"] == "ERRORS":
+        alerts.append({"level": "error", "source": "OB Collector", "message": f"{ob['total_errors']} write errors"})
+    
+    if ob.get("disk_free_gb") is not None and ob["disk_free_gb"] < 5:
+        alerts.append({"level": "critical", "source": "Disk", "message": f"Low disk space: {ob['disk_free_gb']:.1f} GB"})
+    
+    # Check candle collector
+    cc = get_candle_collector()
+    if cc["status"] == "NO DATA":
+        alerts.append({"level": "warning", "source": "Candle Collector", "message": "No kline data"})
+    
+    # Check data quality
+    dq = get_data_quality()
+    if dq["orderbook"]["gap"] > 0:
+        alerts.append({"level": "warning", "source": "Data Quality", "message": f"{dq['orderbook']['gap']} OB gaps detected"})
+    
+    # Check pipeline
+    pipeline = get_pipeline_status()
+    if pipeline.get("verdict") == "STOP":
+        alerts.append({"level": "error", "source": "Pipeline", "message": "Pipeline stopped"})
+    elif pipeline.get("verdict") == "ERROR":
+        alerts.append({"level": "error", "source": "Pipeline", "message": "Pipeline error"})
+    
+    # Check system status
+    status = get_system_status()
+    if status.get("any_stale"):
+        alerts.append({"level": "warning", "source": "System", "message": "Some log files are stale"})
+    
+    return alerts
+
+
+# ─── 20. Shadow Paper Status ──────────────────────────────────────
+
+def get_shadow_paper() -> dict:
+    """Shadow paper (MODE B) status and summary."""
+    shadow_file = PAPER_SHADOW / "state.json"
+    portfolio_file = PAPER_PORTFOLIO / "state.json"
+
+    shadow_state = None
+    if shadow_file.exists():
+        try:
+            shadow_state = json.loads(shadow_file.read_text())
+        except Exception:
+            shadow_state = None
+
+    portfolio_state = None
+    if portfolio_file.exists():
+        try:
+            portfolio_state = json.loads(portfolio_file.read_text())
+        except Exception:
+            portfolio_state = None
+
+    if shadow_state is None and portfolio_state is None:
+        return {"status": "NO DATA", "shadow_trades": 0, "shadow_pnl": 0.0}
+
+    shadow_trades = (shadow_state or {}).get("trades", [])
+    validated_trades = [t for t in (portfolio_state or {}).get("trades", [])
+                        if t.get("mode") == "VALIDATED"]
+
+    shadow_pnl = sum(t.get("net_pnl", 0) for t in shadow_trades)
+    shadow_wins = sum(1 for t in shadow_trades if t.get("net_pnl", 0) > 0)
+
+    by_hyp = {}
+    for t in shadow_trades:
+        hid = t.get("hypothesis_id", "?")
+        if hid not in by_hyp:
+            by_hyp[hid] = {"trades": 0, "pnl": 0.0, "wins": 0}
+        by_hyp[hid]["trades"] += 1
+        by_hyp[hid]["pnl"] += t.get("net_pnl", 0)
+        if t.get("net_pnl", 0) > 0:
+            by_hyp[hid]["wins"] += 1
+
+    return {
+        "status": (shadow_state or {}).get("mode", "UNKNOWN"),
+        "hypothesis_id": (shadow_state or {}).get("hypothesis_id"),
+        "balance": (shadow_state or {}).get("balance"),
+        "shadow_trades": len(shadow_trades),
+        "shadow_pnl": round(shadow_pnl, 4),
+        "shadow_win_rate": round(shadow_wins / len(shadow_trades), 4) if shadow_trades else 0.0,
+        "validated_trades": len(validated_trades),
+        "by_hypothesis": by_hyp,
+        "total_trades": len(shadow_trades) + len(validated_trades),
+        "realized_pnl": (shadow_state or {}).get("realized_pnl", 0.0),
+    }

@@ -1,0 +1,580 @@
+================================================================================
+ORDER BOOK RESEARCH — ARCHITECTURAL AUDIT
+Date: 2026-09-05
+Author: Sisyphus (automated audit)
+Status: DESIGN PHASE — no implementation
+================================================================================
+
+TABLE OF CONTENTS
+ 1. Current Architecture
+ 2. Data Flow: Capture → Feature → Research
+ 3. Confirmed Problems (from deep audit)
+ 4. Design Requirements
+ 5. Architecture Options
+ 6. Recommended Architecture
+ 7. Data Contract (Parquet schema)
+ 8. Time Semantics (T, T+1, staleness)
+ 9. Feature Categories for Order Book
+10. Leakage Checks
+11. Research Integration
+12. Statistical Safeguards
+13. Provenance
+14. Recovery / Idempotency
+15. Storage Layout
+16. Dashboard Metrics
+17. Testing Plan
+18. Implementation Phases
+19. BLOCKERS BEFORE IMPLEMENTATION
+
+================================================================================
+1. CURRENT ARCHITECTURE
+================================================================================
+
+Two independent subsystems exist:
+
+A) COLLECTOR (Rust, marketdata binary)
+   - Perpetual loop: trades/liquidation/futures/ratio → Parquet (continuous)
+   - Event-driven: candle trigger → trigger_watcher → ob_capture_task →
+     snapshot every N seconds → Parquet (timeboxed)
+   - Config: config/orderbook_capture.toml
+   - Trigger rules: relative_volume > 3.0 OR relative_range > 3.0
+   - Capture duration: 1200 sec (~20 min)
+   - Snapshot interval: 30 sec (hardcoded in Rust)
+   - Storage: data/market/orderbook/captures/{symbol}/{trigger_ts}/
+   - Each capture = 40 Parquet files (snapshot_000..0039)
+
+B) PIPELINE (Python, orchestrator)
+   - Loads candle data (1m OHLCV) from data/market/*.parquet
+   - Computes features via features_market.py (_orderbook_features)
+   - Builds events (suspicious candles → future returns)
+   - Generates hypotheses → tests → BH correction → validation → OOS
+   - Candle triggers evaluated (ct_mod.evaluate_all_triggers) — writes
+     trigger files for Rust to pick up
+
+CRITICAL GAP: The orderbook captures produced by the Rust collector are
+NOT consumed by the Python pipeline. The pipeline reads data/market/
+which contains only candles/trades/liquidation/futures/ratio — NOT
+orderbook snapshots. The captures sit at data/market/orderbook/captures/
+with no reader code.
+
+================================================================================
+2. DATA FLOW: CAPTURE → FEATURE → RESEARCH
+================================================================================
+
+Current (broken) flow:
+
+  Rust collector                    Python pipeline
+  ──────────────                    ───────────────
+  candle trigger fires →            load candles
+  write trigger file →              compute features
+  ob_capture_task runs →            build events
+  writes Parquet snapshots →        generate hypotheses
+  DONE (no consumer)                test hypotheses
+                                     → reads candles only
+                                     → orderbook data IGNORED
+
+Intended flow:
+
+  Rust collector                    Python pipeline
+  ──────────────                    ───────────────
+  candle trigger fires →            load candles + orderbook captures
+  write trigger file →              reconstruct book state from snapshots
+  ob_capture_task runs →            compute orderbook features at event time
+  writes Parquet snapshots →        join with candle features
+  DONE                              build enriched events
+                                    generate hypotheses (with OB features)
+                                    test hypotheses
+                                    validate → OOS
+
+================================================================================
+3. CONFIRMED PROBLEMS (from deep audit)
+================================================================================
+
+P1 — Deltas stored as snapshots [HIGH, doc-level impact]
+  In marketdata.rs:1298, update_side() treats every update as snapshot:
+    price: f64 → Ok(book_side.insert(price, qty))  // overwrites, no delta
+  Real WebSocket sends deltas (qty changes, deletions). Current code:
+  - Overwrites existing price levels with new qty
+  - Never removes deleted levels
+  - Never adds new price levels from deltas
+  Result: book state drifts from reality over time
+  Impact on research: If captures ARE consumed → distorted features.
+  Current status: captures NOT consumed → impact = ZERO
+
+P2 — Crash recovery: orphaned triggers → duplicate capture [HIGH]
+  If collector crashes mid-capture:
+  - Trigger file remains in data/triggers/
+  - On restart, trigger_watcher re-reads it
+  - ob_capture_task runs again for same symbol+timestamp
+  - New 40 Parquet files overwrite old ones
+  - Wasted resources, but data integrity preserved (overwrite)
+  Fix: atomic trigger deletion on capture completion, or dedup by
+  trigger_id
+
+P3 — Snapshot interval hardcoded [LOW]
+  marketdata.rs:1490: tokio::time::sleep(Duration::from_secs(30))
+  Not configurable. 30s = 2400 snapshots over 1200s capture = 40 files.
+  Acceptable for current use case but inflexible.
+
+P4 — max_concurrent_triggers=20 but max_concurrent=10 [MEDIUM]
+  Queue can hold 20 triggers but only 10 run simultaneously.
+  Remaining 10 stay in queue — could starve if triggers fire faster
+  than they complete (1200s each).
+
+P5 — forward_fill() without limit [MEDIUM]
+  features_market.py forward_fill() fills NaN indefinitely forward.
+  Orderbook features with long gaps get stale values with no decay.
+  Fix: limit forward fill to N candles (e.g., 30 for 1m data).
+
+P6 — HypothesisLifecycle dead code [LOW]
+  registry.py:113-178 — HypothesisLifecycle class exists but is
+  never instantiated or called from orchestrator/research.
+
+P7 — paper_run() not integrated [LOW]
+  src/paper.py exists but orchestrator never calls it.
+
+================================================================================
+4. DESIGN REQUIREMENTS
+================================================================================
+
+R1 — Research-first, not trading
+  The goal is to discover statistically confirmed inefficiencies.
+  Orderbook features are input to hypothesis testing, not trading signals.
+
+R2 — Event-driven capture
+  Captures only around suspicious candles (relative_volume > 3 or
+  relative_range > 3). No permanent orderbook storage.
+
+R3 — Snapshot-based reconstruction
+  Each capture is a sequence of full snapshots at 30s intervals.
+  From snapshots we reconstruct:
+  - Book depth at event time (T)
+  - Book imbalance
+  - Spread
+  - Top-N bid/ask levels
+  - Volume concentration
+
+R4 — No hypothesis leakage
+  Orderbook features must be computed from data available at time T
+  (close of suspicious candle). No future information.
+
+R5 — Cost model unchanged
+  Round-trip cost = 0.0006 (0.03% per side). No modification.
+
+R6 — Periods unchanged
+  Discovery: 2025-12-25 to 2026-04-30
+  Validation: 2026-05-01 to 2026-06-30
+  OOS: 2026-07-01 to 2026-09-02
+
+R7 — Minimal code (ponytail)
+  Shortest implementation that works. No speculative abstractions.
+
+R8 — Dashboard as visual layer only
+  Dashboard reads from Parquet/JSON, never modifies data.
+
+================================================================================
+5. ARCHITECTURE OPTIONS
+================================================================================
+
+OPTION A: "Snapshot Reader" (minimal)
+  - Python reads capture Parquet files directly
+  - Reconstructs book from latest snapshot at event time
+  - Computes orderbook features inline
+  - Integrates into features_market.py
+
+  Pros: Minimal code, no new infrastructure
+  Cons: Slow (reads 40 files per capture), no delta correction,
+        stale data if snapshot interval too large
+
+OPTION B: "Capture Aggregator" (recommended)
+  - New Python module: orderbook_features.py
+  - Reads all snapshots for a capture, builds time-indexed book state
+  - Computes features at each snapshot timestamp
+  - Returns feature vector for the capture window
+  - Joins with candle events by timestamp
+
+  Pros: Clean separation, reusable, testable
+  Cons: More code than Option A
+
+OPTION C: "Real-time Reconstructor" (over-engineered)
+  - Rust side maintains full book state during capture
+  - Writes reconstructed book + features to Parquet
+  - Python reads pre-computed features
+
+  Pros: Fastest Python side, richest features
+  Cons: Duplicates logic in Rust, violates minimal code principle,
+        Rust book reconstruction is complex (delta parsing broken)
+
+================================================================================
+6. RECOMMENDED ARCHITECTURE
+================================================================================
+
+OPTION B — Capture Aggregator.
+
+Implementation:
+
+  src/orderbook_features.py (new, ~200 lines)
+    - read_capture(symbol, trigger_ts) → list[dict]
+      Reads all snapshot_{NNN}.parquet for a capture
+    - reconstruct_book(snapshots) → dict
+      Takes list of snapshots, returns book state at latest snapshot
+    - compute_features(book_state, event_time) → dict
+      Computes: spread, bid_depth_5, ask_depth_5, imbalance, etc.
+    - build_orderbook_features(captures_df, events_df) → DataFrame
+      Joins orderbook features with events by closest timestamp
+
+  Integration point:
+    orchestrator.py line 92-98: after features_mod.add_features(),
+    call orderbook_features.build_orderbook_features() to enrich events
+
+  Hypothesis generator:
+    hgen_mod.default_rules() — add orderbook-based rules:
+    - spread > median + 2σ → mean reversion
+    - imbalance > 0.7 → continuation
+
+================================================================================
+7. DATA CONTRACT (Parquet schema)
+================================================================================
+
+Each capture directory: data/market/orderbook/captures/{symbol}/{trigger_ts}/
+
+Files: snapshot_000.parquet .. snapshot_0039.parquet (40 files × 30s = 1200s)
+
+Schema per snapshot (from marketdata.rs):
+  bids: List[Struct{price: Float64, qty: Float64}]
+  asks: List[Struct{price: Float64, qty: Float64}]
+  timestamp_ms: Int64   (Unix epoch milliseconds)
+  snapshot_index: UInt32 (0..39)
+
+Python reads this schema via polars:
+  pl.read_parquet("snapshot_000.parquet")
+  → DataFrame with columns: bids, asks, timestamp_ms, snapshot_index
+
+Feature output schema (from compute_features):
+  ob_spread_bps: Float64       (best_ask - best_bid) / mid * 10000
+  ob_bid_depth_5: Float64      (sum of top 5 bid qty)
+  ob_ask_depth_5: Float64      (sum of top 5 ask qty)
+  ob_imbalance: Float64        (bid_depth_5 - ask_depth_5) / (bid_depth_5 + ask_depth_5)
+  ob_vwap_bid: Float64         (volume-weighted avg bid price, top 5)
+  ob_vwap_ask: Float64         (volume-weighted avg ask price, top 5)
+  ob_mid_price: Float64        (best_bid + best_ask) / 2
+  ob_n_levels: UInt32          (number of price levels in book)
+
+================================================================================
+8. TIME SEMANTICS
+================================================================================
+
+Event time T: close of suspicious candle (open_time + 1 minute)
+  → This is when the trigger fires
+  → Orderbook state at T is what we want
+
+Capture window: [T, T + 1200s]
+  → First snapshot: T + 30s (approximately)
+  → Last snapshot: T + 1200s
+
+Feature computation: use snapshot closest to T
+  → snapshot_000 is nearest to T (within 30s)
+  → Features computed from this snapshot represent "state at event time"
+
+Staleness:
+  → If capture starts late (queue delay), snapshot_000 may be T + 60s
+  → Acceptable for research (not HFT)
+  → Document staleness in provenance
+
+No future leakage:
+  → Orderbook features use only data from [T, T + snapshot_interval]
+  → Future returns use data from [T+1, T+1+h] (h candles ahead)
+  → No overlap: OB features at T, returns at T+1..T+h
+
+================================================================================
+9. FEATURE CATEGORIES FOR ORDER BOOK
+================================================================================
+
+A) Depth features (from snapshot at T):
+  - ob_bid_depth_N: sum of top N bid qty
+  - ob_ask_depth_N: sum of top N ask qty (N = 1, 5, 10, 20)
+  - ob_total_depth: total bid + ask depth
+
+B) Imbalance features:
+  - ob_imbalance: (bid - ask) / (bid + ask)
+  - ob_imbalance_ratio: bid / ask (or ask / bid)
+  - ob_bid_ask_ratio: bid_depth / ask_depth at various levels
+
+C) Spread features:
+  - ob_spread_bps: spread in basis points
+  - ob_spread_abs: absolute spread (best_ask - best_bid)
+  - ob_mid_price: (best_bid + best_ask) / 2
+
+D) Concentration features:
+  - ob_top1_share: top1_bid_qty / total_bid_qty
+  - ob_top5_share: top5_bid_qty / total_bid_qty
+  - ob_hhi_bid: Herfindahl-Hirschman index of bid side
+  - ob_hhi_ask: Herfindahl-Hirschman index of ask side
+
+E) VWAP features:
+  - ob_vwap_bid: volume-weighted avg bid price
+  - ob_vwap_ask: volume-weighted avg ask price
+  - ob_vwap_spread: |vwap_bid - vwap_ask| / mid
+
+F) Stability features (across snapshots in capture window):
+  - ob_depth_volatility: std of total depth across 40 snapshots
+  - ob_spread_volatility: std of spread across 40 snapshots
+  - ob_imbalance_trend: slope of imbalance over time
+
+================================================================================
+10. LEAKAGE CHECKS
+================================================================================
+
+L1 — No future information in OB features:
+  ✓ Features computed from snapshot at T (closest to event time)
+  ✓ No use of snapshots after T+1
+  ✓ Future returns computed separately from [T+1, T+1+h]
+
+L2 — No candle info leakage into OB features:
+  ✓ OB features derived from raw book state (prices, quantities)
+  ✓ Candle features (relative_volume, relative_range, is_green) in
+    separate feature set, joined by timestamp
+
+L3 — No threshold leakage:
+  ✓ OB feature thresholds (if used in hypotheses) computed from
+    disc_events only
+  ✓ Same BH correction applies to OB hypotheses
+  ✓ Gate mask applied before validation/OOS
+
+L4 — No cross-period contamination:
+  ✓ split_periods() separates discovery/validation/OOS by timestamp
+  ✓ OB features attached to events, events split by time
+  ✓ No OB-specific period splitting needed
+
+L5 — No look-ahead in stability features:
+  ✓ ob_depth_volatility uses all 40 snapshots within capture window
+  ✓ Capture window [T, T+1200s] is BEFORE future returns [T+1, T+1+h]
+  ✓ No overlap between OB capture window and return calculation window
+
+================================================================================
+11. RESEARCH INTEGRATION
+================================================================================
+
+Integration points:
+
+1. orchestrator.py: after line 98 (events built), add:
+   captures_df = orderbook_features.load_captures(events)
+   enriched_events = orderbook_features.join_with_events(captures_df, events)
+
+2. hypothesis_generator.py: add OB-based rules to default_rules():
+   - spread > P90 → mean reversion (short if spread wide, price high)
+   - imbalance > 0.7 → continuation (long if bid-heavy)
+   - depth_drop > 50% → volatility expansion
+
+3. research.py: no changes needed — hypotheses are data-agnostic
+   (condition is a polars expression, works with any columns)
+
+4. critic.py: no changes needed — gates work on metrics, not feature types
+
+5. Hypothesis format (example):
+   Hypothesis("H_OB001",
+     "Wide spread + bid imbalance → mean reversion",
+     "(pl.col('ob_spread_bps') > 10) & (pl.col('ob_imbalance') > 0.5)",
+     "short", 10)
+
+================================================================================
+12. STATISTICAL SAFEGUARDS
+================================================================================
+
+Same safeguards as candle-based hypotheses:
+
+S1 — BH correction: applies to ALL p-values including OB hypotheses
+S2 — Gate mask: min_events, min_unique_symbols, min_months, min_t_stat
+S3 — Dependency: block bootstrap, cluster bootstrap, HAC t-test
+S4 — Period split: discovery → validation → OOS (frozen thresholds)
+S5 — Cost grid: round-trip 0.0006 applied to OB hypotheses identically
+S6 — Multiple testing: OB hypotheses added to pool, BH corrects for
+     total number of hypotheses tested (candle + OB)
+
+No additional safeguards needed for OB features specifically.
+
+================================================================================
+13. PROVENANCE
+================================================================================
+
+Each OB feature computation should record:
+  - capture_path: data/market/orderbook/captures/{symbol}/{ts}/
+  - n_snapshots: number of snapshots read (should be 40)
+  - snapshot_interval_sec: 30
+  - feature_version: "1.0"
+  - stale: bool (if first snapshot > 30s after event time)
+  - provenance added to events DataFrame as metadata
+
+Global provenance (Provenance dataclass):
+  - Add ob_feature_version: "1.0"
+  - Add ob_capture_config_hash: hash of orderbook_capture.toml
+  - Add ob_n_captures_used: total captures consumed in this run
+
+================================================================================
+14. RECOVERY / IDEMPOTENCY
+================================================================================
+
+Crash recovery:
+  - If collector crashes mid-capture: trigger file remains
+  - On restart: trigger_watcher re-reads → duplicate capture
+  - Current behavior: Parquet files overwritten (safe but wasteful)
+  - Fix: delete trigger file on capture completion (atomic)
+
+Pipeline recovery:
+  - If orchestrator crashes after OB feature computation:
+    - Re-run from scratch (features recomputed from Parquet)
+    - No partial state to corrupt
+  - If orchestrator crashes mid-research:
+    - Results file not written (research_mod.save_result at end)
+    - Re-run produces same results (deterministic with seed=42)
+
+Idempotency:
+  - Reading same capture twice → same features (Parquet is immutable)
+  - Re-running pipeline → same events (candle data unchanged)
+  - Only new captures (new triggers) change results
+
+================================================================================
+15. STORAGE LAYOUT
+================================================================================
+
+Current:
+  data/market/orderbook/captures/
+    {symbol}/
+      {trigger_timestamp}/
+        snapshot_000.parquet
+        snapshot_001.parquet
+        ...
+        snapshot_0039.parquet
+
+Proposed additions:
+  data/market/orderbook/captures/
+    {symbol}/
+      {trigger_timestamp}/
+        snapshot_000..039.parquet  (existing)
+        features.json              (NEW: computed OB features)
+        metadata.json              (NEW: capture metadata)
+
+  data/market/orderbook/
+    ob_features_{run_id}.parquet  (NEW: aggregated OB features for all events)
+
+This avoids reading 40 files per capture on every pipeline run.
+Features computed once, cached in features.json.
+
+================================================================================
+16. DASHBOARD METRICS
+================================================================================
+
+New dashboard cards (read-only, from ob_features parquet):
+
+Card: "Order Book Captures"
+  - Total captures: N
+  - Captures with OB features: M
+  - Avg snapshots per capture: mean
+  - Stale captures (first snapshot > 30s late): count
+
+Card: "OB Feature Distributions"
+  - Spread distribution (histogram)
+  - Imbalance distribution (histogram)
+  - Depth distribution (histogram)
+
+Card: "OB Hypotheses"
+  - OB-specific hypothesis results (filtered from research JSON)
+  - p-values, t-stats, win rates
+  - Comparison: OB-only vs candle-only hypothesis performance
+
+Endpoints:
+  GET /api/orderbook/captures — list captures with metadata
+  GET /api/orderbook/features — OB feature distributions
+  GET /api/orderbook/hypotheses — OB hypothesis results
+
+================================================================================
+17. TESTING PLAN
+================================================================================
+
+Unit tests (tests/test_orderbook_features.py):
+
+T1 — read_capture: reads 40 Parquet files, returns list of snapshots
+T2 — reconstruct_book: builds book state from snapshot list
+T3 — compute_features: correct spread, depth, imbalance calculation
+T4 — compute_features_empty: handles empty book gracefully
+T5 — compute_features_single_level: edge case, 1 bid + 1 ask
+T6 — join_with_events: correct timestamp matching
+T7 — join_with_events_no_match: events without captures handled
+T8 — build_orderbook_features: end-to-end from captures to DataFrame
+
+Integration tests:
+
+T9 — orchestrator with OB features: full pipeline produces enriched events
+T10 — hypothesis with OB feature: correct filtering and statistics
+
+Regression tests:
+
+T11 — existing 185 tests still pass after OB integration
+T12 — no new hypotheses added (OB rules are additions, not replacements)
+
+================================================================================
+18. IMPLEMENTATION PHASES
+================================================================================
+
+Phase 1: Orderbook features module (estimate: 2-3 hours)
+  - Create src/orderbook_features.py
+  - Implement read_capture, reconstruct_book, compute_features
+  - Unit tests T1-T8
+  - Run full test suite: 185 existing + 8 new = 193
+
+Phase 2: Pipeline integration (estimate: 1-2 hours)
+  - Modify orchestrator.py to call OB feature builder
+  - Add OB features to events DataFrame
+  - Integration test T9
+  - Verify existing tests pass
+
+Phase 3: Hypothesis rules (estimate: 1 hour)
+  - Add OB-based rules to hypothesis_generator.py
+  - Test T10
+  - Run orchestrator --limit 5, verify no crashes
+
+Phase 4: Dashboard (estimate: 1-2 hours)
+  - Add OB endpoints to dashboard/server.py
+  - Add OB cards to index.html
+  - Visual QA
+
+Phase 5: Crash recovery (estimate: 30 min)
+  - Fix trigger file deletion in marketdata.rs
+  - Test duplicate prevention
+
+Total estimate: 5-8 hours
+
+================================================================================
+19. BLOCKERS BEFORE IMPLEMENTATION
+================================================================================
+
+B1 — Collector captures are NOT consumed
+  The Python pipeline has no code to read Parquet captures.
+  This is the #1 blocker. Everything depends on a working reader.
+
+B2 — Deltas stored as snapshots (P1 from audit)
+  If we build features on snapshot data, the book state may be wrong.
+  However: for research purposes (not HFT), snapshot-based features
+  are sufficient. The "drift" is gradual and acceptable for
+  statistical analysis of inefficiencies.
+  Decision: document this limitation, proceed with snapshots.
+
+B3 — No dedup for duplicate captures (P2 from audit)
+  If collector restarts, same capture may be read twice.
+  Fix: either delete trigger file on completion, or dedup in reader
+  by checking if features.json already exists.
+
+B4 — forward_fill without limit (P5 from audit)
+  If OB features have gaps, forward_fill will propagate stale values.
+  Fix: limit forward fill to N candles (e.g., 30 for 1m data).
+  This is a pre-existing bug, not OB-specific.
+
+================================================================================
+END OF AUDIT
+================================================================================
+
+NEXT: Wait for user decision on:
+  1. Proceed with Option B (Capture Aggregator)?
+  2. Any changes to feature list (Section 9)?
+  3. Priority order of implementation phases?
+  4. Any additional requirements?

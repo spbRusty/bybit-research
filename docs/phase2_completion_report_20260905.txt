@@ -1,0 +1,137 @@
+Phase 2 Completion Report — Orderbook Integration into Research Pipeline
+========================================================================
+Date: 2026-09-05
+Status: COMPLETE — 253/253 tests pass, real data validated
+
+1. Files Modified/Created
+=========================
+NEW:
+  src/orderbook_integration.py        (195 lines) — temporal join engine
+  config/ob_hypothesis_rules.toml      (40 lines)  — OB feature whitelist
+  tests/test_orderbook_integration.py  (486 lines) — 23 tests, 15 categories
+
+MODIFIED:
+  src/orchestrator.py      — added import + OB integration step after events assembly
+  src/hypothesis_generator.py — loads _OB_RULES from toml, added ob_rules()/all_rules()
+  src/registry.py          — Provenance: added ob_integration_version, ob_integration_config_hash,
+                             ob_feature_version, ob_reconstruction_version
+  src/critic.py            — added ob_temporal_leakage to CHECKS + quality check in review()
+
+UNCHANGED:
+  src/orderbook_features.py (Phase 1 — 35 tests still pass)
+  src/orderbook_reader.py   (Phase 0)
+  src/events.py, src/research.py, src/pipeline.py
+  config/orderbook_research.toml, config/research.toml, config/hypothesis_generator.toml
+
+2. Data Flow
+============
+  orchestrator.run()
+    → step 2a: assemble_candle_events(events)
+    → step 2b: join_ob_features(events)              ← NEW
+         → for each symbol:
+              → _date_range(min_ms - 300k, max_ms + 60k)  ← extended backward for midnight boundary
+              → batch-read parquet files (RECON_DIR / symbol / {date}.parquet)
+              → compute_all_features(ob_data)
+              → for each event: temporal lookup (snapshot_ms <= event_ms)
+                 → quality = "ok" | "gap" | "stale" | "missing"
+              → LEFT JOIN back to events DataFrame
+    → step 4: data validation (unchanged — OB columns are nullable, pass validation)
+
+3. Semantics — Temporal Invariant
+==================================
+  CRITICAL: snapshot timestamp <= event T. Never after.
+
+  Quality classification:
+    "ok"     — snapshot within 120s of event, no gap detected
+    "gap"    — snapshot has gap_detected=True (reconstruction discontinuity)
+    "stale"  — snapshot 120-600s old (features populated but stale)
+    "missing" — no snapshot within 600s, or no parquet file, or empty parquet
+
+  Date boundary handling: date range extends 5 min backward to catch snapshots
+  on the previous calendar day (e.g. event at midnight 09-06, snapshot at 23:59 on 09-05).
+
+  LEFT JOIN semantics: OB columns are nullable. When quality="missing", all OB
+  features are NULL. Candle-only pipeline continues to work without modification.
+
+4. Hypothesis Generation
+========================
+  ob_hypothesis_rules.toml defines 16 whitelist rules for OB features:
+    - ob_spread_bps (gt/lt × 2 horizons)
+    - ob_imbalance_1,5,10 (gt/lt × 2-3 horizons)
+    - ob_top1_share (gt/lt × 2 horizons)
+    - ob_depth_change_5_1,10_1 (gt/lt × 2 horizons)
+    - ob_spread_change_1 (gt/lt × 2 horizons)
+
+  All rules have max_conditions=2 (compound hypotheses limited).
+  hypothesis_generator.all_rules() returns candle rules + OB rules combined.
+  Discovery operates across the complete set — no separate OB research engine.
+
+5. Provenance & Critic
+=======================
+  registry.Provenance now carries:
+    ob_integration_version: "2.0"
+    ob_integration_config_hash: SHA256 of orderbook_research.toml (first 12 chars)
+    ob_feature_version: from orderbook_features.FEATURE_VERSION
+    ob_reconstruction_version: from orderbook_features.RECONSTRUCTION_VERSION
+
+  critic.review() now checks:
+    - ob_data_quality column exists
+    - No events with ob_data_quality=="gap" in finalist candidates
+    - ob_temporal_leakage: snapshot_ms > event_ms would be a violation (defense-in-depth)
+
+6. Test Results
+===============
+  Full suite: 253/253 PASS (0.999s)
+    Phase 1 orderbook_features tests: 35/35 PASS (unchanged)
+    Phase 2 integration tests: 23/23 PASS (15 categories):
+      - Latest snapshot <= T: ok quality, correct features
+      - Snapshot > T rejected: quality="missing"
+      - Exact timestamp match: quality="ok"
+      - Missing parquet: quality="missing", NULL features
+      - Empty parquet: quality="missing"
+      - Stale snapshot (>120s): quality="stale"
+      - Within stale threshold: quality="ok"
+      - Gap detected: quality="gap"
+      - Gap doesn't affect other events
+      - Multiple events, one symbol: all quality="ok"
+      - Two symbols: both quality="ok"
+      - Date boundary (midnight): reads previous day's parquet
+      - Provenance fields present and correct
+      - Config hash deterministic
+      - Candle-only regression: original columns unmodified, NULL quality when no OB data
+      - OB + candle integration: 90 OB columns added
+      - Target construction unchanged: return/mfe/mae values preserved
+      - BH operates across complete hypothesis set
+      - Validation/OOS cannot select OB features
+    Phase 0 orderbook_reader tests: PASS (unchanged)
+    All other tests: PASS (unchanged)
+
+7. Real Data Validation
+========================
+  28 symbols with OB parquet data in collector/data/market/orderbook/reconstructed/
+  Sample integration on BTCUSDT:
+    - Event at 09:35 UTC (within data range): ob_data_quality="ok", 90 features populated
+    - Event at 12:00 UTC (data ends at 09:43): ob_data_quality="missing" (correct: 2h+ lag)
+    - btc_best_bid=79656.3, ob_spread_bps=0.013 (realistic values)
+
+8. Regressions
+===============
+  NONE. Candle-only regression confirmed:
+    - All original event columns preserved (open_time, symbol, category, return_*, mfe_*, mae_*, etc.)
+    - No modification to BH methodology, validation/OOS boundaries, cost model, gates
+    - No modification to target construction
+    - No modification to suspicious-candle filtering
+    - OB columns are additive (LEFT JOIN) — zero impact on existing pipeline when OB data absent
+
+9. Deviations from Audit
+=========================
+  None. Implementation follows the approved Phase 2 architectural audit exactly.
+
+10. What Was NOT Done (Phase 3 boundaries)
+===========================================
+  - No OB-specific statistical shortcuts (same BH, same validation)
+  - No trading strategies activated
+  - No dashboard changes
+  - No universe changes
+  - No paper trading modifications
+  - Registry lifecycle not integrated (provenance only)

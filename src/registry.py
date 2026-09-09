@@ -87,6 +87,11 @@ class Provenance:
     cost_assumptions: list[float] = field(default_factory=list)
     random_seed: int = 42
     timestamp: str = field(default_factory=lambda: datetime.now(tz=timezone.utc).isoformat())
+    ob_integration_version: str = ""
+    ob_integration_config_hash: str = ""
+    ob_feature_version: str = ""
+    ob_reconstruction_version: str = ""
+    ob_hypothesis_rules_hash: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -180,6 +185,79 @@ class HypothesisLifecycle:
 def compute_config_hash(config_path: Path | None = None) -> str:
     p = config_path or (Path(__file__).resolve().parent.parent / "config" / "research.toml")
     return hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+
+
+# --------------------------------------------------------------------------
+# Research Integration — update lifecycle from pipeline results
+# --------------------------------------------------------------------------
+
+def update_from_research(registry: HypothesisLifecycle, result: dict) -> list[dict]:
+    """Update hypothesis lifecycle from research.run_research() output.
+
+    For each hypothesis:
+    - Register as CANDIDATE if not already registered
+    - Transition to VALIDATED only if ALL gates passed (candidate + validation + OOS + Critic)
+    - Record provenance metadata
+
+    Returns list of transitions made.
+    """
+    transitions = []
+    candidates = set(result.get("candidates", []))
+    finalist_id = result.get("finalist", {}).get("hypothesis_id") if result.get("finalist") else None
+    discovery_results = {r["hypothesis_id"]: r for r in result.get("discovery_results", [])}
+    validation_results = result.get("validation", {})
+    oos_results = result.get("oos", {})
+
+    for hyp_id, disc in discovery_results.items():
+        entry = registry.get_entry(hyp_id)
+        if entry is None:
+            if hyp_id in candidates:
+                registry.register(hyp_id, HypothesisStatus.CANDIDATE, {
+                    "source": "pipeline",
+                    "description": disc.get("description", ""),
+                })
+            else:
+                continue
+
+        # Determine if this hypothesis passed all gates
+        passed_disc = (hyp_id in candidates)
+        passed_val = False
+        passed_oos = False
+
+        if hyp_id in validation_results:
+            v = validation_results[hyp_id]
+            passed_val = (v.get("mean_net", -1) > 0
+                         and (v.get("n") or 0) >= 100
+                         and (v.get("t_stat") or 0) >= 2.0)
+
+        if hyp_id in oos_results:
+            o = oos_results[hyp_id]
+            passed_oos = (o.get("mean_net", -1) > 0
+                         and (o.get("n") or 0) >= 100
+                         and (o.get("t_stat") or 0) >= 2.0)
+
+        current = registry.get_status(hyp_id)
+
+        # Only VALIDATED if discovery + validation + OOS all passed
+        if current == HypothesisStatus.CANDIDATE and passed_disc and passed_val and passed_oos:
+            ok = registry.transition(hyp_id, HypothesisStatus.VALIDATED,
+                                     reason="All gates passed: discovery + validation + OOS")
+            if ok:
+                transitions.append({"hypothesis_id": hyp_id, "from": "CANDIDATE", "to": "VALIDATED"})
+        # If candidate but didn't pass all gates, keep as CANDIDATE (no downgrade needed)
+
+    return transitions
+
+
+def get_eligible_for_paper(registry: HypothesisLifecycle) -> list[str]:
+    """Return hypothesis IDs eligible for MODE A (VALIDATED PAPER)."""
+    return registry.list_by_status(HypothesisStatus.VALIDATED)
+
+
+def get_shadow_eligible(registry: HypothesisLifecycle) -> list[str]:
+    """Return hypothesis IDs eligible for MODE B (SHADOW/RESEARCH PAPER).
+    All CANDIDATE hypotheses are eligible for shadow observation."""
+    return registry.list_by_status(HypothesisStatus.CANDIDATE)
 
 
 def get_git_commit(repo_path: Path | None = None) -> str:
