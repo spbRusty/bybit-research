@@ -214,6 +214,75 @@ def stage_feature_validation(
 
 
 # --------------------------------------------------------------------------
+# Stage: Orderbook Feature Validation (per-feature coverage gate)
+# --------------------------------------------------------------------------
+
+def stage_ob_feature_validation(
+    events: pl.DataFrame,
+    config: dict | None = None,
+) -> StageResult:
+    """Per-feature coverage gate for whitelisted OB features.
+
+    Признак непригоден (ineligible), если доля валидных наблюдений ниже
+    min_feature_coverage или валидных наблюдений меньше min_feature_valid_events.
+    Пороги не произвольны, а зеркалят существующие правила проекта:
+      - min_feature_coverage=0.5 — инверсия правила stage_feature_validation
+        "null_pct > 50 => warning" (валидных наблюдений должно быть >= 50%);
+      - min_feature_valid_events=100 — min_events из research.toml.
+    Гипотезы, condition которых ссылается на ineligible-признак, отфильтровываются
+    в orchestrator до research (см. _condition_cols), поэтому REJECT стадии не
+    останавливает pipeline — он останавливает OB-гипотезы.
+    """
+    cfg = config or load_toml("ob_hypothesis_rules.toml")
+    run_id = _make_run_id()
+    min_cov = float(cfg.get("min_feature_coverage", 0.5))
+    min_valid = int(cfg.get("min_feature_valid_events", 100))
+    whitelist = sorted({f["feature_id"] for f in cfg.get("ob_features", [])})
+
+    present = [c for c in whitelist if c in events.columns]
+    metrics: dict = {
+        "n_features_checked": len(whitelist),
+        "n_features_present": len(present),
+        "min_coverage": min_cov,
+        "min_valid_events": min_valid,
+    }
+
+    if not present or events.height == 0:
+        return StageResult(
+            stage="ob_feature_validation", status=StageStatus.SKIPPED,
+            run_id=run_id, config_hash=compute_config_hash(), metrics=metrics,
+        )
+
+    coverage: dict = {}
+    valid_events: dict = {}
+    ineligible: list[str] = []
+    errors: list[str] = []
+    for c in whitelist:
+        if c not in events.columns:
+            coverage[c] = 0.0
+            valid_events[c] = 0
+        else:
+            n_valid = int(events[c].is_not_null().sum())
+            valid_events[c] = n_valid
+            coverage[c] = round(n_valid / events.height, 4)
+        if coverage[c] < min_cov or valid_events[c] < min_valid:
+            ineligible.append(c)
+            errors.append(
+                f"{c}: coverage={coverage[c]:.2%} valid_events={valid_events[c]} "
+                f"< min(coverage={min_cov:.0%}, valid_events={min_valid})"
+            )
+    metrics["coverage"] = coverage
+    metrics["valid_events"] = valid_events
+    metrics["ineligible_features"] = ineligible
+
+    status = StageStatus.REJECT if ineligible else StageStatus.PASS
+    return StageResult(
+        stage="ob_feature_validation", status=status, run_id=run_id,
+        config_hash=compute_config_hash(), metrics=metrics, errors=errors,
+    )
+
+
+# --------------------------------------------------------------------------
 # Stage: Validation Gate
 # --------------------------------------------------------------------------
 

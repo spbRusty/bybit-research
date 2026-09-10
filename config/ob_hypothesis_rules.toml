@@ -38,3 +38,16 @@ ob_features = [
 max_conditions_per_hyp = 2
 max_features_per_hyp = 2
 dedup_by = "condition"
+
+# --- OB feature coverage gate (stage_ob_feature_validation) ---
+# Архитектурное решение, не произвольные пороги:
+#   - min_feature_coverage     = 0.5  -> инверсия существующего правила
+#     stage_feature_validation "null_pct > 50 => warning" (валидных наблюдений
+#     должно быть не меньше 50%);
+#   - min_feature_valid_events = 100  -> min_events из research.toml
+#     (выборка, на которой считается валидным статистический вывод в Val/OOS).
+# OB-признак с coverage < min_feature_coverage ИЛИ valid_events <
+# min_feature_valid_events считается ineligible: гипотезы, condition которых
+# на него ссылается, отфильтровываются в orchestrator до research.
+min_feature_coverage = 0.5
+min_feature_valid_events = 100

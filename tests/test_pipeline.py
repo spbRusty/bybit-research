@@ -20,6 +20,7 @@ from src.pipeline import (
     stage_critic,
     stage_data_validation,
     stage_feature_validation,
+    stage_ob_feature_validation,
     stage_oos_gate,
     stage_parameter_freeze,
     stage_validation_gate,
@@ -170,6 +171,58 @@ class TestFeatureValidation(unittest.TestCase):
         ev = pl.DataFrame({"feat_a": [1.0]})
         r = stage_feature_validation(ev, ["feat_a", "feat_b"])
         self.assertEqual(r.status, StageStatus.ERROR)
+
+
+class TestOBFeatureValidation(unittest.TestCase):
+    def _cfg(self, min_cov=0.5, min_valid=100):
+        return {
+            "ob_features": [{"feature_id": "ob_spread_bps"}],
+            "min_feature_coverage": min_cov,
+            "min_feature_valid_events": min_valid,
+        }
+
+    def _events(self, n=200, nulls=0):
+        vals = [1.0] * (n - nulls) + [None] * nulls
+        return pl.DataFrame({"ob_spread_bps": vals})
+
+    def test_pass_full_coverage(self):
+        r = stage_ob_feature_validation(self._events(), self._cfg())
+        self.assertEqual(r.status, StageStatus.PASS)
+        self.assertEqual(r.metrics["ineligible_features"], [])
+        self.assertEqual(r.metrics["coverage"]["ob_spread_bps"], 1.0)
+        self.assertEqual(r.metrics["valid_events"]["ob_spread_bps"], 200)
+
+    def test_reject_low_coverage(self):
+        r = stage_ob_feature_validation(self._events(n=100, nulls=60), self._cfg())
+        self.assertEqual(r.status, StageStatus.REJECT)
+        self.assertIn("ob_spread_bps", r.metrics["ineligible_features"])
+        self.assertEqual(r.metrics["coverage"]["ob_spread_bps"], 0.4)
+        self.assertTrue(r.errors)
+
+    def test_reject_low_valid_count(self):
+        r = stage_ob_feature_validation(self._events(n=80), self._cfg())
+        self.assertEqual(r.status, StageStatus.REJECT)
+        self.assertIn("ob_spread_bps", r.metrics["ineligible_features"])
+
+    def test_skipped_no_ob_columns(self):
+        ev = pl.DataFrame({"candle_feat": [1.0, 2.0]})
+        r = stage_ob_feature_validation(ev, self._cfg())
+        self.assertEqual(r.status, StageStatus.SKIPPED)
+
+    def test_metrics_present(self):
+        r = stage_ob_feature_validation(self._events(), self._cfg())
+        self.assertEqual(r.metrics["n_features_checked"], 1)
+        self.assertEqual(r.metrics["n_features_present"], 1)
+        self.assertEqual(r.metrics["min_coverage"], 0.5)
+        self.assertEqual(r.metrics["min_valid_events"], 100)
+
+    def test_real_config_pass_full_coverage(self):
+        cols = ["ob_spread_bps", "ob_imbalance_1", "ob_imbalance_5",
+                "ob_imbalance_10", "ob_top1_share", "ob_depth_change_5_1",
+                "ob_depth_change_10_1", "ob_spread_change_1"]
+        ev = pl.DataFrame({c: [1.0] * 200 for c in cols})
+        r = stage_ob_feature_validation(ev)
+        self.assertEqual(r.status, StageStatus.PASS)
 
 
 class TestValidationGate(unittest.TestCase):

@@ -43,6 +43,7 @@ from src.pipeline import (
     stage_critic,
     stage_data_validation,
     stage_feature_validation,
+    stage_ob_feature_validation,
     stage_oos_gate,
     stage_parameter_freeze,
     stage_validation_gate,
@@ -202,15 +203,7 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     if missing_ob:
         raise RuntimeError(f"OB columns missing after join: {missing_ob}")
 
-    # --- 3. CANDLE TRIGGER → ORDERBOOK CAPTURE ---
-    triggers = ct_mod.evaluate_all_triggers(events)
-    if triggers:
-        logger.info("Candle triggers fired: %d (orderbook captures queued)",
-                     len(triggers))
-    else:
-        logger.info("Candle triggers: none fired this run")
-
-    # --- 4. DATA VALIDATION GATE ---
+    # --- 3. DATA VALIDATION GATE ---
     s = stage_data_validation(events, universe)
     stages.append(s)
     _log_stage(s)
@@ -222,7 +215,26 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     stages.append(s)
     _log_stage(s)
 
-    # --- 5. HYPOTHESIS GENERATION ---
+    # --- 4b. ORDERBOOK FEATURE VALIDATION (per-feature coverage gate) ---
+    s = stage_ob_feature_validation(events)
+    stages.append(s)
+    _log_stage(s)
+    ob_ineligible = set()
+    if s.status != StageStatus.SKIPPED and s.metrics:
+        ob_ineligible = set(s.metrics.get("ineligible_features", []))
+
+    # --- 5. CANDLE TRIGGER → ORDERBOOK CAPTURE (post-validation gate) ---
+    # Обязательно после data/feature validation: триггерный файл в _TRIGGERS_DIR
+    # наблюдается Rust-collector'ом → подписка на реальный OB-захват не должна
+    # стартовать ранее, чем прошли все валидационные гейты.
+    triggers = ct_mod.evaluate_all_triggers(events)
+    if triggers:
+        logger.info("Candle triggers fired: %d (orderbook captures queued)",
+                     len(triggers))
+    else:
+        logger.info("Candle triggers: none fired this run")
+
+    # --- 6. HYPOTHESIS GENERATION ---
     if mr_control:
         hypotheses = _mr_hypotheses()
     else:
@@ -232,6 +244,9 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
         generated = hgen_mod.filter_by_freq(generated, disc_events,
                                             _R["min_events"])
         hypotheses = list(baseline) + generated
+    if ob_ineligible:
+        hypotheses = [h for h in hypotheses
+                      if not (_condition_cols(h.condition) & ob_ineligible)]
     logger.info("Hypotheses: %d", len(hypotheses))
 
     # --- 6. RESEARCH (discovery + validation + OOS metrics) ---
