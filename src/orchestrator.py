@@ -33,6 +33,8 @@ from src.orderbook_integration import (
     join_ob_features,
     get_ob_provenance,
     _get_ob_columns,
+    assert_no_post_signal_features,
+    build_post_signal_dataset,
 )
 from src.pipeline import (
     StageResult,
@@ -60,6 +62,7 @@ from src.notify import (
     notify_hypothesis_candidate,
     notify_hypothesis_validated,
     notify_paper_started,
+    notify_research,
     notify_shadow_summary,
 )
 
@@ -145,6 +148,11 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     btc = _load_symbol(_FEAT["btc_symbol"], "linear")
     eth = _load_symbol(_FEAT["eth_symbol"], "linear")
     univ_dfs = data_mod.load_universe_data(universe)
+    klines_max = None
+    for df in univ_dfs.values():
+        mx = df["open_time"].max()
+        klines_max = mx if klines_max is None or mx > klines_max else klines_max
+    oos_end = klines_max.isoformat() if klines_max is not None else None
     breadth = breadth_mod.compute_breadth(univ_dfs)
     required_cols = _required_columns()
     all_events = []
@@ -203,6 +211,20 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     if missing_ob:
         raise RuntimeError(f"OB columns missing after join: {missing_ob}")
 
+    # --- 2c. POST-SIGNAL OB DATASET (отдельный артефакт, вне same-T) ---
+    # Пост-сигнальные фичи (reconstructed_captures) НЕ входят в same-T
+    # predictive набор: guard не допускает ob_post_*/post_signal в events
+    # (look-ahead bias). Они сохраняются отдельным research-артефактом.
+    assert_no_post_signal_features(events)
+    try:
+        post_ds = build_post_signal_dataset(events)
+        if post_ds.height:
+            logger.info("Post-signal OB dataset: %d events (%s)",
+                        post_ds.height,
+                        "data/research/post_signal/post_signal_events.parquet")
+    except Exception as e:
+        logger.warning("Post-signal OB build failed (research continues): %s", e)
+
     # --- 3. DATA VALIDATION GATE ---
     s = stage_data_validation(events, universe)
     stages.append(s)
@@ -250,7 +272,8 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     logger.info("Hypotheses: %d", len(hypotheses))
 
     # --- 6. RESEARCH (discovery + validation + OOS metrics) ---
-    result = research_mod.run_research(events, hypotheses=hypotheses)
+    result = research_mod.run_research(events, hypotheses=hypotheses,
+                                       oos_end=oos_end)
     rid = research_mod.save_result(result)
     logger.info("Research %s: candidates=%s", rid, result["candidates"])
 
@@ -460,6 +483,87 @@ def _load_latest_events():
     return pl.read_parquet(files[-1])
 
 
+def gated_research_once(limit: int | None = None,
+                        category: str | None = None,
+                        mr_control: bool = False) -> dict:
+    """One gated research run: data-ready gate -> pipeline -> reviewer hook.
+
+    Идемпотентен: flock-лок research.lock, состояние last_run.json.
+    Недостаточно данных -> вердикт SKIP (exit 0 для таймера).
+    """
+    from src.data_ready import (Lock, check_ready, git_head, load_last_run,
+                                save_last_run)
+    from src.pipeline import _make_run_id
+
+    lock = Lock()
+    if not lock.acquire():
+        logger.info("Gated run SKIP: another research run is in progress")
+        return {"verdict": "SKIP", "reason": "lock"}
+
+    try:
+        ready, reasons, metrics = check_ready()
+        if not ready:
+            logger.info("Gated run SKIP (%s)", "; ".join(reasons))
+            return {"verdict": "SKIP", "reasons": reasons,
+                    "metrics": {"klines_max": metrics["klines"]["klines_max"]}}
+
+        logger.info("Gated run: data-ready OK, launching pipeline")
+        report = run_pipeline(limit=limit, category=category, mr_control=mr_control)
+
+        try:
+            notify_research(report, report["verdict"] in ("PASS", "CANDIDATE"),
+                            paper=None)
+        except Exception as e:
+            logger.warning("notify_research failed: %s", e)
+
+        # Post-research state для идемпотентности gate
+        klines_max = metrics["klines"]["klines_max"]
+        if klines_max is not None:
+            save_last_run({
+                "run_id": report.get("run_id") or _make_run_id(),
+                "finished_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+                "verdict": report["verdict"],
+                "config_hash": metrics["config_hash"],
+                "git_head": git_head(),
+                "klines_max": str(klines_max),
+                "ob_valid_symbols": metrics["ob"]["ob_valid_symbols"],
+                "n_events": report.get("n_events", {}),
+            })
+            logger.info("Saved last_run.json: klines_max=%s verdict=%s",
+                        klines_max, report["verdict"])
+
+        try:
+            _post_research_reviewer(run_id=report.get("run_id"))
+        except Exception as e:
+            logger.warning("Reviewer hook failed: %s", e)
+        return report
+    finally:
+        lock.release()
+
+
+def _post_research_reviewer(run_id: str | None = None) -> None:
+    """Post-research reviewer hook: detached system_reviewer --once.
+
+    Reviewer не влияет на research (try/except + detached процесс):
+    его FAIL не должен ронять gate/ран.
+    """
+    try:
+        import os
+        import subprocess
+        env = dict(os.environ)
+        env.setdefault("REVIEW_MODEL", "opencode/big-pickle")
+        env["REVIEW_NOTIFY_ON_PASS"] = "0"
+        log = open(LOGS_DIR / "reviewer_hook.log", "a")
+        subprocess.Popen(
+            [sys.executable, "-m", "src.system_reviewer", "--once"],
+            env=env, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        logger.info("Reviewer hook spawned (run=%s)", run_id or "-")
+    except Exception as e:
+        logger.warning("Reviewer hook failed: %s", e)
+
+
 def auto_paper_trigger(registry: HypothesisLifecycle | None = None) -> list[str]:
     """Start MODE A paper for newly VALIDATED hypotheses.
 
@@ -538,11 +642,19 @@ if __name__ == "__main__":
                     help="Run in auto-loop mode (continuous pipeline execution)")
     ap.add_argument("--interval", type=int, default=3600,
                     help="Interval in seconds for auto-loop (default: 3600)")
+    ap.add_argument("--gated", action="store_true",
+                    help="Single gated run: data-ready gate + pipeline + reviewer hook")
     args = ap.parse_args()
     setup_logging()
 
     if args.auto:
         auto_research_loop(interval_sec=args.interval, limit=args.limit)
+    elif args.gated:
+        report = gated_research_once(limit=args.limit, category=args.category,
+                                     mr_control=args.mr_control)
+        # SKIP — нормальный исход для таймера при нехватке данных (exit 0)
+        ok = report["verdict"] in ("PASS", "REJECT", "CANDIDATE", "SKIP")
+        sys.exit(0 if ok else 1)
     else:
         report = run_pipeline(limit=args.limit, category=args.category,
                               mr_control=args.mr_control)

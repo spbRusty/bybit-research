@@ -1,0 +1,20 @@
+[Unit]
+Description=Bybit gated research run (data-ready gate + pipeline + reviewer hook)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vlad/Документы/построение
+ExecStart=/home/vlad/Документы/построение/.venv/bin/python -m src.orchestrator --gated
+KillMode=process
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+StandardOutput=append:/home/vlad/Документы/построение/logs/research_timer.log
+StandardError=append:/home/vlad/Документы/построение/logs/research_timer.log
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

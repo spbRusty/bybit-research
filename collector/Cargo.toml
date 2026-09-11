@@ -15,6 +15,10 @@ path = "src/bin/marketdata.rs"
 name = "ob_reconstructor"
 path = "src/bin/ob_reconstructor.rs"
 
+[[bin]]
+name = "ob_capture_reconstruct"
+path = "src/bin/ob_capture_reconstruct.rs"
+
 [lib]
 name = "collector_lib"
 path = "src/lib.rs"

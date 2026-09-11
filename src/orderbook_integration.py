@@ -6,13 +6,14 @@ Temporal invariant: predictor timestamp <= event T (never after T).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
 
-from config.settings import MARKET_DATA_DIR, load_toml
+from config.settings import MARKET_DATA_DIR, RESEARCH_DIR, load_toml
 from src.orderbook_features import (
     DEPTH_LEVELS,
     FEATURE_VERSION,
@@ -25,6 +26,17 @@ logger = logging.getLogger(__name__)
 _CFG = load_toml("orderbook_research.toml")
 _OB_RULES_CFG = load_toml("ob_hypothesis_rules.toml")
 _RECON_DIR = MARKET_DATA_DIR / "orderbook" / "reconstructed"
+# Пост-сигнальные captures: wide-снапшоты из ob_capture_reconstruct (
+# collector/src/bin/ob_capture_reconstruct.rs). НЕ путать с _RECON_DIR —
+# это отдельный контур: точный event_id join вместо asof по времени.
+_CAPTURE_RECON_DIR = MARKET_DATA_DIR / "orderbook" / "reconstructed_captures"
+# Отдельный research-артефакт пост-сигнальных фич (вне same-T predictive).
+_POST_SIGNAL_DIR = RESEARCH_DIR / "post_signal"
+
+# Полный capture-период: 1200 с (marketdata.rs ob_capture_task). Окно считается
+# полным от 75% span.
+_FULL_CAPTURE_SPAN_SEC = 1200
+_PARTIAL_SPAN_PCT = 0.75
 
 STALE_THRESHOLD_SEC = 120
 MISSING_THRESHOLD_SEC = 600
@@ -188,6 +200,105 @@ def _get_ob_columns() -> list[str]:
         for lb in _CFG.get("lookback_snapshots", [5, 12, 60]):
             cols.append(f"ob_imbalance_volatility_{n}_{lb}")
     return cols
+
+
+def _post_col_name(c: str) -> str:
+    return "ob_post" + c[len("ob"):]
+
+
+def _get_post_ob_columns() -> list[str]:
+    return [_post_col_name(c) for c in _get_ob_columns()]
+
+
+def _load_post_features(event_id: str) -> tuple[list, str, str]:
+    """Значения пост-сигнальных фич (последний снапшот capture-окна), quality, reason."""
+    path = _CAPTURE_RECON_DIR / f"{event_id}.parquet"
+    meta_path = _CAPTURE_RECON_DIR / f"{event_id}.meta.json"
+    post_cols = _get_post_ob_columns()
+    n = len(post_cols)
+
+    if not path.exists():
+        return [None] * n, "missing", "no capture file"
+
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+
+    if meta.get("status") not in (None, "ok"):
+        return [None] * n, "partial", f"status={meta.get('status')}"
+
+    df = pl.read_parquet(path)
+    if df.height == 0:
+        return [None] * n, "partial", "empty capture"
+
+    feats = compute_all_features(df)
+    last = feats.tail(1)
+
+    reasons = []
+    span = meta.get("span_sec")
+    if span is None or span < _FULL_CAPTURE_SPAN_SEC * _PARTIAL_SPAN_PCT:
+        reasons.append(f"span={span}s")
+    if meta.get("depth_incomplete"):
+        reasons.append(f"depth={meta.get('max_level_seen')}")
+
+    values = []
+    for c in post_cols:
+        src = "ob" + c[len("ob_post"):]
+        values.append(last[src][0] if src in last.columns else None)
+
+    return values, ("partial" if reasons else "ok"), (";".join(reasons) if reasons else "full")
+
+
+def build_post_signal_dataset(events: pl.DataFrame) -> pl.DataFrame:
+    """Пост-сигнальный OB-датасет: точный join по event_id (без asof).
+
+    Читает reconstructed_captures/{event_id}.parquet (wide, из
+    ob_capture_reconstruct), считает фичи по последнему снапшоту окна и
+    сохраняет отдельный research-артефакт data/research/post_signal/.
+
+    НЕ модифицирует events — результат предназначен только для отдельного
+    исследования реакции стакана ПОСЛЕ сигнала (post_signal=True).
+    """
+    if events.height == 0 or "event_id" not in events.columns:
+        return pl.DataFrame()
+
+    sig = events.filter(
+        pl.col("event_id").is_not_null() & (pl.col("event_id") != ""))
+    if sig.height == 0:
+        return pl.DataFrame()
+
+    post_cols = _get_post_ob_columns()
+    rows = []
+    for ev in sig.iter_rows(named=True):
+        values, quality, reason = _load_post_features(ev["event_id"])
+        rows.append({
+            "event_id": ev["event_id"],
+            "symbol": ev["symbol"],
+            "post_signal": True,
+            "ob_data_quality_post": quality,
+            "ob_data_quality_reason": reason,
+            **dict(zip(post_cols, values)),
+        })
+    ds = pl.DataFrame(rows)
+
+    _POST_SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
+    ds.write_parquet(_POST_SIGNAL_DIR / "post_signal_events.parquet")
+    logger.info("Post-signal dataset: %d events -> %s",
+                ds.height, _POST_SIGNAL_DIR / "post_signal_events.parquet")
+    return ds
+
+
+def assert_no_post_signal_features(df: pl.DataFrame) -> None:
+    """Guard: пост-сигнальные фичи запрещены в same-T predictive наборе."""
+    bad = [c for c in df.columns
+           if c.startswith("ob_post_") or c in ("post_signal", "ob_data_quality_post")]
+    if bad:
+        raise RuntimeError(
+            f"Post-signal features must not enter same-T predictive "
+            f"pipeline (look-ahead): {bad}")
 
 
 def get_ob_provenance() -> dict:

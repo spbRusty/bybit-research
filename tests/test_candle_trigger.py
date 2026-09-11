@@ -83,9 +83,15 @@ class TestEventId(unittest.TestCase):
     def test_format(self):
         ts = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
         eid = _make_event_id("BTCUSDT", ts)
-        self.assertIn("20260905T120000Z", eid)
-        self.assertIn("BTCUSDT", eid)
-        self.assertIn(CONFIG_HASH[:6], eid)
+        self.assertEqual(eid, "20260905T120000Z_BTCUSDT")
+
+    def test_format_parses_back(self):
+        # event_id в едином формате цепочки events -> trigger -> capture -> research
+        ts = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
+        eid = _make_event_id("ETHUSDT", ts)
+        ts_part, symbol = eid.rsplit("_", 1)
+        self.assertEqual(symbol, "ETHUSDT")
+        self.assertEqual(ts_part, "20260905T120000Z")
 
 
 class TestTriggerFile(unittest.TestCase):

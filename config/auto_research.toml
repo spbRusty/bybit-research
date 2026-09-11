@@ -1,0 +1,12 @@
+# Пороги data-ready gate (ЭТАП 1)
+# min_events / min_unique_symbols / min_months живут в research.toml — не дублируем.
+
+[gate]
+min_new_data_minutes = 1440   # прирост данных с прошлого research-run (мин)
+max_data_age_minutes = 30     # свежесть: последняя свеча не старше (мин)
+min_new_rows = 1000           # минимальный прирост строк свечей
+min_ob_symbols = 20           # символов с валидным реконструированным OB
+max_ob_jumps = 5              # допустимые update_id_jumps в OB-метриках
+max_gap_ratio = 0.05          # доля пропусков свечей в новом окне
+max_stale_ratio = 0.10        # доля «мёртвых» символов (без свечей 7+ дней)
+cooldown_minutes = 720        # пауза между research-запусками (мин)

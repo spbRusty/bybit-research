@@ -102,10 +102,23 @@ class CooldownTracker:
 # ---------------------------------------------------------------------------
 
 def _make_event_id(symbol: str, ts: datetime) -> str:
-    """Event ID: YYYYMMDDTHHmmssZ_{SYMBOL}_{config_hash}."""
+    """Event ID: YYYYMMDDTHHmmssZ_{SYMBOL} (единый формат всей цепочки)."""
     ts_str = ts.strftime("%Y%m%dT%H%M%SZ")
-    short_hash = CONFIG_HASH[:6]
-    return f"{ts_str}_{symbol}_{short_hash}"
+    return f"{ts_str}_{symbol}"
+
+
+def _signal_open_time(last: pl.DataFrame, fallback: datetime) -> datetime:
+    """Open time сигнальной свечи из последней строки (единый event_id с events.py)."""
+    if "open_time" in last.columns:
+        v = last["open_time"][0]
+        if v is not None:
+            if hasattr(v, "to_python"):
+                v = v.to_python()
+            if isinstance(v, datetime):
+                return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+            if isinstance(v, int):
+                return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+    return fallback
 
 
 @dataclass
@@ -114,6 +127,7 @@ class TriggerFile:
     event_id: str
     symbol: str
     category: str
+    signal_open_time: str = field(default_factory=lambda: datetime.now(tz=timezone.utc).isoformat())
     trigger_type: str = "candle_features"
     trigger_version: str = CONFIG_VERSION
     trigger_config_hash: str = CONFIG_HASH
@@ -187,14 +201,16 @@ def evaluate_trigger(
         all_horizons.update(r.horizons)
     horizons = sorted(all_horizons)
 
-    # Создаём триггер
-    now = datetime.now(tz=timezone.utc)
-    event_id = _make_event_id(symbol, now)
+    # Создаём триггер: event_id от open_time сигнальной свечи,
+    # чтобы цепочка events -> trigger -> capture -> research совпадала.
+    signal_open_time = _signal_open_time(last, datetime.now(tz=timezone.utc))
+    event_id = _make_event_id(symbol, signal_open_time)
 
     trigger = TriggerFile(
         event_id=event_id,
         symbol=symbol,
         category=category,
+        signal_open_time=signal_open_time.isoformat(),
         trigger_params=trigger_params,
         horizons=horizons,
         capture_duration_sec=_CFG.get("capture", {}).get("duration_sec", 1200),

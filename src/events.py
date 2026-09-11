@@ -64,7 +64,10 @@ def build_events(df: pl.DataFrame, symbol: str, category: str) -> pl.DataFrame:
     cand = cand.with_columns([
         pl.lit(symbol).alias("symbol"),
         pl.lit(category).alias("category"),
-        pl.col("open_time").dt.strftime("%Y%m%dT%H%M%SZ").alias("event_id"),
+        pl.concat_str([
+            pl.col("open_time").dt.strftime("%Y%m%dT%H%M%SZ"),
+            pl.lit(f"_{symbol}"),
+        ]).alias("event_id"),
     ])
     # события без полного будущего окна исключаются (null)
     cand = cand.drop_nulls(subset=["entry_price"])

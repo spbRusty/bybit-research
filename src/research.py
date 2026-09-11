@@ -152,23 +152,40 @@ def benjamini_hochberg(p_values: np.ndarray, q: float) -> np.ndarray:
 # Прогон (§33-34)
 # --------------------------------------------------------------------------
 
-def split_periods(events: pl.DataFrame) -> dict[str, pl.DataFrame]:
-    return {
-        name: events.filter(
-            (pl.col("open_time") >= D_v2(start)) & (pl.col("open_time") < D_v2(end)))
-        for name, start, end in _R["sample_periods"]
-    }
+def split_periods(events: pl.DataFrame,
+                  oos_end: str | None = None) -> dict[str, pl.DataFrame]:
+    """Разбиение событий на discovery/validation/oos.
+
+    oos_end — фактическая граница данных (klines_max, ISO-строка, tz-наивная UTC).
+    Согласованный вариант 2: сдвигается ТОЛЬКО oos.end до min(oos_end, today),
+    но не ранее конфиг-границы (только расширение окна вперёд). Discovery и
+    validation периоды НЕ меняются (исторические окна фиксированы).
+    """
+    today = datetime.now(timezone.utc).replace(tzinfo=None)
+    out: dict[str, pl.DataFrame] = {}
+    for name, start, end in _R["sample_periods"]:
+        end_dt = D_v2(end)
+        if name == "oos" and oos_end:
+            # только расширение вперёд, защита от сжатия при устаревших данных
+            end_dt = max(end_dt, min(D_v2(oos_end), today))
+        out[name] = events.filter(
+            (pl.col("open_time") >= D_v2(start)) & (pl.col("open_time") < end_dt))
+    return out
 
 
 def run_research(events: pl.DataFrame,
                  q: float | None = None,
                  cost_survival: float | None = None,
-                 hypotheses: list[Hypothesis] | None = None) -> dict:
-    """Полный прогон: discovery sweep -> БХ -> validation -> oos -> результат."""
+                 hypotheses: list[Hypothesis] | None = None,
+                 oos_end: str | None = None) -> dict:
+    """Полный прогон: discovery sweep -> БХ -> validation -> oos -> результат.
+
+    oos_end: фактическая граница данных (klines_max) для OOS-окна (вариант 2).
+    """
     q = q or _R["bh_q"]
     cost_survival = cost_survival or _R["survival_cost"]
     hypotheses = hypotheses if hypotheses is not None else HYPOTHESES
-    periods = split_periods(events)
+    periods = split_periods(events, oos_end=oos_end)
     disc, val, oos = periods["discovery"], periods["validation"], periods["oos"]
 
     rows = []
@@ -203,6 +220,7 @@ def run_research(events: pl.DataFrame,
         "q_bh": q, "cost_survival": cost_survival, "n_hypotheses": len(hypotheses),
         "n_events_total": events.height,
         "n_events": {k: v.height for k, v in periods.items()},
+        "oos_end_actual": str(max(periods["oos"]["open_time"])) if periods["oos"].height else None,
         "discovery_results": df.to_dicts(),
         "candidates": candidates.select("hypothesis_id").to_series().to_list() if candidates.height else [],
         "validation": {}, "oos": {},

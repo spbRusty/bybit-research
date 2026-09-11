@@ -38,7 +38,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 const API: &str = "https://api.bybit.com";
 const PACE_MS: u64 = 200;
-const OB_LEVELS: usize = 10;
+const OB_LEVELS: usize = 50;
 const FLUSH_SEC: u64 = 30;
 const RATIO_POLL_SEC: u64 = 300;
 const FUTURES_POLL_SEC: u64 = 60;
@@ -61,6 +61,35 @@ type Table = Vec<(&'static str, Col)>;
 
 fn len(t: &Table) -> usize {
     t.first().map(|(_, c)| c.len()).unwrap_or(0)
+}
+
+fn col_i<'a>(t: &'a Table, name: &str) -> Option<&'a Col> {
+    t.iter().find(|(n, _)| *n == name).map(|(_, c)| c)
+}
+
+/// (min, max) по целочисленной колонке.
+fn min_max_i(t: &Table, name: &str) -> Option<(i64, i64)> {
+    let vals: Vec<i64> = col_i(t, name)?.iter()
+        .map(|cell| if let Cell::I(v) = cell { *v } else { 0 })
+        .collect();
+    let mn = *vals.iter().min()?;
+    let mx = *vals.iter().max()?;
+    Some((mn, mx))
+}
+
+/// Число snapshot-сообщений (уникальные (ts, seq) c is_delta=false).
+fn count_snapshots(t: &Table) -> usize {
+    let (Some(ts), Some(seq), Some(is_delta)) = (col_i(t, "ts"), col_i(t, "seq"), col_i(t, "is_delta")) else { return 0 };
+    let mut seen: Vec<(i64, i64)> = Vec::new();
+    for i in 0..len(t) {
+        let d = if let Cell::B(b) = &is_delta[i] { *b } else { true };
+        if !d {
+            let tv = if let Cell::I(v) = &ts[i] { *v } else { 0 };
+            let sv = if let Cell::I(v) = &seq[i] { *v } else { 0 };
+            if !seen.contains(&(tv, sv)) { seen.push((tv, sv)); }
+        }
+    }
+    seen.len()
 }
 
 fn write_parquet(path: &Path, t: &Table) -> Result<()> {
@@ -575,6 +604,9 @@ async fn ob_capture_task(trigger: TriggerFile) {
     }
 
     let n = len(&all_rows);
+    let (first_ts, last_ts) = min_max_i(&all_rows, "ts").unwrap_or((0, 0));
+    let (first_seq, last_seq) = min_max_i(&all_rows, "seq").unwrap_or((0, 0));
+    let n_snapshots = count_snapshots(&all_rows);
     if n > 0 {
         let path = dir.join(format!("{event_id}.parquet"));
         if let Err(e) = write_parquet(&path, &all_rows) {
@@ -589,6 +621,12 @@ async fn ob_capture_task(trigger: TriggerFile) {
             "symbol": symbol,
             "capture_duration_sec": duration.as_secs(),
             "records": n,
+            "first_ts_ms": (n > 0).then_some(first_ts),
+            "last_ts_ms": (n > 0).then_some(last_ts),
+            "first_seq": (n > 0).then_some(first_seq),
+            "last_seq": (n > 0).then_some(last_seq),
+            "n_snapshots": n_snapshots,
+            "has_snapshot": n_snapshots > 0,
             "status": "completed",
         });
         let meta_path = dir.join(format!("{event_id}.meta.json"));
@@ -601,6 +639,12 @@ async fn ob_capture_task(trigger: TriggerFile) {
             "symbol": symbol,
             "capture_duration_sec": duration.as_secs(),
             "records": 0,
+            "first_ts_ms": serde_json::Value::Null,
+            "last_ts_ms": serde_json::Value::Null,
+            "first_seq": serde_json::Value::Null,
+            "last_seq": serde_json::Value::Null,
+            "n_snapshots": 0,
+            "has_snapshot": false,
             "status": "no_data",
         });
         let meta_path = dir.join(format!("{event_id}.meta.json"));
