@@ -29,107 +29,112 @@ async def index():
 
 
 @app.get("/api/paper")
-async def api_paper():
+def api_paper():
     return JSONResponse(collectors.get_paper())
 
 
 @app.get("/api/risk")
-async def api_risk():
+def api_risk():
     return JSONResponse(collectors.get_risk_params())
 
 
 @app.get("/api/costs")
-async def api_costs():
+def api_costs():
     return JSONResponse(collectors.get_trading_costs())
 
 
 @app.get("/api/instruments")
-async def api_instruments():
+def api_instruments():
     return JSONResponse(collectors.get_instrument_info())
 
 
 @app.get("/api/stakes")
-async def api_stakes():
+def api_stakes():
     return JSONResponse(collectors.get_stake_levels())
 
 
 @app.get("/api/winrate")
-async def api_winrate():
+def api_winrate():
     return JSONResponse(collectors.get_winrate_by_stake())
 
 
 @app.get("/api/pipeline")
-async def api_pipeline():
+def api_pipeline():
     return JSONResponse(collectors.get_pipeline_status())
 
 
 @app.get("/api/hypotheses")
-async def api_hypotheses():
+def api_hypotheses():
     return JSONResponse(collectors.get_hypotheses())
 
 
 @app.get("/api/data")
-async def api_data():
+def api_data():
     return JSONResponse(collectors.get_data_status())
 
 
 @app.get("/api/market-data")
-async def api_market_data():
+def api_market_data():
     return JSONResponse(collectors.get_market_data())
 
 
 @app.get("/api/market")
-async def api_market():
+def api_market():
     return JSONResponse(collectors.get_market_metrics())
 
 
 @app.get("/api/signals")
-async def api_signals():
+def api_signals():
     return JSONResponse(collectors.get_signals())
 
 
 @app.get("/api/captures")
-async def api_captures():
+def api_captures():
     return JSONResponse(collectors.get_captures())
 
 
 @app.get("/api/status")
-async def api_status():
+def api_status():
     return JSONResponse(collectors.get_system_status())
 
 
 @app.get("/api/logs")
-async def api_logs(n: int = Query(default=30, ge=1, le=200)):
+def api_logs(n: int = Query(default=30, ge=1, le=200)):
     return JSONResponse(collectors.get_logs(n=n))
 
 
 @app.get("/api/ob-collector")
-async def api_ob_collector():
+def api_ob_collector():
     return JSONResponse(collectors.get_ob_collector())
 
 
 @app.get("/api/candle-collector")
-async def api_candle_collector():
+def api_candle_collector():
     return JSONResponse(collectors.get_candle_collector())
 
 
 @app.get("/api/data-quality")
-async def api_data_quality():
+def api_data_quality():
     return JSONResponse(collectors.get_data_quality())
 
 
 @app.get("/api/research-conclusion")
-async def api_research_conclusion():
+def api_research_conclusion():
     return JSONResponse(collectors.get_research_conclusion())
 
 
+@app.get("/api/research-gate")
+def api_research_gate():
+    return JSONResponse(collectors.get_research_gate())
+
+
 @app.get("/api/alerts")
-async def api_alerts():
+def api_alerts():
     return JSONResponse(collectors.get_alerts())
 
 
 @app.get("/api/shadow-paper")
-async def api_shadow_paper():
+def api_shadow_paper():
     return JSONResponse(collectors.get_shadow_paper())
 
 

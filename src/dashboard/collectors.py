@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from config.settings import (
     RAW_KLINES_DIR, MARKET_DATA_DIR, CLEAN_CANDLES, FEATURES_DIR,
-    EVENTS_DIR, HYPOTHESES_DIR, RESULTS_DIR, REPORTS_DIR,
+    EVENTS_DIR, HYPOTHESES_DIR, RESULTS_DIR, REPORTS_DIR, RESEARCH_DIR,
     PAPER_DIR, PAPER_PORTFOLIO, PAPER_SHADOW, PAPER_TRADES, LOGS_DIR, ROOT,
 )
 
@@ -346,6 +346,26 @@ def get_hypotheses() -> dict:
         except Exception:
             pass
 
+    last_acceptance = None
+    acceptance_files = sorted(RESULTS_DIR.glob("acceptance_*.json"), reverse=True)
+    if acceptance_files:
+        try:
+            last_acceptance = json.loads(acceptance_files[0].read_text())
+        except Exception:
+            pass
+
+    last_verdict = last_acceptance.get("verdict") if last_acceptance else None
+    last_candidates = last_acceptance.get("candidates", []) if last_acceptance else []
+
+    accepted_ids = {c.get("hypothesis_id") for c in last_candidates}
+    for h in hypotheses:
+        if last_verdict in ("REJECT", "NO_CANDIDATE") and h.get("status") == "CANDIDATE":
+            h["display_status"] = "REJECTED_BY_PIPELINE"
+        elif h.get("hypothesis_id") in accepted_ids:
+            h["display_status"] = "CANDIDATE"
+        else:
+            h["display_status"] = h.get("status", "UNKNOWN")
+
     research_files = sorted(RESULTS_DIR.glob("research_*.json"), reverse=True)
     research_runs = []
     for rf in research_files[:5]:
@@ -354,7 +374,7 @@ def get_hypotheses() -> dict:
             discovery = r.get("discovery_results", {})
             n_discovered = len(discovery) if isinstance(discovery, dict) else 0
             research_runs.append({
-                "run_id": r.get("run_id"),
+                "run_id": r.get("run_id") or rf.stem.replace("research_", ""),
                 "timestamp": r.get("created_at"),
                 "n_hypotheses": r.get("n_hypotheses"),
                 "n_discovered": n_discovered,
@@ -374,97 +394,111 @@ def get_hypotheses() -> dict:
 # ─── 9. Data Download ──────────────────────────────────────────────
 
 def get_data_status() -> dict:
-    stats = {}
-    for cat in ("linear", "spot"):
-        cat_dir = RAW_KLINES_DIR / cat
-        if not cat_dir.exists():
-            stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None}
-            continue
-        files = sorted(cat_dir.glob("*_1m.parquet"))
-        if not files:
-            stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None}
-            continue
-        sizes = sum(f.stat().st_size for f in files)
-        oldest_ts = newest_ts = None
-        try:
-            first = pl.read_parquet(files[0], columns=["open_time"])
-            oldest_ts = str(first["open_time"].min())
-        except Exception:
-            pass
-        try:
-            last = pl.read_parquet(files[-1], columns=["open_time"])
-            newest_ts = str(last["open_time"].max())
-        except Exception:
-            pass
-
-        lag_min = None
-        if newest_ts:
+    """Heavy scan (50 parquet per category) — cache 60s like market."""
+    def _load():
+        stats = {}
+        for cat in ("linear", "spot"):
+            cat_dir = RAW_KLINES_DIR / cat
+            if not cat_dir.exists():
+                stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None}
+                continue
+            files = sorted(cat_dir.glob("*_1m.parquet"))
+            if not files:
+                stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None}
+                continue
+            sizes = sum(f.stat().st_size for f in files)
+            oldest_ts = newest_ts = None
             try:
-                newest_dt = datetime.fromisoformat(newest_ts.replace("Z", "+00:00"))
-                lag_s = (datetime.now(timezone.utc) - newest_dt).total_seconds()
-                lag_min = round(lag_s / 60, 1)
+                first = pl.read_parquet(files[0], columns=["open_time"])
+                oldest_ts = str(first["open_time"].min())
             except Exception:
                 pass
+            # Sort by mtime descending, sample up to 50 files for newest
+            mtime_sorted = sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+            for f in mtime_sorted[:5]:
+                try:
+                    df = pl.read_parquet(f, columns=["open_time"])
+                    mx = df["open_time"].max()
+                    if mx is not None:
+                        if newest_ts is None or str(mx) > newest_ts:
+                            newest_ts = str(mx)
+                except Exception:
+                    continue
 
-        is_stale = lag_min is not None and lag_min > 60 * 24
-        status = "STALE" if is_stale else "LIVE" if lag_min is not None and lag_min < 60 else "UNKNOWN"
+            lag_min = None
+            if newest_ts:
+                try:
+                    newest_dt = datetime.fromisoformat(newest_ts)
+                    if newest_dt.tzinfo is None:
+                        newest_dt = newest_dt.replace(tzinfo=timezone.utc)
+                    lag_s = (datetime.now(timezone.utc) - newest_dt).total_seconds()
+                    lag_min = round(lag_s / 60, 1)
+                except Exception:
+                    pass
 
-        stats[cat] = {
-            "files": len(files),
-            "total_size_mb": round(sizes / 1e6, 1),
-            "newest": newest_ts,
-            "oldest": oldest_ts,
-            "lag_min": lag_min,
-            "status": status,
+            is_stale = lag_min is not None and lag_min > 60 * 24
+            status = "STALE" if is_stale else "LIVE" if lag_min is not None and lag_min < 60 else "UNKNOWN"
+
+            stats[cat] = {
+                "files": len(files),
+                "total_size_mb": round(sizes / 1e6, 1),
+                "newest": newest_ts,
+                "oldest": oldest_ts,
+                "lag_min": lag_min,
+                "status": status,
+            }
+
+        return {
+            "klines": stats,
+            "total_files": sum(s["files"] for s in stats.values()),
+            "total_size_mb": round(sum(s["total_size_mb"] for s in stats.values()), 1),
         }
-
-    return {
-        "klines": stats,
-        "total_files": sum(s["files"] for s in stats.values()),
-        "total_size_mb": round(sum(s["total_size_mb"] for s in stats.values()), 1),
-    }
+    return _cached("data_status", 60, _load)
 
 
 # ─── 10. Collector Market Data ─────────────────────────────────────
 
 def get_market_data() -> dict:
-    streams = {}
-    for stream in ("trades", "orderbook", "futures", "liquidation", "ratio"):
-        stream_dir = MARKET_DATA_DIR / stream / "linear"
-        if not stream_dir.exists():
-            streams[stream] = {"count": 0, "status": "NO DATA"}
-            continue
-        files = list(stream_dir.glob("*.parquet"))
-        newest_mtime = 0
-        total_records = 0
-        for f in files:
-            mt = f.stat().st_mtime
-            if mt > newest_mtime:
-                newest_mtime = mt
-            try:
-                df = pl.read_parquet(f, columns=[])
-                total_records += df.height
-            except Exception:
-                pass
+    """Records count is expensive (2800+ parquet files) — cache 60s like market."""
+    def _load():
+        streams = {}
+        for stream in ("trades", "orderbook", "futures", "liquidation", "ratio"):
+            stream_dir = MARKET_DATA_DIR / stream / "linear"
+            if not stream_dir.exists():
+                streams[stream] = {"count": 0, "status": "NO DATA"}
+                continue
+            files = list(stream_dir.glob("*.parquet"))
+            newest_mtime = 0
+            total_records = 0
+            for f in files:
+                mt = f.stat().st_mtime
+                if mt > newest_mtime:
+                    newest_mtime = mt
+                try:
+                    n = pl.scan_parquet(f).select(pl.len()).collect().item()
+                    total_records += n
+                except Exception:
+                    pass
 
-        age = time.time() - newest_mtime if newest_mtime else float("inf")
-        lag_min = round(age / 60, 1) if age < float("inf") else None
+            age = time.time() - newest_mtime if newest_mtime else float("inf")
+            lag_min = round(age / 60, 1) if age < float("inf") else None
 
-        if age < 300:
-            status = "LIVE"
-        elif age < 3600:
-            status = "STALE"
-        else:
-            status = "STOPPED"
+            if age < 300:
+                status = "LIVE"
+            elif age < 3600:
+                status = "STALE"
+            else:
+                status = "STOPPED"
 
-        streams[stream] = {
-            "count": len(files),
-            "status": status,
-            "lag_min": lag_min,
-            "records": total_records,
-        }
+            streams[stream] = {
+                "count": len(files),
+                "status": status,
+                "lag_min": lag_min,
+                "records": total_records,
+            }
 
-    return {"streams": streams}
+        return {"streams": streams}
+    return _cached("market_data", 60, _load)
 
 
 # ─── 11. Market Metrics ────────────────────────────────────────────
@@ -597,7 +631,7 @@ def get_captures() -> dict:
 def get_system_status() -> dict:
     log_files = {
         "orchestrator": LOGS_DIR / "orchestrator.log",
-        "pipeline": LOGS_DIR / "pipeline.log",
+        "research": LOGS_DIR / "research_timer.log",
     }
     collector_log = ROOT / "collector" / "logs" / "marketdata.log"
 
@@ -740,71 +774,81 @@ def get_ob_collector() -> dict:
 # ─── 16. Candle Collector ──────────────────────────────────────────
 
 def get_candle_collector() -> dict:
-    """Candle collector status from kline files."""
-    stats = {}
-    total_files = 0
-    total_size = 0
-    total_records = 0
-    
-    for cat in ("linear", "spot"):
-        cat_dir = RAW_KLINES_DIR / cat
-        if not cat_dir.exists():
-            stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
-            continue
+    """Candle collector status from kline files. Heavy scan (50 file per cat) — cache 60s."""
+    def _load():
+        stats = {}
+        total_files = 0
+        total_size = 0
+        total_records = 0
         
-        files = sorted(cat_dir.glob("*_1m.parquet"))
-        if not files:
-            stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
-            continue
-        
-        sizes = sum(f.stat().st_size for f in files)
-        total_files += len(files)
-        total_size += sizes
-        
-        oldest_ts = newest_ts = None
-        cat_records = 0
-        try:
-            first = pl.read_parquet(files[0], columns=["open_time"])
-            oldest_ts = str(first["open_time"].min())
-        except Exception:
-            pass
-        try:
-            last = pl.read_parquet(files[-1], columns=["open_time"])
-            newest_ts = str(last["open_time"].max())
-        except Exception:
-            pass
-        
-        lag_min = None
-        status = "UNKNOWN"
-        if newest_ts:
+        for cat in ("linear", "spot"):
+            cat_dir = RAW_KLINES_DIR / cat
+            if not cat_dir.exists():
+                stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
+                continue
+            
+            files = sorted(cat_dir.glob("*_1m.parquet"))
+            if not files:
+                stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
+                continue
+            
+            sizes = sum(f.stat().st_size for f in files)
+            total_files += len(files)
+            total_size += sizes
+            
+            oldest_ts = newest_ts = None
+            cat_records = 0
             try:
-                newest_dt = datetime.fromisoformat(newest_ts.replace("Z", "+00:00"))
-                lag_s = (datetime.now(timezone.utc) - newest_dt).total_seconds()
-                lag_min = round(lag_s / 60, 1)
-                if lag_min < 60:
-                    status = "LIVE"
-                elif lag_min < 60 * 24:
-                    status = "STALE"
-                else:
-                    status = "OLD"
+                first = pl.read_parquet(files[0], columns=["open_time"])
+                oldest_ts = str(first["open_time"].min())
             except Exception:
                 pass
+            # Sort by mtime descending, sample up to 50 files for newest
+            mtime_sorted = sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+            for f in mtime_sorted[:5]:
+                try:
+                    df = pl.read_parquet(f, columns=["open_time"])
+                    mx = df["open_time"].max()
+                    if mx is not None:
+                        if newest_ts is None or str(mx) > newest_ts:
+                            newest_ts = str(mx)
+                except Exception:
+                    continue
+            
+            lag_min = None
+            status = "UNKNOWN"
+            if newest_ts:
+                try:
+                    newest_dt = datetime.fromisoformat(newest_ts)
+                    if newest_dt.tzinfo is None:
+                        newest_dt = newest_dt.replace(tzinfo=timezone.utc)
+                    lag_s = (datetime.now(timezone.utc) - newest_dt).total_seconds()
+                    lag_min = round(lag_s / 60, 1)
+                    if lag_min < 60:
+                        status = "LIVE"
+                    elif lag_min < 60 * 24:
+                        status = "STALE"
+                    else:
+                        status = "OLD"
+                except Exception:
+                    pass
+            
+            stats[cat] = {
+                "files": len(files),
+                "total_size_mb": round(sizes / 1e6, 1),
+                "newest": newest_ts,
+                "oldest": oldest_ts,
+                "lag_min": lag_min,
+                "status": status,
+            }
         
-        stats[cat] = {
-            "files": len(files),
-            "total_size_mb": round(sizes / 1e6, 1),
-            "newest": newest_ts,
-            "oldest": oldest_ts,
-            "lag_min": lag_min,
-            "status": status,
+        return {
+            "status": "RUNNING" if total_files > 0 else "NO DATA",
+            "categories": stats,
+            "total_files": total_files,
+            "total_size_mb": round(total_size / 1e6, 1),
         }
-    
-    return {
-        "status": "RUNNING" if total_files > 0 else "NO DATA",
-        "categories": stats,
-        "total_files": total_files,
-        "total_size_mb": round(total_size / 1e6, 1),
-    }
+    return _cached("candle_collector", 60, _load)
 
 
 # ─── 17. Data Quality ──────────────────────────────────────────────
@@ -917,7 +961,73 @@ def get_research_conclusion() -> dict:
     }
 
 
-# ─── 19. Alerts ────────────────────────────────────────────────────
+# ─── 19. Research Gate ────────────────────────────────────────────
+
+def get_research_gate() -> dict:
+    """Research gate status from last_run.json + research_timer.log."""
+    import re
+
+    last_run = None
+    last_run_path = RESEARCH_DIR / "last_run.json"
+    if last_run_path.exists():
+        try:
+            last_run = json.loads(last_run_path.read_text())
+        except Exception:
+            pass
+
+    timer_log = LOGS_DIR / "research_timer.log"
+    last_skip = None
+    cooldown_until = None
+    if timer_log.exists():
+        try:
+            lines = timer_log.read_text().splitlines()
+            for line in reversed(lines[-100:]):
+                if "SKIP" in line:
+                    last_skip = line.strip()
+                    m = re.search(r"cooldown until (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", line)
+                    if m:
+                        cooldown_until = m.group(1) + " UTC"
+                    break
+        except Exception:
+            pass
+
+    now = datetime.now(timezone.utc)
+
+    if last_skip and cooldown_until:
+        try:
+            cd_dt = datetime.strptime(cooldown_until.replace(" UTC", ""), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            if now < cd_dt:
+                status = "SKIP"
+                reason = last_skip.split("SKIP")[-1].strip().strip("()")
+                next_run = cooldown_until
+            else:
+                status = "READY"
+                reason = "Cooldown expired"
+                next_run = None
+        except Exception:
+            status = "UNKNOWN"
+            reason = "Cannot parse cooldown"
+            next_run = None
+    elif last_run and last_run.get("verdict"):
+        status = "READY"
+        reason = f"Last run verdict: {last_run['verdict']}"
+        next_run = None
+    else:
+        status = "READY"
+        reason = "No previous runs"
+        next_run = None
+
+    return {
+        "status": status,
+        "reason": reason,
+        "next_run_utc": next_run,
+        "last_run_id": last_run.get("run_id") if last_run else None,
+        "last_run_verdict": last_run.get("verdict") if last_run else None,
+        "last_run_finished": last_run.get("finished_at_utc") if last_run else None,
+    }
+
+
+# ─── 20. Alerts ────────────────────────────────────────────────────
 
 def get_alerts() -> list[dict]:
     """Active alerts based on system state."""
