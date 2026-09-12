@@ -45,6 +45,28 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 <!-- ═══════ ALERTS ═══════ -->
 <div id="alerts-bar" style="margin-bottom:8px"></div>
 
+<!-- ═══════ SYSTEM STATUS ═══════ -->
+<div class="grid g3" id="row-sys">
+<div class="card"><h2>Data Collection</h2><div id="sys-data">Loading...</div></div>
+<div class="card"><h2>Research</h2><div id="sys-research">Loading...</div></div>
+<div class="card"><h2>Paper Trading</h2><div id="sys-paper">Loading...</div></div>
+</div>
+
+<!-- ═══════ RESEARCH PROGRESS ═══════ -->
+<div class="card" style="margin-bottom:8px">
+<h2>Research Progress</h2>
+<div class="pipe" id="rp-flow"></div>
+<div class="sub" id="rp-gate"></div>
+<div class="sub" id="rp-state"></div>
+<div class="sub" id="rp-reason"></div>
+</div>
+
+<!-- ═══════ LIVE DATA ═══════ -->
+<div class="card" style="margin-bottom:8px">
+<h2>Live Data</h2>
+<div id="ld-rows">Loading...</div>
+</div>
+
 <!-- ═══════ ROW 1: Paper Wallet ═══════ -->
 <div class="grid g4" id="row-wallet">
 <div class="card g"><span>Paper Trading</span><div class="v" id="p-status">—</div><div class="sub" id="p-reason"></div></div>
@@ -525,6 +547,155 @@ async function renderResearchConclusion() {
   setIf('research-conclusion', html);
 }
 
+// ═══════ 18. System Status ═══════
+async function renderSysStatus() {
+  const [cc, md, ob] = await Promise.all([
+    fetchJSON('/candle-collector'), fetchJSON('/market-data'), fetchJSON('/ob-collector')
+  ]);
+  if (!cc || !md || !ob) {
+    setIf('sys-data', '<span class="tag tag-na">UNKNOWN</span>');
+  } else {
+    const streams = md.streams || {};
+    const ok = cc.status === 'RUNNING' &&
+      streams.trades && streams.trades.status === 'LIVE' &&
+      streams.futures && streams.futures.status === 'LIVE' &&
+      streams.liquidation && streams.liquidation.status === 'LIVE' &&
+      streams.ratio && streams.ratio.status === 'LIVE' &&
+      ob.status === 'RUNNING';
+    const parts = [`Candles ${cc.status}`];
+    for (const k of ['trades', 'futures', 'liquidation', 'ratio']) {
+      const s = streams[k];
+      parts.push(`${k[0].toUpperCase() + k.slice(1)} ${s ? s.status : 'UNKNOWN'}`);
+    }
+    parts.push(`OB ${ob.status}`);
+    setIf('sys-data', `${ok ? tagHTML('PASS') : tagHTML('ERROR')}<div class="sub" style="margin-top:2px">${parts.join(' · ')}</div>`);
+  }
+
+  const [gate, concl] = await Promise.all([
+    fetchJSON('/research-gate'), fetchJSON('/research-conclusion')
+  ]);
+  if (!gate && !concl) {
+    setIf('sys-research', '<span class="tag tag-na">UNKNOWN</span>');
+  } else {
+    let tag, cls;
+    if (gate && gate.status === 'SKIP') { tag = 'WAITING'; cls = 'tag-stop'; }
+    else if (concl && concl.verdict === 'PASS') { tag = 'READY'; cls = 'tag-pass'; }
+    else { tag = 'REJECTED'; cls = 'tag-reject'; }
+    let sub = '';
+    const ts = (concl && concl.timestamp) || (gate && gate.last_run_finished);
+    if (ts) sub += `<div class="sub">Last research: ${fmt(ts)}</div>`;
+    if (concl) {
+      sub += `<div class="sub">Result: ${concl.n_hypotheses} hypotheses → ${concl.n_candidates} candidates → ${concl.verdict}</div>`;
+    } else if (gate && gate.last_run_verdict) {
+      sub += `<div class="sub">Result: ${gate.last_run_verdict}</div>`;
+    }
+    setIf('sys-research', `<span class="tag ${cls}">${tag}</span>${sub}`);
+  }
+
+  const p = await fetchJSON('/paper');
+  if (!p) {
+    setIf('sys-paper', '<span class="tag tag-na">UNKNOWN</span>');
+  } else {
+    let tag, cls;
+    if (p.status === 'NOT READY') { tag = 'WAITING FOR VALIDATED HYPOTHESIS'; cls = 'tag-stop'; }
+    else if (p.status === 'STOPPED') { tag = 'STOPPED'; cls = 'tag-reject'; }
+    else if (p.status === 'RUNNING') { tag = 'RUNNING'; cls = 'tag-pass'; }
+    else { tag = 'UNKNOWN'; cls = 'tag-na'; }
+    setIf('sys-paper', `<span class="tag ${cls}">${tag}</span>${p.status_reason ? `<div class="sub">${p.status_reason}</div>` : ''}`);
+  }
+}
+
+// ═══════ 19. Research Progress ═══════
+async function renderResearchProgress() {
+  const [d, gate, paper] = await Promise.all([
+    fetchJSON('/pipeline'), fetchJSON('/research-gate'), fetchJSON('/paper')
+  ]);
+  if (!d) {
+    setIf('rp-flow', '<span class="step NOT">UNKNOWN</span>');
+    setIf('rp-gate', ''); setIf('rp-state', ''); setIf('rp-reason', '');
+    return;
+  }
+  const names = ['DATA', 'FEATURES', 'HYPOTHESES', 'DISCOVERY', 'VALIDATION', 'OOS', 'CRITIC', 'PAPER'];
+  const mapping = {
+    'DATA': 'data_validation', 'FEATURES': 'feature_validation', 'HYPOTHESES': null,
+    'DISCOVERY': null, 'VALIDATION': null, 'OOS': null, 'CRITIC': 'critic', 'PAPER': null
+  };
+  let flowHtml = '';
+  for (const name of names) {
+    const stage = mapping[name];
+    let status = 'NOT';
+    if (name === 'HYPOTHESES') {
+      status = d.n_hypotheses > 0 ? 'PASS' : 'NOT';
+    } else if (name === 'PAPER') {
+      status = !paper ? 'NOT' : paper.status === 'RUNNING' ? 'PASS' : paper.status === 'NOT READY' ? 'NOT' : 'STOP';
+    } else if (stage && d.stages) {
+      const found = d.stages.find(s => s.stage === stage);
+      status = found ? found.status : 'NOT';
+    }
+    flowHtml += `<span class="step ${status}">${name}: ${status}</span>`;
+  }
+  setIf('rp-flow', flowHtml);
+
+  if (gate) {
+    setIf('rp-gate', `Research gate: <span class="tag ${gate.status === 'SKIP' ? 'tag-skip' : 'tag-na'}">${gate.status}</span>`);
+    if (gate.status === 'READY') {
+      setIf('rp-state', 'Current state: WAITING FOR NEXT RESEARCH RUN');
+    } else if (gate.status === 'SKIP') {
+      setIf('rp-state', `Current state: RESEARCH COOLDOWN${gate.next_run_utc ? ` · next run: ${fmt(gate.next_run_utc)}` : ''}`);
+    } else {
+      setIf('rp-state', '');
+    }
+    setIf('rp-reason', gate.reason ? `Reason: ${gate.reason}` : '');
+  } else {
+    setIf('rp-gate', ''); setIf('rp-state', ''); setIf('rp-reason', '');
+  }
+}
+
+// ═══════ 20. Live Data ═══════
+async function renderLiveData() {
+  const [md, cc, cap, ob] = await Promise.all([
+    fetchJSON('/market-data'), fetchJSON('/candle-collector'), fetchJSON('/captures'), fetchJSON('/ob-collector')
+  ]);
+  const row = (label, tag, cls, sub) =>
+    `<div style="margin-bottom:2px"><span class="sub">${label}</span> <span class="tag ${cls}">${tag}</span>${sub ? ` <span class="sub">${sub}</span>` : ''}</div>`;
+
+  let h = '';
+  if (!cc) {
+    h += row('Candles', 'UNKNOWN', 'tag-na', '');
+  } else {
+    const live = cc.status === 'RUNNING';
+    let sub = '';
+    if (cc.categories) {
+      sub = Object.entries(cc.categories).map(([n, i]) => `${n} ${i.status}`).join(' · ');
+    }
+    h += row('Candles', live ? 'LIVE' : 'STOPPED', live ? 'tag-pass' : 'tag-na', sub);
+  }
+
+  const streams = md ? (md.streams || {}) : null;
+  for (const [label, key] of [['Trades', 'trades'], ['Futures', 'futures'], ['Liquidations', 'liquidation']]) {
+    const s = streams ? streams[key] : null;
+    if (!s) { h += row(label, 'UNKNOWN', 'tag-na', ''); continue; }
+    const live = s.status === 'LIVE';
+    h += row(label, live ? 'LIVE' : s.status, live ? 'tag-pass' : 'tag-na', s.lag_min != null ? `lag ${s.lag_min} min` : '');
+  }
+
+  if (!ob) {
+    h += row('Orderbook', 'UNKNOWN', 'tag-na', '');
+  } else {
+    const live = ob.status === 'RUNNING';
+    h += row('Orderbook', live ? 'LIVE' : 'STOPPED', live ? 'tag-pass' : 'tag-na', 'event-driven captures');
+  }
+
+  if (!cap || cap.captures_count == null) {
+    h += row('OB captures', 'UNKNOWN', 'tag-na', '');
+  } else {
+    let sub = `${cap.captures_count} captures completed`;
+    if (cap.pending_count > 0) sub += ` · ${cap.pending_count} pending`;
+    h += row('OB captures', `${cap.captures_count} done`, 'tag-pass', sub);
+  }
+  setIf('ld-rows', h);
+}
+
 function startSSE() {
   if (sseActive) return;
   try {
@@ -549,7 +720,8 @@ async function refreshAll() {
     renderPaper(), renderRisk(), renderStakes(), renderWinrate(),
     renderInstruments(), renderPipeline(), renderData(), renderStreams(),
     renderSignals(), renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll(),
-    renderAlerts(), renderOBCollector(), renderCandleCollector(), renderDataQuality(), renderResearchConclusion()
+    renderAlerts(), renderOBCollector(), renderCandleCollector(), renderDataQuality(), renderResearchConclusion(),
+    renderSysStatus(), renderResearchProgress(), renderLiveData()
   ]);
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
   countdown = 3;

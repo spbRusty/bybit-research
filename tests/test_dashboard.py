@@ -336,5 +336,32 @@ class TestObGapMetric(unittest.TestCase):
         self.assertEqual(d["orderbook"]["gap"], 0)
 
 
+class TestStatusBlocks(unittest.TestCase):
+    """Dashboard UX blocks: display-only System Status / Research Progress / Live Data."""
+
+    def test_system_status_block_present(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn('<div class="grid g3" id="row-sys">', html)
+        for hid in ("sys-data", "sys-research", "sys-paper"):
+            self.assertIn(f'id="{hid}"', html)
+
+    def test_research_progress_block_present(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        for hid in ("rp-flow", "rp-gate", "rp-state", "rp-reason"):
+            self.assertIn(f'id="{hid}"', html)
+
+    def test_live_data_block_present(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn('id="ld-rows"', html)
+
+    def test_render_functions_registered_in_refresh_all(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn("renderSysStatus(), renderResearchProgress(), renderLiveData()", html)
+
+    def test_stage_lookup_uses_api_field_name(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn("d.stages.find(s => s.stage === stage)", html)
+
+
 if __name__ == "__main__":
     unittest.main()
