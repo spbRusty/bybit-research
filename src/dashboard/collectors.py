@@ -862,8 +862,15 @@ def get_data_quality() -> dict:
     
     # Check OB quality from metrics
     metrics_path = MARKET_DATA_DIR / "orderbook" / "reconstructed" / "_metrics.jsonl"
+    ob_ok = 0
+    ob_gap = 0
+    ob_stale = 0
+    ob_missing = 0
     if metrics_path.exists():
         try:
+            # Последняя (текущая) запись на символ: суммарный счётчик по историческим строкам
+            # завышает gap делистингнутыми символами (updates_received == 0).
+            by_symbol: dict[str, dict] = {}
             with open(metrics_path) as f:
                 for line in f:
                     line = line.strip()
@@ -871,16 +878,21 @@ def get_data_quality() -> dict:
                         continue
                     try:
                         e = json.loads(line)
-                        if e.get("is_valid"):
-                            quality["orderbook"]["ok"] += 1
-                        else:
-                            quality["orderbook"]["gap"] += 1
-                        if e.get("invalid_state_duration_secs", 0) > 60:
-                            quality["orderbook"]["stale"] += 1
+                        by_symbol[e.get("symbol", "?")] = e
                     except json.JSONDecodeError:
                         continue
         except Exception:
             pass
+        for e in by_symbol.values():
+            if e.get("is_valid"):
+                ob_ok += 1
+            elif e.get("updates_received", 0) > 0:
+                ob_gap += 1
+            else:
+                ob_missing += 1
+            if e.get("invalid_state_duration_secs", 0) > 60:
+                ob_stale += 1
+        quality["orderbook"] = {"ok": ob_ok, "stale": ob_stale, "gap": ob_gap, "missing": ob_missing}
     
     for cat in ("linear", "spot"):
         cat_dir = RAW_KLINES_DIR / cat

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -286,6 +287,53 @@ class TestResearchGateRoute(unittest.TestCase):
         from src.dashboard.server import app
         paths = {r.path for r in app.routes}
         self.assertIn("/api/research-gate", paths)
+
+
+class TestObGapMetric(unittest.TestCase):
+    """OB gaps metric: counts current per-symbol state, delisted symbols -> missing."""
+
+    def _write_metrics(self, tmp: Path, lines: list[dict]) -> Path:
+        path = tmp / "orderbook" / "reconstructed" / "_metrics.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(e) for e in lines) + "\n")
+        return path
+
+    def test_gap_counts_current_state_not_history(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            path = self._write_metrics(tmp, [
+                {"symbol": "BTCUSDT", "is_valid": True, "updates_received": 100, "invalid_state_duration_secs": 0},
+                {"symbol": "MYROUSDT", "is_valid": False, "updates_received": 0, "invalid_state_duration_secs": 300},
+                {"symbol": "RIFUSDT", "is_valid": False, "updates_received": 0, "invalid_state_duration_secs": 300},
+                {"symbol": "ETHUSDT", "is_valid": False, "updates_received": 50, "invalid_state_duration_secs": 120},
+            ])
+            with patch("src.dashboard.collectors.MARKET_DATA_DIR", tmp), \
+                 patch("src.dashboard.collectors.RAW_KLINES_DIR", tmp / "klines"):
+                d = collectors.get_data_quality()
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        ob = d["orderbook"]
+        self.assertEqual(ob["ok"], 1)        # BTCUSDT
+        self.assertEqual(ob["gap"], 1)       # ETHUSDT (has updates, invalid state)
+        self.assertEqual(ob["missing"], 2)   # MYROUSDT, RIFUSDT (never received data)
+        self.assertEqual(ob["stale"], 3)     # MYROUSDT, RIFUSDT, ETHUSDT (invalid > 60s)
+
+    def test_latest_entry_wins_per_symbol(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            self._write_metrics(tmp, [
+                {"symbol": "BTCUSDT", "is_valid": False, "updates_received": 100, "invalid_state_duration_secs": 0},
+                {"symbol": "BTCUSDT", "is_valid": True, "updates_received": 150, "invalid_state_duration_secs": 0},
+            ])
+            with patch("src.dashboard.collectors.MARKET_DATA_DIR", tmp), \
+                 patch("src.dashboard.collectors.RAW_KLINES_DIR", tmp / "klines"):
+                d = collectors.get_data_quality()
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(d["orderbook"]["ok"], 1)
+        self.assertEqual(d["orderbook"]["gap"], 0)
 
 
 if __name__ == "__main__":

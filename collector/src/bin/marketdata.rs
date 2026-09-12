@@ -194,17 +194,14 @@ impl Stream {
         match self {
             Stream::Trades => format!("publicTrade.{sym}"),
             Stream::Orderbook => format!("orderbook.50.{sym}"),
-            Stream::Liquidation => "allLiquidation".to_string(),
+            Stream::Liquidation => format!("allLiquidation.{sym}"),
         }
     }
     fn strip<'a>(&self, topic: &'a str) -> Option<&'a str> {
         match self {
             Stream::Trades => topic.strip_prefix("publicTrade."),
             Stream::Orderbook => topic.strip_prefix("orderbook.50."),
-            Stream::Liquidation => {
-                if topic == "allLiquidation" { Some("broadcast") }
-                else { topic.strip_prefix("allLiquidation.") }
-            }
+            Stream::Liquidation => topic.strip_prefix("allLiquidation."),
         }
     }
 }
@@ -262,11 +259,7 @@ fn parse_message(stream: Stream, v: &Value) -> Option<(String, Table)> {
         }
         Stream::Liquidation => {
             let arr = data.as_array()?;
-            let sym = if stream.strip(topic) == Some("broadcast") {
-                arr.first()?.get("symbol")?.as_str()?.to_string()
-            } else {
-                stream.strip(topic)?.to_string()
-            };
+            let sym = stream.strip(topic)?.to_string();
             let mut t = Table::from([
                 ("ts", Col::new()), ("is_sell", Col::new()), ("price", Col::new()), ("size", Col::new()),
             ]);
@@ -285,11 +278,6 @@ fn parse_message(stream: Stream, v: &Value) -> Option<(String, Table)> {
 async fn subscribe_all<S>(sink: &mut S, stream: Stream, syms: &[String]) -> Result<()>
 where S: Sink<Message> + Unpin, S::Error: std::error::Error + Send + Sync + 'static,
 {
-    if stream == Stream::Liquidation {
-        let args = vec!["allLiquidation".to_string()];
-        sink.send(Message::Text(json!({"op":"subscribe","args":args}).to_string().into())).await?;
-        return Ok(());
-    }
     for c in syms.chunks(SUB_CHUNK) {
         let args: Vec<String> = c.iter().map(|s| stream.topic(s)).collect();
         sink.send(Message::Text(json!({"op":"subscribe","args":args}).to_string().into())).await?;
@@ -839,21 +827,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn liquidation_strip_broadcast() {
-        assert_eq!(Stream::Liquidation.strip("allLiquidation"), Some("broadcast"));
-        assert_eq!(Stream::Liquidation.strip("allLiquidation.BTCUSDT"), Some("BTCUSDT"));
+    fn liquidation_topic_per_symbol() {
+        assert_eq!(Stream::Liquidation.topic("BTCUSDT"), "allLiquidation.BTCUSDT");
     }
 
     #[test]
-    fn liquidation_parse_broadcast() {
-        let msg = json!({
-            "topic": "allLiquidation",
-            "ts": 1234567890000u64,
-            "data": [{"symbol": "BTCUSDT", "S": "Sell", "p": "50000", "v": "0.1"}]
-        });
-        let (sym, table) = parse_message(Stream::Liquidation, &msg).unwrap();
-        assert_eq!(sym, "BTCUSDT");
-        assert_eq!(table[0].1.len(), 1);
+    fn liquidation_strip() {
+        assert_eq!(Stream::Liquidation.strip("allLiquidation.BTCUSDT"), Some("BTCUSDT"));
+        assert_eq!(Stream::Liquidation.strip("allLiquidation"), None);
     }
 
     #[test]
@@ -863,7 +844,7 @@ mod tests {
             "ts": 1234567890000u64,
             "data": [{"S": "Buy", "p": "3000", "v": "1.0"}]
         });
-        let (sym, table) = parse_message(Stream::Liquidation, &msg).unwrap();
+        let (sym, _table) = parse_message(Stream::Liquidation, &msg).unwrap();
         assert_eq!(sym, "ETHUSDT");
     }
 
