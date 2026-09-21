@@ -35,6 +35,11 @@ OB_COVERAGE_WINDOW_MIN = 30   # «обновлён» = запись OB не ст
 
 _G = load_toml("auto_research.toml")["gate"]
 
+# Frozen boundary: снапшот данных, зафиксированный Research Runner на время
+# цикла. Действует ТОЛЬКО внутри цикла: за пределами FROZEN_TTL не применяется,
+# чтобы сбой/перезагрузка не оставили вечный обход обычного data-ready gate.
+FROZEN_TTL = timedelta(hours=24)
+
 
 class Lock:
     """flock-лок от параллельного запуска: авто-освобождается ядром."""
@@ -181,12 +186,101 @@ def scan_ob() -> dict:
             "ob_rows": rows}
 
 
+# --- Frozen boundary (Research Runner) -----------------------------------
+
+def frozen_boundary_path() -> Path:
+    return RESEARCH_DIR / "frozen_boundary.json"
+
+
+def load_frozen_boundary() -> dict | None:
+    """Снапшот замороженного boundary, если он существует и не протух.
+
+    Протухший (старше FROZEN_TTL) или повреждённый снапшот игнорируется —
+    обычный data-ready gate снова работает в полном объёме.
+    """
+    p = frozen_boundary_path()
+    if not p.exists():
+        return None
+    try:
+        snap = json.loads(p.read_text())
+    except (ValueError, OSError):
+        logger.warning("frozen_boundary.json corrupt, ignoring")
+        return None
+    km_raw = snap.get("klines_max")
+    if not km_raw:
+        return None
+    try:
+        km = datetime.fromisoformat(str(km_raw))
+        if km.tzinfo is not None:
+            km = km.astimezone(timezone.utc).replace(tzinfo=None)
+    except ValueError:
+        logger.warning("frozen_boundary.json bad klines_max, ignoring")
+        return None
+    snap["_klines_max"] = km
+    frozen_at = snap.get("frozen_at_utc")
+    if frozen_at:
+        try:
+            ft = datetime.fromisoformat(str(frozen_at))
+            if ft.tzinfo is not None:
+                ft = ft.astimezone(timezone.utc).replace(tzinfo=None)
+            age = now_utc() - ft
+            if age > FROZEN_TTL:
+                logger.warning("frozen boundary stale (age=%s), ignoring", age)
+                return None
+        except ValueError:
+            pass
+    return snap
+
+
+def save_frozen_boundary(snapshot: dict) -> None:
+    snap = dict(snapshot)
+    snap.pop("_klines_max", None)
+    snap["frozen_at_utc"] = now_utc().isoformat()
+    p = frozen_boundary_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(snap, ensure_ascii=False, indent=2, default=str))
+    tmp.replace(p)
+
+
+def clear_frozen_boundary() -> None:
+    try:
+        frozen_boundary_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
 # --- Решение -------------------------------------------------------------
 
 def check_ready() -> tuple[bool, list[str], dict]:
     """(ready, причины отказа, метрики). ready=True без last_run.json
     (первый запуск) — gate не должен блокировать инициализацию."""
     reasons: list[str] = []
+
+    frozen = load_frozen_boundary()
+    if frozen is not None:
+        klines_max = frozen["_klines_max"]
+        logger.info("Frozen boundary %s: data-ready gate skipped",
+                    klines_max.isoformat())
+        metrics = {
+            "klines": {
+                "klines_max": klines_max,
+                "new_rows": 0,
+                "n_files": int(frozen.get("n_files", 0)),
+                "fresh_symbols": int(frozen.get("fresh_symbols", 0)),
+                "stale_symbols": 0,
+            },
+            "ob": {
+                "ob_valid_symbols": int(frozen.get("ob_valid_symbols", 0)),
+                "ob_unique_symbols": int(frozen.get("ob_unique_symbols", 0)),
+                "ob_rows": int(frozen.get("ob_rows", 0)),
+            },
+            "config_hash": str(frozen.get("config_hash", "")),
+            "git_head": str(frozen.get("git_head", "")),
+            "data_version": str(frozen.get("data_version", "1.0")),
+        }
+        return True, [], metrics
+
     last = load_last_run()
     since = datetime.fromisoformat(last["klines_max"]) if last and last.get("klines_max") else None
     metrics = {"klines": scan_klines(since=since), "ob": scan_ob(),

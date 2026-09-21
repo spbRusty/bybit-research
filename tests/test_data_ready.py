@@ -108,5 +108,89 @@ class TestCooldown(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestFrozenBoundary(unittest.TestCase):
+    """Frozen boundary: snapshot действует только внутри research cycle."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._td = Path(self._tmp.name)
+        self._old_dir = data_ready.RESEARCH_DIR
+        self._old_state = data_ready.STATE_PATH
+        data_ready.RESEARCH_DIR = self._td
+        data_ready.STATE_PATH = self._td / "last_run.json"
+
+    def tearDown(self):
+        data_ready.RESEARCH_DIR = self._old_dir
+        data_ready.STATE_PATH = self._old_state
+        self._tmp.cleanup()
+
+    def _snapshot(self, klines_max: str = "2026-09-20T19:55:00",
+                  frozen_at: str | None = None):
+        return {
+            "klines_max": klines_max,
+            "config_hash": "9be56a1fe207",
+            "git_head": "test",
+            "data_version": "1.0",
+            "n_files": 10,
+            "fresh_symbols": 93,
+            "ob_valid_symbols": 744,
+            "ob_unique_symbols": 100,
+            "ob_rows": 5000,
+            "frozen_at_utc": frozen_at or datetime.now(timezone.utc).isoformat(),
+        }
+
+    def test_frozen_makes_ready_with_stable_cycle_id(self):
+        data_ready.save_frozen_boundary(self._snapshot())
+        ok, reasons, metrics = check_ready()
+        self.assertTrue(ok)
+        self.assertEqual(reasons, [])
+        self.assertEqual(metrics["klines"]["klines_max"].isoformat(),
+                         "2026-09-20T19:55:00")
+        self.assertEqual(metrics["ob"]["ob_valid_symbols"], 744)
+        # klines_max приходит из снапшота, не из живого скана
+        self.assertEqual(metrics["config_hash"], "9be56a1fe207")
+
+    def test_clear_frozen_restores_full_gate(self):
+        data_ready.save_frozen_boundary(self._snapshot())
+        self.assertTrue(data_ready.frozen_boundary_path().exists())
+        data_ready.clear_frozen_boundary()
+        self.assertFalse(data_ready.frozen_boundary_path().exists())
+        # после очистки — полный gate: cooldown снова блокирует
+        data_ready.STATE_PATH.write_text(__import__("json").dumps(_state(
+            datetime.now(timezone.utc).isoformat(),
+            "2026-09-10 00:00:00")))
+        with patch("src.data_ready.scan_klines",
+                   return_value={"klines_max": None, "n_files": 0}), \
+             patch("src.data_ready.scan_ob",
+                   return_value={"ob_valid_symbols": 0}):
+            ok, reasons, _ = check_ready()
+        self.assertFalse(ok)
+        self.assertTrue(any("cooldown" in r for r in reasons))
+
+    def test_stale_frozen_ignored(self):
+        stale = (datetime.now(timezone.utc) - data_ready.FROZEN_TTL
+                 - timedelta(hours=1)).isoformat()
+        snap = self._snapshot(frozen_at=stale)
+        # save_frozen_boundary перезаписывает frozen_at_utc; stale пишем напрямую
+        data_ready.frozen_boundary_path().write_text(
+            __import__("json").dumps(snap))
+        self.assertIsNone(data_ready.load_frozen_boundary())
+        # gate снова обычный (не frozen) — cooldown блокирует, а не снапшот
+        data_ready.STATE_PATH.write_text(__import__("json").dumps(_state(
+            datetime.now(timezone.utc).isoformat(),
+            "2026-09-10 00:00:00")))
+        with patch("src.data_ready.scan_klines",
+                   return_value={"klines_max": None, "n_files": 0}), \
+             patch("src.data_ready.scan_ob",
+                   return_value={"ob_valid_symbols": 0}):
+            ok, reasons, _ = check_ready()
+        self.assertFalse(ok)
+        self.assertTrue(any("cooldown" in r for r in reasons))
+
+    def test_no_frozen_unchanged(self):
+        self.assertIsNone(data_ready.load_frozen_boundary())
+        self.assertFalse(data_ready.frozen_boundary_path().exists())
+
+
 if __name__ == "__main__":
     unittest.main()
