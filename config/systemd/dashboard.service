@@ -1,0 +1,13 @@
+[Unit]
+Description=Bybit Research Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vlad/Документы/построение
+ExecStart=/home/vlad/Документы/построение/.venv/bin/python -m src.dashboard.server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

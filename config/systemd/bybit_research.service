@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/vlad/Документы/построение
-ExecStart=/home/vlad/Документы/построение/.venv/bin/python -m src.orchestrator --gated
+ExecStart=/home/vlad/Документы/построение/.venv/bin/python -m src.research_runner
 KillMode=process
 Restart=on-failure
 RestartSec=60
