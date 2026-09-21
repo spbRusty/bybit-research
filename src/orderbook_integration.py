@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -102,11 +103,16 @@ def _process_symbol(
     # (e.g. event at midnight 09-06, snapshot at 23:59 on 09-05)
     date_strs = _date_range(min_ms - 300_000, max_ms + 60_000)
 
+    sym_dir = _RECON_DIR / symbol
     frames = []
     for ds in date_strs:
-        path = _RECON_DIR / symbol / f"{ds}.parquet"
-        if path.exists():
-            df = pl.read_parquet(path)
+        # {ds}.parquet, {ds}.parquet.legacy, or {ds}-HH.parquet (2-digit hour)
+        _name_re = re.compile(rf"^{re.escape(ds)}(?:\.parquet(?:\.legacy)?|-\d{{2}}\.parquet)$")
+        for p in sorted(
+            (p for p in sym_dir.glob(f"{ds}*") if _name_re.fullmatch(p.name)),
+            key=lambda p: (0 if p.name[len(ds)] == "." else 1, p.name),
+        ):
+            df = pl.read_parquet(p)
             if df.height > 0:
                 frames.append(df)
 
@@ -115,9 +121,19 @@ def _process_symbol(
             if c not in events.columns:
                 events = events.with_columns(pl.lit(None, dtype=pl.Float64).alias(c))
         events = events.with_columns(pl.lit("missing").alias("ob_data_quality"))
+        events = events.with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("ob_ts_min_ms"),
+            pl.lit(None, dtype=pl.Int64).alias("ob_ts_max_ms"),
+        )
         return events
 
-    ob_data = pl.concat(frames).sort("timestamp_ms")
+    ob_data = (
+        pl.concat(frames)
+        .unique(subset=["timestamp_ms"], keep="last")
+        .sort("timestamp_ms")
+    )
+    ob_min_ms = int(ob_data["timestamp_ms"].min())
+    ob_max_ms = int(ob_data["timestamp_ms"].max())
     features = compute_all_features(ob_data)
 
     feat_cols = [c for c in features.columns if c not in ("timestamp_ms", "update_id", "symbol")]
@@ -166,6 +182,11 @@ def _process_symbol(
             joined = joined.with_columns(pl.lit(None).alias(c))
 
     result = joined.drop("_idx", "_event_ts_ms", "timestamp_ms", "gap_detected", "_lag_sec")
+
+    result = result.with_columns(
+        pl.lit(ob_min_ms, dtype=pl.Int64).alias("ob_ts_min_ms"),
+        pl.lit(ob_max_ms, dtype=pl.Int64).alias("ob_ts_max_ms"),
+    )
 
     return result
 

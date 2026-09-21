@@ -381,6 +381,63 @@ class TestMultipleSymbols(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class TestPerSymbolWindowBounds(unittest.TestCase):
+    def test_bounds_match_raw_snapshot_range(self):
+        from src.orderbook_integration import _process_symbol, _get_ob_columns
+
+        snap_ms = _BASE_MS - 30_000
+        rows = _make_snapshot_rows("BTCUSDT", snap_ms, n=5, interval_ms=5000)
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            _write_parquet(tmp / "BTCUSDT" / f"{_DATE_STR}.parquet", rows)
+            events = _make_events("BTCUSDT", [_BASE_MS, _BASE_MS + 60_000])
+            with patch("src.orderbook_integration._RECON_DIR", tmp):
+                result = _process_symbol("BTCUSDT", events, _get_ob_columns())
+            self.assertEqual(result["ob_ts_min_ms"][0], snap_ms)
+            self.assertEqual(result["ob_ts_max_ms"][0], snap_ms + 4 * 5000)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_bounds_null_without_snapshots(self):
+        from src.orderbook_integration import _process_symbol, _get_ob_columns
+
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            events = _make_events("BTCUSDT", [_BASE_MS])
+            with patch("src.orderbook_integration._RECON_DIR", tmp):
+                result = _process_symbol("BTCUSDT", events, _get_ob_columns())
+            self.assertTrue(result["ob_ts_min_ms"][0] is None)
+            self.assertTrue(result["ob_ts_max_ms"][0] is None)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_two_symbols_disjoint_windows(self):
+        from src.orderbook_integration import join_ob_features
+
+        btc_ms = _BASE_MS - 30_000
+        eth_ms = _BASE_MS + 3_600_000
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            _write_parquet(tmp / "BTCUSDT" / f"{_DATE_STR}.parquet",
+                           _make_snapshot_rows("BTCUSDT", btc_ms, n=3))
+            _write_parquet(tmp / "ETHUSDT" / f"{_DATE_STR}.parquet",
+                           _make_snapshot_rows("ETHUSDT", eth_ms, n=3))
+            events = pl.concat([
+                _make_events("BTCUSDT", [_BASE_MS]),
+                _make_events("ETHUSDT", [_BASE_MS + 3_600_000]),
+            ])
+            with patch("src.orderbook_integration._RECON_DIR", tmp):
+                result = join_ob_features(events).sort("symbol")
+            btc_row = result.filter(pl.col("symbol") == "BTCUSDT")
+            eth_row = result.filter(pl.col("symbol") == "ETHUSDT")
+            self.assertEqual(btc_row["ob_ts_min_ms"][0], btc_ms)
+            self.assertEqual(btc_row["ob_ts_max_ms"][0], btc_ms + 2 * 5000)
+            self.assertEqual(eth_row["ob_ts_min_ms"][0], eth_ms)
+            self.assertEqual(eth_row["ob_ts_max_ms"][0], eth_ms + 2 * 5000)
+        finally:
+            shutil.rmtree(tmp)
+
+
 class TestDateBoundary(unittest.TestCase):
     def test_event_at_midnight_reads_both_dates(self):
         from src.orderbook_integration import _process_symbol, _get_ob_columns

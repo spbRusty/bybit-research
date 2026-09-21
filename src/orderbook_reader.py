@@ -6,6 +6,7 @@ This module is read-only: never modifies market data.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,16 +35,33 @@ def _date_range(start_ms: int, end_ms: int) -> list[str]:
 def read_reconstructed(symbol: str, date_str: str) -> pl.DataFrame | None:
     """Read reconstructed snapshots for a symbol on a given date.
 
+    Handles both legacy daily files ({date}.parquet) and hourly files
+    ({date}-{HH}.parquet).  Ignores .parquet.legacy and .tmp leftovers.
+
     Returns DataFrame with columns:
         timestamp_ms, update_id, symbol, best_bid, best_ask,
         spread_bps, mid_price, levels (nested)
 
-    Returns None if file doesn't exist.
+    Returns None if no matching files exist.
     """
-    path = _RECON_DIR / symbol / f"{date_str}.parquet"
-    if not path.exists():
+    sym_dir = _RECON_DIR / symbol
+    if not sym_dir.exists():
         return None
-    return pl.read_parquet(path)
+    # Daily {date}.parquet, migrated {date}.parquet.legacy, hourly {date}-HH.parquet
+    _name_re = re.compile(rf"^{re.escape(date_str)}(?:\.parquet(?:\.legacy)?|-\d{{2}}\.parquet)$")
+    paths = sorted(
+        (p for p in sym_dir.glob(f"{date_str}*") if _name_re.fullmatch(p.name)),
+        key=lambda p: (0 if p.name[len(date_str)] == "." else 1, p.name),
+    )
+    if not paths:
+        return None
+    frames = [pl.read_parquet(p) for p in paths]
+    combined = pl.concat(frames)
+    return (
+        combined
+        .unique(subset=["timestamp_ms"], keep="last")
+        .sort("timestamp_ms")
+    )
 
 
 def get_window(
@@ -163,9 +181,9 @@ def list_dates(symbol: str) -> list[str]:
     sym_dir = _RECON_DIR / symbol
     if not sym_dir.exists():
         return []
-    return sorted([
-        p.stem for p in sym_dir.glob("*.parquet")
-    ])
+    _name_re = re.compile(r"^\d{4}-\d{2}-\d{2}(?:\.parquet(?:\.legacy)?|-\d{2}\.parquet)$")
+    dates = {p.name[:10] for p in sym_dir.iterdir() if p.is_file() and _name_re.fullmatch(p.name)}
+    return sorted(dates)
 
 
 def storage_stats() -> dict:
