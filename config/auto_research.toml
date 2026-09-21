@@ -1,5 +1,8 @@
 # Пороги data-ready gate (ЭТАП 1)
 # min_events / min_unique_symbols / min_months живут в research.toml — не дублируем.
+# 2026-09-16: MR_SMA120_* подключены к основному pipeline (features_momentum.mr_sma120,
+# orchestrator добавляет _mr_hypotheses() в обычный набор). config_hash не видит код —
+# этот комментарий триггерит легитимный перезапуск research после изменения кода.
 
 [gate]
 min_new_data_minutes = 1440   # прирост данных с прошлого research-run (мин)
@@ -10,3 +13,4 @@ max_ob_jumps = 5              # допустимые update_id_jumps в OB-ме�
 max_gap_ratio = 0.05          # доля пропусков свечей в новом окне
 max_stale_ratio = 0.10        # доля «мёртвых» символов (без свечей 7+ дней)
 cooldown_minutes = 720        # пауза между research-запусками (мин)
+# 2026-09-16 13:15 UTC: acceptance-логика исправлена (REJECT вместо ERROR при candidates+validation-reject)

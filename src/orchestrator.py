@@ -93,7 +93,7 @@ def _condition_cols(condition: str) -> set[str]:
     return set(_COND_COL_RE.findall(condition))
 
 
-def _required_columns() -> list[str]:
+def _required_columns(extra_conditions: tuple[str, ...] = ()) -> list[str]:
     """Колонки, реально потребляемые downstream (research, critic, shadow, triggers).
 
     Выводятся из фактических потребителей, НЕ хардкодятся:
@@ -127,14 +127,35 @@ def _required_columns() -> list[str]:
     return sorted(cols)
 
 
+def _tag_report(report: dict, experiment_id: str | None,
+                cycle_id: str | None) -> dict:
+    """Проставляет experiment_id/cycle_id Research Controller в acceptance report."""
+    if experiment_id is not None:
+        report["experiment_id"] = experiment_id
+    if cycle_id is not None:
+        report["cycle_id"] = cycle_id
+    return report
+
+
 def run_pipeline(limit: int | None = None, category: str | None = None,
-                 mr_control: bool = False) -> dict:
-    """Full pipeline with structured stage results. Returns acceptance report."""
+                 mr_control: bool = False,
+                 hypothesis_specs: list[research_mod.Hypothesis] | None = None,
+                 auto_paper: bool = False,
+                 experiment_id: str | None = None,
+                 cycle_id: str | None = None) -> dict:
+    """Full pipeline with structured stage results. Returns acceptance report.
+
+    Research Controller hooks:
+      - hypothesis_specs: при задании заменяет штатную генерацию гипотез (§6);
+      - auto_paper=False: гарантированно запрещает auto trigger MODE A (§14);
+      - experiment_id/cycle_id: попадают в acceptance report.
+    """
     t0 = datetime.now(tz=timezone.utc)
     run_id = t0.strftime("%Y%m%dT%H%M%SZ")
     stages: list[StageResult] = []
 
-    logger.info("=== ORCHESTRATOR: %s (run_id=%s) ===", t0.isoformat(), run_id)
+    logger.info("=== ORCHESTRATOR: %s (run_id=%s%s) ===", t0.isoformat(), run_id,
+                f", experiment={experiment_id}" if experiment_id else "")
 
     # --- 1. UNIVERSE ---
     universe = data_mod.liquidity_universe()
@@ -154,7 +175,8 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
         klines_max = mx if klines_max is None or mx > klines_max else klines_max
     oos_end = klines_max.isoformat() if klines_max is not None else None
     breadth = breadth_mod.compute_breadth(univ_dfs)
-    required_cols = _required_columns()
+    extra_conds = tuple(h.condition for h in hypothesis_specs) if hypothesis_specs else ()
+    required_cols = _required_columns(extra_conds)
     all_events = []
     n_loaded = 0
     full_cols: set[str] = set()
@@ -183,7 +205,8 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
                         errors=["No events produced"])
         stages.append(s)
         _log_stage(s)
-        return build_acceptance_report(stages, {}, run_id)
+        return _tag_report(build_acceptance_report(stages, {}, run_id),
+                           experiment_id, cycle_id)
 
     all_cols = sorted(set(c for ev in all_events for c in ev.columns))
     aligned = []
@@ -230,7 +253,8 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     stages.append(s)
     _log_stage(s)
     if s.status == StageStatus.STOP:
-        return build_acceptance_report(stages, {}, run_id)
+        return _tag_report(build_acceptance_report(stages, {}, run_id),
+                           experiment_id, cycle_id)
 
     # --- 4. FEATURE VALIDATION ---
     s = stage_feature_validation(events)
@@ -257,7 +281,13 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
         logger.info("Candle triggers: none fired this run")
 
     # --- 6. HYPOTHESIS GENERATION ---
-    if mr_control:
+    if hypothesis_specs is not None:
+        # Research Controller инжектирует готовый набор гипотез вместо штатной
+        # генерации (baseline + generator + mr). Приёмочные пороги не меняются.
+        hypotheses = list(hypothesis_specs)
+        logger.info("Hypotheses: injected %d spec(s) by Research Controller",
+                    len(hypotheses))
+    elif mr_control:
         hypotheses = _mr_hypotheses()
     else:
         baseline = research_mod.HYPOTHESES
@@ -352,7 +382,8 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
                 len(eligible_a), len(eligible_b))
 
     # --- 12. ACCEPTANCE REPORT ---
-    report = build_acceptance_report(stages, result, run_id)
+    report = _tag_report(build_acceptance_report(stages, result, run_id),
+                         experiment_id, cycle_id)
     report_path = RESULTS_DIR / f"acceptance_{run_id}.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False,
                                       default=str))
@@ -360,7 +391,12 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
                 report["verdict"])
 
     # --- 13. SHADOW PAPER (MODE B) ---
-    if eligible_b:
+    # auto_paper=False (Research Controller) гарантирует, что paper.py не
+    # запускается вообще: ни MODE B, ни MODE A. PAPER — только вручную.
+    if not auto_paper:
+        logger.info("auto_paper=False: shadow/MODE A paper skipped "
+                    "(paper is manual under Research Controller)")
+    elif eligible_b:
         try:
             from src.paper import shadow_run
             shadow_hyps = [h for h in hypotheses if h.hypothesis_id in eligible_b]
@@ -382,7 +418,7 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
             logger.warning("Shadow paper failed: %s", e)
 
     # --- 14. AUTO TRIGGER MODE A ---
-    if eligible_a:
+    if auto_paper and eligible_a:
         try:
             triggered = auto_paper_trigger(registry)
             if triggered:

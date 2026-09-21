@@ -181,27 +181,70 @@ class TestOBFeatureValidation(unittest.TestCase):
             "min_feature_valid_events": min_valid,
         }
 
-    def _events(self, n=200, nulls=0):
-        vals = [1.0] * (n - nulls) + [None] * nulls
-        return pl.DataFrame({"ob_spread_bps": vals})
+    def _events(self, n=200, nulls=0, in_window=None, out_nulls=0,
+                with_bounds=True, bounds_null=False):
+        n_in = n if in_window is None else in_window
+        vals = [1.0] * (n_in - nulls) + [None] * nulls
+        vals += [None if out_nulls else 1.0] * (n - n_in)
+        ts = [1_000_000 + i for i in range(n_in)]
+        ts += [9_999_999 + i for i in range(n - n_in)]
+        if with_bounds:
+            bmin = None if bounds_null else 1_000_000
+            bmax = None if bounds_null else (ts[n_in - 1] if n_in else None)
+            rows_min = [bmin] * n
+            rows_max = [bmax] * n
+        else:
+            rows_min = rows_max = None
+        data = {"open_time": ts, "ob_spread_bps": vals}
+        if with_bounds:
+            data["ob_ts_min_ms"] = rows_min
+            data["ob_ts_max_ms"] = rows_max
+        return pl.DataFrame(data)
 
     def test_pass_full_coverage(self):
-        r = stage_ob_feature_validation(self._events(), self._cfg())
+        r = stage_ob_feature_validation(self._events(n=200, in_window=200),
+                                        self._cfg())
         self.assertEqual(r.status, StageStatus.PASS)
         self.assertEqual(r.metrics["ineligible_features"], [])
         self.assertEqual(r.metrics["coverage"]["ob_spread_bps"], 1.0)
-        self.assertEqual(r.metrics["valid_events"]["ob_spread_bps"], 200)
+        self.assertEqual(r.metrics["n_events_in_window"], 200)
 
-    def test_reject_low_coverage(self):
-        r = stage_ob_feature_validation(self._events(n=100, nulls=60), self._cfg())
-        self.assertEqual(r.status, StageStatus.REJECT)
+    def test_low_coverage_insufficient_data_gaps_stay_in_denominator(self):
+        r = stage_ob_feature_validation(
+            self._events(n=100, in_window=100, nulls=60), self._cfg())
+        self.assertEqual(r.status, StageStatus.INSUFFICIENT_DATA)
         self.assertIn("ob_spread_bps", r.metrics["ineligible_features"])
         self.assertEqual(r.metrics["coverage"]["ob_spread_bps"], 0.4)
         self.assertTrue(r.errors)
 
+    def test_out_of_window_events_excluded_from_denominator(self):
+        ev = self._events(n=300, in_window=150, nulls=15, out_nulls=150)
+        r = stage_ob_feature_validation(ev, self._cfg())
+        self.assertEqual(r.status, StageStatus.PASS)
+        self.assertEqual(r.metrics["n_events_in_window"], 150)
+        self.assertEqual(r.metrics["coverage"]["ob_spread_bps"], 0.9)
+
+    def test_no_bounds_insufficient_data(self):
+        ev = self._events(n=200, in_window=200, with_bounds=False)
+        r = stage_ob_feature_validation(ev, self._cfg())
+        self.assertEqual(r.status, StageStatus.INSUFFICIENT_DATA)
+        self.assertIn("ob_spread_bps", r.metrics["ineligible_features"])
+
+    def test_null_bounds_insufficient_data(self):
+        ev = self._events(n=200, in_window=200, bounds_null=True)
+        r = stage_ob_feature_validation(ev, self._cfg())
+        self.assertEqual(r.status, StageStatus.INSUFFICIENT_DATA)
+        self.assertIn("ob_spread_bps", r.metrics["ineligible_features"])
+
+    def test_few_in_window_events_insufficient_data(self):
+        r = stage_ob_feature_validation(
+            self._events(n=300, in_window=80), self._cfg())
+        self.assertEqual(r.status, StageStatus.INSUFFICIENT_DATA)
+        self.assertIn("ob_spread_bps", r.metrics["ineligible_features"])
+
     def test_reject_low_valid_count(self):
         r = stage_ob_feature_validation(self._events(n=80), self._cfg())
-        self.assertEqual(r.status, StageStatus.REJECT)
+        self.assertEqual(r.status, StageStatus.INSUFFICIENT_DATA)
         self.assertIn("ob_spread_bps", r.metrics["ineligible_features"])
 
     def test_skipped_no_ob_columns(self):
@@ -215,13 +258,21 @@ class TestOBFeatureValidation(unittest.TestCase):
         self.assertEqual(r.metrics["n_features_present"], 1)
         self.assertEqual(r.metrics["min_coverage"], 0.5)
         self.assertEqual(r.metrics["min_valid_events"], 100)
+        self.assertTrue(r.metrics["ob_window_bounds"])
+        self.assertEqual(r.metrics["n_events_in_window"], 200)
+        self.assertEqual(r.metrics["n_events_out_of_window"], 0)
 
     def test_real_config_pass_full_coverage(self):
         cols = ["ob_spread_bps", "ob_imbalance_1", "ob_imbalance_5",
                 "ob_imbalance_10", "ob_top1_share", "ob_depth_change_5_1",
                 "ob_depth_change_10_1", "ob_spread_change_1"]
-        ev = pl.DataFrame({c: [1.0] * 200 for c in cols})
-        r = stage_ob_feature_validation(ev)
+        n = 200
+        ts = [1_000_000 + i for i in range(n)]
+        data = {c: [1.0] * n for c in cols}
+        data["open_time"] = ts
+        data["ob_ts_min_ms"] = [ts[0]] * n
+        data["ob_ts_max_ms"] = [ts[-1]] * n
+        r = stage_ob_feature_validation(pl.DataFrame(data))
         self.assertEqual(r.status, StageStatus.PASS)
 
 
@@ -345,6 +396,9 @@ def _pass(s: str) -> StageResult:
 
 def _reject(s: str, err: str = "fail") -> StageResult:
     return StageResult(stage=s, status=StageStatus.REJECT, run_id="r1", errors=[err])
+
+def _insufficient(s: str, err: str = "insufficient data") -> StageResult:
+    return StageResult(stage=s, status=StageStatus.INSUFFICIENT_DATA, run_id="r1", errors=[err])
 
 def _stop(s: str, err: str = "stop") -> StageResult:
     return StageResult(stage=s, status=StageStatus.STOP, run_id="r1", errors=[err])
@@ -908,6 +962,65 @@ class TestAcceptanceReportVerdict(unittest.TestCase):
         val = {"n": 200, "mean_net": 0.003, "t_stat": 3.5}
         s = stage_validation_gate(val)
         self.assertTrue(s.passed)
+
+
+class TestOBGateNonBlocking(unittest.TestCase):
+    """OB gate должна помечать OB-фичи ineligible, но не блокировать verdict,
+    пока не-OB гипотезы проходят обычные гейты (разделение OB/non-OB)."""
+
+    def _all_pass_with_finalist(self):
+        return [
+            _pass("data_validation"),
+            _pass("feature_validation"),
+            _pass("validation_gate"),
+            _pass("oos_gate"),
+            _pass("parameter_freeze"),
+            _pass("critic"),
+        ], {"candidates": ["H001"], "finalist": {"hypothesis_id": "H001"}}
+
+    def _ob_insufficient(self):
+        return _insufficient(
+            "ob_feature_validation",
+            "ob_spread_bps: coverage=21.90% < min(coverage=50%)",
+        )
+
+    def test_ob_insufficient_data_does_not_block_verdict(self):
+        stages, result = self._all_pass_with_finalist()
+        stages.append(self._ob_insufficient())
+        report = build_acceptance_report(stages, result, "r1")
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertEqual(report["reject_reasons"], [])
+
+    def test_ob_reject_does_not_block_verdict(self):
+        stages, result = self._all_pass_with_finalist()
+        stages.append(_reject("ob_feature_validation",
+                              "ob_spread_bps: no OB window bounds"))
+        report = build_acceptance_report(stages, result, "r1")
+        self.assertEqual(report["verdict"], "PASS")
+
+    def test_ob_stage_kept_in_report_stages(self):
+        stages, result = self._all_pass_with_finalist()
+        stages.append(self._ob_insufficient())
+        report = build_acceptance_report(stages, result, "r1")
+        ob = [s for s in report["stages"] if s["stage"] == "ob_feature_validation"]
+        self.assertEqual(len(ob), 1)
+        self.assertEqual(ob[0]["status"], "INSUFFICIENT_DATA")
+
+    def test_real_reject_still_detected_with_ob_stage(self):
+        stages, result = self._all_pass_with_finalist()
+        stages.append(self._ob_insufficient())
+        stages[2] = _reject("validation_gate", "t_stat=0.45 <= 2.0")
+        report = build_acceptance_report(stages, result, "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+        self.assertIn("t_stat=0.45 <= 2.0", report["reject_reasons"])
+
+    def test_ob_fail_plus_critic_reject_is_still_reject(self):
+        stages, result = self._all_pass_with_finalist()
+        stages.append(self._ob_insufficient())
+        stages[5] = _reject("critic", "costs: t=-3.55 <= 2.0")
+        report = build_acceptance_report(stages, result, "r1")
+        self.assertEqual(report["verdict"], "REJECT")
+        self.assertIn("costs: t=-3.55 <= 2.0", report["reject_reasons"])
 
 
 if __name__ == "__main__":

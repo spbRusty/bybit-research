@@ -32,6 +32,7 @@ class StageStatus(str, Enum):
     STOP = "STOP"
     ERROR = "ERROR"
     SKIPPED = "SKIPPED"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
 
 
 @dataclass
@@ -223,15 +224,22 @@ def stage_ob_feature_validation(
 ) -> StageResult:
     """Per-feature coverage gate for whitelisted OB features.
 
-    Признак непригоден (ineligible), если доля валидных наблюдений ниже
-    min_feature_coverage или валидных наблюдений меньше min_feature_valid_events.
+    Coverage считается ТОЛЬКО по событиям внутри окна доступности OB-данных
+    [ob_ts_min_ms, ob_ts_max_ms] (фактические timestamp сырых снапшотов,
+    проставляемые _process_symbol). Пропуски внутри окна остаются в
+    знаменателе. INSUFFICIENT_DATA: границы окна отсутствуют/пусты, событий
+    в окне меньше min_feature_valid_events либо coverage признака
+    < min_feature_coverage — данных по OB-признаку недостаточно для осмысленной
+    оценки; это не REJECT качества данных и не REJECT research в целом.
+
     Пороги не произвольны, а зеркалят существующие правила проекта:
       - min_feature_coverage=0.5 — инверсия правила stage_feature_validation
         "null_pct > 50 => warning" (валидных наблюдений должно быть >= 50%);
       - min_feature_valid_events=100 — min_events из research.toml.
     Гипотезы, condition которых ссылается на ineligible-признак, отфильтровываются
-    в orchestrator до research (см. _condition_cols), поэтому REJECT стадии не
-    останавливает pipeline — он останавливает OB-гипотезы.
+    в orchestrator до research (см. _condition_cols). Стадия входит в
+    NON_BLOCKING_STAGES: её INSUFFICIENT_DATA не влияет на вердикт research —
+    non-OB гипотезы проходят обычные discovery→validation→OOS→Critic гейты.
     """
     cfg = config or load_toml("ob_hypothesis_rules.toml")
     run_id = _make_run_id()
@@ -253,6 +261,54 @@ def stage_ob_feature_validation(
             run_id=run_id, config_hash=compute_config_hash(), metrics=metrics,
         )
 
+    bound_cols = [c for c in ("ob_ts_min_ms", "ob_ts_max_ms") if c in events.columns]
+    has_bounds = (
+        len(bound_cols) == 2
+        and "open_time" in events.columns
+        and any(events[c].is_not_null().any() for c in bound_cols)
+    )
+
+    if not has_bounds:
+        ineligible = list(present)
+        metrics["ob_window_bounds"] = False
+        metrics["n_events_in_window"] = 0
+        metrics["n_events_out_of_window"] = events.height
+        metrics["coverage"] = {c: 0.0 for c in whitelist}
+        metrics["valid_events"] = {c: 0 for c in whitelist}
+        metrics["ineligible_features"] = ineligible
+        return StageResult(
+            stage="ob_feature_validation", status=StageStatus.INSUFFICIENT_DATA,
+            run_id=run_id, config_hash=compute_config_hash(), metrics=metrics,
+            errors=[f"{c}: no OB window bounds (ob_ts_min_ms/ob_ts_max_ms absent or null)"
+                    for c in ineligible],
+        )
+
+    event_ts = events["open_time"].cast(pl.Datetime("ms")).cast(pl.Int64)
+    ts_min = events["ob_ts_min_ms"].min()
+    ts_max = events["ob_ts_max_ms"].max()
+    in_window = (
+        (event_ts >= ts_min) & (event_ts <= ts_max)
+    ).fill_null(False)
+    n_in_window = int(in_window.sum())
+    n_out_of_window = events.height - n_in_window
+    metrics["ob_window_bounds"] = True
+    metrics["ob_window"] = {"ts_min_ms": int(ts_min), "ts_max_ms": int(ts_max)}
+    # ponytail: окно = глобальный [min,max] по всем символам; per-symbol окна,
+    # если разбавление coverage символами без OB внутри чужого окна станет заметно.
+    metrics["n_events_in_window"] = n_in_window
+    metrics["n_events_out_of_window"] = n_out_of_window
+
+    if n_in_window < min_valid:
+        ineligible = list(present)
+        metrics["coverage"] = {c: 0.0 for c in whitelist}
+        metrics["valid_events"] = {c: 0 for c in whitelist}
+        metrics["ineligible_features"] = ineligible
+        return StageResult(
+            stage="ob_feature_validation", status=StageStatus.INSUFFICIENT_DATA,
+            run_id=run_id, config_hash=compute_config_hash(), metrics=metrics,
+            errors=[f"events_in_window={n_in_window} < min_feature_valid_events={min_valid}"],
+        )
+
     coverage: dict = {}
     valid_events: dict = {}
     ineligible: list[str] = []
@@ -262,20 +318,20 @@ def stage_ob_feature_validation(
             coverage[c] = 0.0
             valid_events[c] = 0
         else:
-            n_valid = int(events[c].is_not_null().sum())
+            n_valid = int((events[c].is_not_null() & in_window).sum())
             valid_events[c] = n_valid
-            coverage[c] = round(n_valid / events.height, 4)
+            coverage[c] = round(n_valid / n_in_window, 4)
         if coverage[c] < min_cov or valid_events[c] < min_valid:
             ineligible.append(c)
             errors.append(
                 f"{c}: coverage={coverage[c]:.2%} valid_events={valid_events[c]} "
-                f"< min(coverage={min_cov:.0%}, valid_events={min_valid})"
+                f"in_window={n_in_window} < min(coverage={min_cov:.0%}, valid_events={min_valid})"
             )
     metrics["coverage"] = coverage
     metrics["valid_events"] = valid_events
     metrics["ineligible_features"] = ineligible
 
-    status = StageStatus.REJECT if ineligible else StageStatus.PASS
+    status = StageStatus.INSUFFICIENT_DATA if ineligible else StageStatus.PASS
     return StageResult(
         stage="ob_feature_validation", status=status, run_id=run_id,
         config_hash=compute_config_hash(), metrics=metrics, errors=errors,
@@ -458,10 +514,17 @@ def stage_parameter_freeze(
 ALWAYS_REQUIRED = {"data_validation", "feature_validation", "critic", "parameter_freeze"}
 CANDIDATE_REQUIRED = {"validation_gate", "oos_gate"}
 
+# Стадии, блокирующие только свои гипотезы, а не весь research:
+# ob_feature_validation при coverage<50% помечает OB-фичи ineligible, и orchestrator
+# отфильтровывает OB-гипотезы по metrics["ineligible_features"] до discovery;
+# недостаток OB-данных не должен давать REJECT всему research.
+NON_BLOCKING_STAGES = {"ob_feature_validation"}
+
 _VERDICT_PRIORITY = {
     "ERROR": 0,
     "STOP": 1,
     "REJECT": 2,
+    "INSUFFICIENT_DATA": 2,
     "NO_CANDIDATE": 3,
     "PASS": 4,
 }
@@ -479,6 +542,8 @@ def build_acceptance_report(
         present_stages.add(s.stage)
         if s.status == StageStatus.SKIPPED:
             continue
+        if s.stage in NON_BLOCKING_STAGES:
+            continue
         if not s.passed:
             reject_reasons.extend(s.errors)
 
@@ -490,13 +555,22 @@ def build_acceptance_report(
         if req not in present_stages:
             present_errors.append(f"missing required stage: {req}")
     if has_candidates:
+        val_passed = any(
+            s.stage == "validation_gate" and s.passed for s in stages
+        )
         for req in CANDIDATE_REQUIRED:
             if req not in present_stages:
+                # oos_gate штатно не выполняется, если ни один кандидат
+                # не прошёл validation_gate (orchestrator: oos только для passed_val)
+                if req == "oos_gate" and not val_passed:
+                    continue
                 present_errors.append(f"missing required stage: {req}")
 
     worst = "PASS"
     for s in stages:
         if s.status == StageStatus.SKIPPED:
+            continue
+        if s.stage in NON_BLOCKING_STAGES:
             continue
         if not s.passed:
             sv = s.status.value
