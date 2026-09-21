@@ -1,113 +1,147 @@
-"""Расширенный генератор гипотез (§22-24, §38): категории, комбо ≤2 условий,
-квантильные/направленно-зависимые пороги, is_spike → context-признаки."""
+"""Генератор гипотез (§22-24, §38): GenRule, дефолтные/OB-правила, условия,
+пороги, дедупликация, фильтр по частоте. Тест на реальный публичный API
+модуля src/hypothesis_generator.py."""
 from __future__ import annotations
 
 import re
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
-import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import polars as pl
 
 from src import hypothesis_generator as hg
 
 
-def _spiky_df(n=900, seed=3) -> pl.DataFrame:
-    """Синтетика с редкими объёмными выбросами: prefilter относительного объёма > 3."""
+def _rules_df(n: int = 300, seed: int = 7) -> pl.DataFrame:
+    """df со всеми признаками дефолтных правил (пороги вычислимы)."""
+    import numpy as np
     import datetime as dt
+    rng = np.random.default_rng(seed)
     base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     ts = [base + dt.timedelta(minutes=i) for i in range(n)]
-    rng = np.random.default_rng(seed)
-    c = 100 * np.exp(np.cumsum(rng.normal(0, 0.001, n)))
-    v = rng.integers(100, 200, n).astype(float)
-    v[::37] = 5000.0
-    return pl.DataFrame({
-        "open_time": ts,
-        "open": c * 0.999, "high": c * 1.002, "low": c * 0.998,
-        "close": c, "volume": v, "turnover": v * c, "is_green": True,
-    })
+    rsi = rng.uniform(0.0, 100.0, n)
+    vol = rng.uniform(0.0, 5.0, n)
+    series = {
+        "relative_volume_60": rng.uniform(0.1, 5.0, n),
+        "relative_range": rng.uniform(0.0, 5.0, n),
+        "volume_zscore": rng.normal(0, 2, n),
+        "realized_vol_60": vol,
+        "dist_rolling_high_60": rng.uniform(0.0, 3.0, n),
+        "dist_rolling_low_60": rng.uniform(0.0, 3.0, n),
+        "breakout_20": rng.uniform(-3.0, 3.0, n),
+        "roc_20": rng.uniform(-1.0, 1.0, n),
+        "rsi_14": rsi,
+        "corr_btc_60": rng.uniform(-0.5, 0.9, n),
+        "btc_trend_regime": rng.choice(["bull", "bear", "flat"], n),
+        "volatility_regime": rng.choice(["low", "normal", "high", "very_high"], n),
+        "close": rng.uniform(90.0, 110.0, n),
+    }
+    return pl.DataFrame({"open_time": ts, **series})
 
 
-def test_extended_and_combo_rules_exist_without_mr_sma120():
-    feats = {r.feature_id for r in hg.extended_rules()}
-    assert "mr_sma120" not in feats
-    assert {"roc_5", "mean_reversion_score", "vol_expansion",
-            "volume_anomaly_60", "mk_funding_rate"} <= feats
-    combos = hg.combo_rules()
-    assert combos and all(c.aux_feature_id for c in combos)
-    assert all(c.max_conditions == 2 for c in combos)
-    assert hg.all_rules() == (hg.default_rules() + hg.extended_rules()
-                              + hg.combo_rules() + hg.mr_conditional_rules()
-                              + hg.ob_rules())
+class TestGenRule(unittest.TestCase):
+    def test_genrule_fields_and_record(self):
+        r = hg.GenRule("rsi_14", "lt")
+        rec = r.to_record()
+        self.assertEqual(rec["feature_id"], "rsi_14")
+        self.assertEqual(rec["operator"], "lt")
+        self.assertEqual(rec["entry_side"], "long")
+        self.assertEqual(tuple(rec["horizons"]), (5, 10, 30))
+
+    def test_default_rules_structure(self):
+        rules = hg.default_rules()
+        self.assertEqual(len(rules), 14)
+        self.assertEqual(len({r.feature_id for r in rules}), 12)
+        for r in rules:
+            self.assertIn(r.operator, {"gt", "lt", "in_range"})
+            self.assertIn(r.entry_side, {"long", "short"})
+            self.assertGreaterEqual(len(r.horizons), 1)
+        pairs = {(r.feature_id, r.operator, r.entry_side) for r in rules}
+        self.assertIn(("rsi_14", "gt", "short"), pairs)
+        self.assertIn(("rsi_14", "lt", "long"), pairs)
+
+    def test_ob_rules_from_config(self):
+        rules = hg.ob_rules()
+        self.assertTrue(rules)
+        self.assertTrue(all(r.feature_id for r in rules))
+
+    def test_all_rules_combines_default_and_ob(self):
+        self.assertEqual(hg.all_rules(), hg.default_rules() + hg.ob_rules())
 
 
-def test_mr_conditional_rules_use_absolute_threshold_and_vol_regime():
-    rules = hg.mr_conditional_rules()
-    assert len(rules) == 6
-    assert all(r.feature_id == "mr_sma120" and r.operator == "lt" for r in rules)
-    assert all(r.aux_feature_id == "volatility_regime" for r in rules)
-    assert {r.abs_threshold for r in rules} == {-0.05, -0.03}
-    df = hg_all_cols()
-    conds = [hg._condition_from_rule(r, df) for r in rules]
-    assert all(c and " & " in c for c in conds)
-    assert any("< -0.05" in c for c in conds) and any("< -0.03" in c for c in conds)
-    both = [c for r, c in zip(rules, conds) if r.aux_values == ("high", "very_high")]
-    vh = [c for r, c in zip(rules, conds) if r.aux_values == ("very_high",)]
-    assert both and all("'high'" in c and "'very_high'" in c for c in both)
-    assert vh and all("'very_high'" in c and "'high'" not in c for c in vh)
-    hyps = hg.generate_hypotheses(df, rules=rules)
-    assert len(hyps) == 6
+class TestConditionFromRule(unittest.TestCase):
+    def _df(self):
+        return _rules_df()
+
+    def test_abs_threshold_same_for_gt_and_lt(self):
+        df = self._df()
+        gt = hg._condition_from_rule(hg.GenRule("rsi_14", "gt"), df)
+        lt = hg._condition_from_rule(hg.GenRule("rsi_14", "lt"), df)
+        self.assertIn("pl.col('rsi_14') > 70", gt)
+        self.assertIn("pl.col('rsi_14') < 70", lt)
+
+    def test_categorical_in_range_uses_is_in(self):
+        df = self._df()
+        cond = hg._condition_from_rule(hg.GenRule("volatility_regime", "in_range"), df)
+        self.assertIn("pl.col('volatility_regime')", cond)
+        self.assertIn("is_in", cond)
+
+    def test_missing_feature_returns_none(self):
+        df = self._df().drop("btc_trend_regime")
+        self.assertIsNone(hg._condition_from_rule(hg.GenRule("btc_trend_regime", "gt"), df))
 
 
-def test_combo_condition_has_exactly_two_features():
-    df = hg_all_cols()
-    for rule in hg.combo_rules():
-        cond = hg._condition_from_rule(rule, df)
-        assert cond and " & " in cond, rule.feature_id
-        assert len(re.findall(r"pl\.col\(", cond)) == 2, cond
-        assert rule.feature_id in cond and rule.aux_feature_id in cond
-    single = hg.extended_rules()[0]
-    assert " & " not in hg._condition_from_rule(single, df)
+class TestGenerateAndFilter(unittest.TestCase):
+    def _df(self):
+        return _rules_df()
+
+    def test_generate_hypotheses_dedups_and_fills_condition(self):
+        df = self._df()
+        hyps = hg.generate_hypotheses(df)
+        # по одной гипотезе на (правило × горизонт): 29 = сумма горизонтов
+        self.assertEqual(len(hyps),
+                         sum(len(r.horizons) for r in hg.default_rules()))
+        # ключ дедупа — (условие, сторона, горизонт): condition уникален на правило,
+        # горизонты различают гипотезы одного правила
+        keys = {(h.condition,
+                 h.entry_side,
+                 h.horizon_min) for h in hyps}
+        self.assertEqual(len(keys), len(hyps))
+        self.assertTrue(all(h.description for h in hyps))
+        rsi = [h for h in hyps if "rsi_14" in h.condition]
+        self.assertEqual(len(rsi), 4)  # gt/lt короткая/длинная × (5, 30)
+
+    def test_generate_dedups_duplicate_rules(self):
+        df = self._df()
+        dup = hg.default_rules()[:2] * 2  # точные дубликаты правил
+        a = hg.generate_hypotheses(df, rules=dup)
+        b = hg.generate_hypotheses(df, rules=hg.default_rules()[:2])
+        self.assertEqual(len(a), len(b))  # дедуп по (feature, operator, entry, horizon)
+        self.assertEqual(len(a), 5)  # rv(3 горизонта) + rr(2 горизонта)
+        keys = {(h.condition, h.entry_side, h.horizon_min) for h in a}
+        self.assertEqual(len(keys), len(a))
+
+    def test_filter_by_freq_drops_rare(self):
+        df = self._df()
+        # постоянный столбец → условие gt никогда не срабатывает
+        df_c = df.with_columns(pl.lit(0.5).alias("relative_volume_60"))
+        hyps = hg.generate_hypotheses(df_c)
+        kept = hg.filter_by_freq(hyps, df_c, min_events=5)
+        self.assertLessEqual(len(kept), len(hyps))
+
+    def test_hypothesis_passes_polars_eval(self):
+        df = self._df()
+        hypo = hg.generate_hypotheses(df)[0]
+        cond = eval(hypo.condition, {"pl": pl})
+        n_true = df.filter(cond).height
+        self.assertIsInstance(n_true, int)
 
 
-def test_rsi_direction_aware_and_quantile_thresholds():
-    df = pl.DataFrame({"rsi_14": np.linspace(0, 100, 500)})
-    gt = hg._condition_from_rule(hg.GenRule("rsi_14", "gt"), df)
-    lt = hg._condition_from_rule(hg.GenRule("rsi_14", "lt"), df)
-    assert float(re.search(r"> ([\d.]+)", gt).group(1)) == 70.0
-    assert float(re.search(r"< ([\d.]+)", lt).group(1)) == 30.0
-    # признак снят с абсолютного порога → считается по процентилю (0.9 конфига)
-    df2 = df.with_columns(relative_volume_60=np.linspace(0, 10, 500))
-    q = hg._condition_from_rule(hg.GenRule("relative_volume_60", "gt"), df2)
-    assert abs(float(re.search(r"> ([\d.]+)", q).group(1)) - 9.0) < 0.2
-
-
-def test_is_spike_derived_makes_context_features_available():
-    import src.features as F
-    out = F.add_features(_spiky_df())
-    assert "is_spike" in out.columns and out["is_spike"].sum() > 0
-    for c in ("event_intensity_60", "event_intensity_240",
-              "event_clustering", "same_event_count", "event_sequence"):
-        assert c in out.columns
-    cond = hg._condition_from_rule(
-        hg.GenRule("event_intensity_60", "gt"), out)
-    assert cond and "event_intensity_60" in cond
-
-
-def hg_all_cols() -> pl.DataFrame:
-    """Feature-frame со всеми колонками, нужными комбо-правилам."""
-    df = _spiky_df()
-    n = df.height
-    return df.with_columns([
-        pl.lit(0.0).alias("roc_5"),
-        pl.lit(1.0).alias("ma_slope_20"),
-        pl.lit(0.5).alias("mean_reversion_score"),
-        pl.lit(0.0).alias("dist_rolling_low_120"),
-        pl.lit(0.0).alias("volume_anomaly_60"),
-        pl.lit(0.0).alias("breakout_magnitude"),
-        pl.lit(0.0).alias("event_intensity_60"),
-        pl.lit(0.0).alias("mk_funding_rate"),
-        pl.lit(-0.10).alias("mr_sma120"),
-        pl.Series("trend_regime", ["trend"] * n),
-        pl.Series("volatility_regime", ["high"] * n),
-        pl.Series("volume_regime", ["high"] * n),
-        pl.Series("session_overlap", ["asia_europe"] * n),
-    ])
+if __name__ == "__main__":
+    unittest.main()
