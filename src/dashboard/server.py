@@ -128,6 +128,11 @@ def api_research_gate():
     return JSONResponse(collectors.get_research_gate())
 
 
+@app.get("/api/research-cycle")
+def api_research_cycle():
+    return JSONResponse(collectors.get_research_cycle())
+
+
 @app.get("/api/alerts")
 def api_alerts():
     return JSONResponse(collectors.get_alerts())
@@ -142,7 +147,7 @@ def api_shadow_paper():
 async def api_stream():
     from config.settings import LOGS_DIR, ROOT
     async def event_gen():
-        log_path = LOGS_DIR / "orchestrator.log"
+        log_path = LOGS_DIR / "research_cycle.log"
         collector_log = ROOT / "collector" / "logs" / "marketdata.log"
         last_pos = 0
         last_collector_pos = 0

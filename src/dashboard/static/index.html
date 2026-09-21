@@ -61,6 +61,12 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 <div class="sub" id="rp-reason"></div>
 </div>
 
+<!-- ═══════ RESEARCH → PAPER ═══════ -->
+<div class="card" style="margin-bottom:8px">
+<h2>Research → Paper</h2>
+<div id="rc-content">Loading...</div>
+</div>
+
 <!-- ═══════ LIVE DATA ═══════ -->
 <div class="card" style="margin-bottom:8px">
 <h2>Live Data</h2>
@@ -453,7 +459,7 @@ async function renderStatus() {
 async function renderLogsPoll() {
   const d = await fetchJSON('/logs?n=20');
   if (!d) return;
-  const all = [...(d.orchestrator || []).slice(-8), ...(d.collector || []).slice(-5)];
+  const all = [...(d.research || []).slice(-8), ...(d.collector || []).slice(-5)];
   const text = all.join('\n') || 'No logs';
   setIf('log-content', text);
 }
@@ -601,7 +607,7 @@ async function renderSysStatus() {
     else if (p.status === 'STOPPED') { tag = 'STOPPED'; cls = 'tag-reject'; }
     else if (p.status === 'RUNNING') { tag = 'RUNNING'; cls = 'tag-pass'; }
     else { tag = 'UNKNOWN'; cls = 'tag-na'; }
-    setIf('sys-paper', `<span class="tag ${cls}">${tag}</span>${p.status_reason ? `<div class="sub">${p.status_reason}</div>` : ''}`);
+    setIf('sys-paper', `<span class="tag ${cls}">${tag}</span>${p.hypothesis_id ? `<div class="sub">Hypothesis: <span class="mono">${p.hypothesis_id}</span></div>` : ''}${p.status_reason ? `<div class="sub">${p.status_reason}</div>` : ''}`);
   }
 }
 
@@ -649,6 +655,39 @@ async function renderResearchProgress() {
   } else {
     setIf('rp-gate', ''); setIf('rp-state', ''); setIf('rp-reason', '');
   }
+}
+
+// ═══════ 20b. Research Cycle → Paper ═══════
+async function renderResearchCycle() {
+  const d = await fetchJSON('/research-cycle');
+  if (!d) { setIf('rc-content', '<span class="sub">No data</span>'); return; }
+  const st = d.state || 'UNKNOWN';
+  const stCls = st === 'PASS_PENDING_PAPER' ? 'tag-pass' : st === 'STOPPED' ? 'tag-reject' : 'tag-na';
+  let html = `<div><span class="tag ${stCls}">${st}</span> <span class="sub">cycle ${(d.cycle_id || '—')} · budget ${d.budget_used || 0}/${d.budget_max || '—'}</span></div>`;
+  if (d.experiment) {
+    const e = d.experiment;
+    html += `<div class="sub">Experiment: <span class="mono">${e.experiment_id || '—'}</span> · ${e.mode || '—'} · ${e.final_verdict || e.status || '—'}${e.n_hypotheses ? ` · ${e.n_hypotheses} hyp` : ''}</div>`;
+    if (e.diagnosis) html += `<div class="sub">Diagnosis: ${e.diagnosis}</div>`;
+  }
+  if (d.finalist) {
+    html += `<div class="sub">Candidate: <span class="mono">${d.finalist.hypothesis_id}</span> · ${d.finalist.entry_side || ''} @ ${d.finalist.horizon_min || '?'}m</div>`;
+  } else if (d.verdict) {
+    html += `<div class="sub">Last verdict: ${d.verdict}</div>`;
+  }
+  const p = d.paper || {};
+  if (p.hypothesis_id) {
+    const prov = p.provenance || {};
+    html += `<div style="margin-top:4px"><span class="tag ${p.mode === 'VALIDATED' ? 'tag-pass' : 'tag-na'}">PAPER ${p.mode || '—'}</span> <span class="mono">${p.hypothesis_id}</span></div>`;
+    if (p.trade_count > 0) {
+      html += `<div class="sub">Balance ${(p.balance || 0).toFixed(2)} · PnL ${(p.realized_pnl || 0).toFixed(2)} (${p.pnl_pct != null ? p.pnl_pct.toFixed(2) : '0.00'}%) · ${p.trade_count} trades</div>`;
+    } else {
+      html += `<div class="sub">Started ${fmt(p.started_at)} · equity ${(p.balance || 0).toFixed(2)} · 0 trades</div>`;
+    }
+    if (prov.experiment_id) html += `<div class="sub">Bound to ${prov.experiment_id} (cycle ${prov.cycle_id || '—'})</div>`;
+  } else {
+    html += '<div class="sub" style="margin-top:4px">No paper launched yet</div>';
+  }
+  setIf('rc-content', html);
 }
 
 // ═══════ 20. Live Data ═══════
@@ -721,7 +760,7 @@ async function refreshAll() {
     renderInstruments(), renderPipeline(), renderData(), renderStreams(),
     renderSignals(), renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll(),
     renderAlerts(), renderOBCollector(), renderCandleCollector(), renderDataQuality(), renderResearchConclusion(),
-    renderSysStatus(), renderResearchProgress(), renderLiveData()
+    renderSysStatus(), renderResearchProgress(), renderResearchCycle(), renderLiveData()
   ]);
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
   countdown = 3;

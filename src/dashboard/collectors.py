@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -130,6 +131,10 @@ def get_paper() -> dict:
         "open_positions": state.get("open_positions", []) if state else [],
         "trades_count": len(all_trades),
         "trades": all_trades[-10:] if all_trades else [],
+        "mode": state.get("mode") if state else None,
+        "hypothesis_id": state.get("hypothesis_id") if state else None,
+        "started_at": state.get("started_at") if state else None,
+        "provenance": state.get("provenance", {}) if state else {},
     }
 
 
@@ -630,8 +635,7 @@ def get_captures() -> dict:
 
 def get_system_status() -> dict:
     log_files = {
-        "orchestrator": LOGS_DIR / "orchestrator.log",
-        "research": LOGS_DIR / "research_timer.log",
+        "research": LOGS_DIR / "research_cycle.log",
     }
     collector_log = ROOT / "collector" / "logs" / "marketdata.log"
 
@@ -854,68 +858,75 @@ def get_candle_collector() -> dict:
 # ─── 17. Data Quality ──────────────────────────────────────────────
 
 def get_data_quality() -> dict:
-    """Data quality metrics from orderbook and kline data."""
-    quality = {
-        "orderbook": {"ok": 0, "stale": 0, "gap": 0, "missing": 0},
-        "klines": {"ok": 0, "stale": 0, "missing": 0},
-    }
-    
-    # Check OB quality from metrics
-    metrics_path = MARKET_DATA_DIR / "orderbook" / "reconstructed" / "_metrics.jsonl"
-    ob_ok = 0
-    ob_gap = 0
-    ob_stale = 0
-    ob_missing = 0
-    if metrics_path.exists():
-        try:
-            # Последняя (текущая) запись на символ: суммарный счётчик по историческим строкам
-            # завышает gap делистингнутыми символами (updates_received == 0).
-            by_symbol: dict[str, dict] = {}
-            with open(metrics_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        e = json.loads(line)
-                        by_symbol[e.get("symbol", "?")] = e
-                    except json.JSONDecodeError:
-                        continue
-        except Exception:
-            pass
-        for e in by_symbol.values():
-            if e.get("is_valid"):
-                ob_ok += 1
-            elif e.get("updates_received", 0) > 0:
-                ob_gap += 1
-            else:
-                ob_missing += 1
-            if e.get("invalid_state_duration_secs", 0) > 60:
-                ob_stale += 1
-        quality["orderbook"] = {"ok": ob_ok, "stale": ob_stale, "gap": ob_gap, "missing": ob_missing}
-    
-    for cat in ("linear", "spot"):
-        cat_dir = RAW_KLINES_DIR / cat
-        if not cat_dir.exists():
-            continue
-        for f in cat_dir.glob("*_1m.parquet"):
+    """Data quality metrics (OB metrics + kline scan, sampled 50/cat, cached 60s)."""
+    def _load():
+        quality = {
+            "orderbook": {"ok": 0, "stale": 0, "gap": 0, "missing": 0},
+            "klines": {"ok": 0, "stale": 0, "missing": 0},
+        }
+
+        # Check OB quality from metrics
+        metrics_path = MARKET_DATA_DIR / "orderbook" / "reconstructed" / "_metrics.jsonl"
+        ob_ok = 0
+        ob_gap = 0
+        ob_stale = 0
+        ob_missing = 0
+        if metrics_path.exists():
             try:
-                df = pl.read_parquet(f, columns=["open_time"])
-                if df.height == 0:
-                    quality["klines"]["missing"] += 1
-                    continue
-                last_ts = df["open_time"].max()
-                lag = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds() / 60
-                if lag < 60:
-                    quality["klines"]["ok"] += 1
-                elif lag < 60 * 24:
-                    quality["klines"]["stale"] += 1
-                else:
-                    quality["klines"]["missing"] += 1
+                # Только хвост файла: последняя запись на символ (полный файл — 3.4M строк)
+                by_symbol: dict[str, dict] = {}
+                size = metrics_path.stat().st_size
+                tail_bytes = 2 * 1024 * 1024
+                with open(metrics_path) as f:
+                    f.seek(max(0, size - tail_bytes))
+                    f.readline()  # отбросить неполную первую строку
+                    for line in deque(f, maxlen=20000):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            e = json.loads(line)
+                            by_symbol[e.get("symbol", "?")] = e
+                        except json.JSONDecodeError:
+                            continue
             except Exception:
-                quality["klines"]["missing"] += 1
-    
-    return quality
+                pass
+            for e in by_symbol.values():
+                if e.get("is_valid"):
+                    ob_ok += 1
+                elif e.get("updates_received", 0) > 0:
+                    ob_gap += 1
+                else:
+                    ob_missing += 1
+                if e.get("invalid_state_duration_secs", 0) > 60:
+                    ob_stale += 1
+            quality["orderbook"] = {"ok": ob_ok, "stale": ob_stale, "gap": ob_gap, "missing": ob_missing}
+
+        for cat in ("linear", "spot"):
+            cat_dir = RAW_KLINES_DIR / cat
+            if not cat_dir.exists():
+                continue
+            files = sorted(cat_dir.glob("*_1m.parquet"),
+                           key=lambda f: f.stat().st_mtime, reverse=True)[:50]
+            for f in files:
+                try:
+                    df = pl.scan_parquet(f).select(pl.col("open_time")).collect()
+                    if df.height == 0:
+                        quality["klines"]["missing"] += 1
+                        continue
+                    last_ts = df["open_time"].max()
+                    lag = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds() / 60
+                    if lag < 60:
+                        quality["klines"]["ok"] += 1
+                    elif lag < 60 * 24:
+                        quality["klines"]["stale"] += 1
+                    else:
+                        quality["klines"]["missing"] += 1
+                except Exception:
+                    quality["klines"]["missing"] += 1
+
+        return quality
+    return _cached("data_quality", 60, _load)
 
 
 # ─── 18. Research Conclusion ───────────────────────────────────────
@@ -970,6 +981,90 @@ def get_research_conclusion() -> dict:
         "finalist": finalist,
         "reject_reasons": reject_reasons[:3],
         "timestamp": report.get("timestamp"),
+    }
+
+
+# ─── 18b. Research Cycle / Paper handoff ──────────────────────────
+
+def get_research_cycle() -> dict:
+    """Frozen-cycle progress + Research→Paper handoff + current paper binding."""
+    ctrl = {}
+    p = RESEARCH_DIR / "controller_state.json"
+    if p.exists():
+        try:
+            ctrl = json.loads(p.read_text())
+        except Exception:
+            ctrl = {}
+
+    frozen = {}
+    fp = RESEARCH_DIR / "frozen_boundary.json"
+    if fp.exists():
+        try:
+            frozen = json.loads(fp.read_text())
+        except Exception:
+            frozen = {}
+
+    experiment = None
+    eid = ctrl.get("last_experiment_id")
+    if eid:
+        ap = RESEARCH_DIR / "experiments" / f"{eid}.json"
+        if ap.exists():
+            try:
+                art = json.loads(ap.read_text())
+                experiment = {
+                    "experiment_id": art.get("experiment_id"),
+                    "mode": art.get("mode"),
+                    "config_hash": art.get("config_hash"),
+                    "status": art.get("status"),
+                    "final_verdict": art.get("final_verdict"),
+                    "diagnosis": art.get("reject_diagnosis"),
+                    "n_hypotheses": len(art.get("hypothesis_specs") or []),
+                }
+            except Exception:
+                experiment = None
+
+    verdict = None
+    finalist = None
+    reports = sorted(RESULTS_DIR.glob("acceptance_*.json"), reverse=True)
+    if reports:
+        try:
+            rep = json.loads(reports[0].read_text())
+            finalist = rep.get("finalist")
+            verdict = rep.get("verdict")
+        except Exception:
+            pass
+
+    ctl_cfg = _load_toml("research_controller.toml")
+    paper = get_paper()
+    return {
+        "state": ctrl.get("state"),
+        "cycle_id": ctrl.get("cycle_id"),
+        "frozen": {
+            "config_hash": frozen.get("config_hash"),
+            "klines_max": frozen.get("klines_max"),
+            "frozen_at_utc": frozen.get("frozen_at_utc"),
+        } if frozen else None,
+        "budget_used": ctrl.get("budget_used", 0),
+        "budget_max": int(ctl_cfg.get("budget", {}).get(
+            "max_experiments_per_boundary", 12)),
+        "last_mode": ctrl.get("last_mode"),
+        "next_mode": (ctrl.get("next_selection") or {}).get("mode"),
+        "pass_pending": ctrl.get("pass_pending"),
+        "paper_handoff": ctrl.get("paper_handoff"),
+        "experiment": experiment,
+        "verdict": verdict,
+        "finalist": finalist,
+        "paper": {
+            "mode": paper.get("mode"),
+            "hypothesis_id": paper.get("hypothesis_id"),
+            "status": paper.get("status"),
+            "balance": paper.get("balance"),
+            "realized_pnl": paper.get("realized_pnl"),
+            "pnl_pct": paper.get("pnl_pct"),
+            "trade_count": paper.get("trade_count"),
+            "started_at": paper.get("started_at"),
+            "provenance": paper.get("provenance"),
+        },
     }
 
 
@@ -1134,4 +1229,20 @@ def get_shadow_paper() -> dict:
         "by_hypothesis": by_hyp,
         "total_trades": len(shadow_trades) + len(validated_trades),
         "realized_pnl": (shadow_state or {}).get("realized_pnl", 0.0),
+    }
+
+
+def get_logs(n: int = 30) -> dict:
+    """Последние N строк логов: research-цикл, orchestrator, collector."""
+    def _tail(path: Path) -> list[str]:
+        if not path.exists():
+            return []
+        try:
+            return path.read_text(errors="replace").splitlines()[-n:]
+        except Exception:
+            return []
+
+    return {
+        "research": _tail(LOGS_DIR / "research_cycle.log"),
+        "collector": _tail(ROOT / "collector" / "logs" / "marketdata.log"),
     }

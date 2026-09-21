@@ -356,7 +356,12 @@ class TestStatusBlocks(unittest.TestCase):
 
     def test_render_functions_registered_in_refresh_all(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
-        self.assertIn("renderSysStatus(), renderResearchProgress(), renderLiveData()", html)
+        self.assertIn("renderSysStatus(), renderResearchProgress(), renderResearchCycle(), renderLiveData()", html)
+
+    def test_research_cycle_block_present(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn('id="rc-content"', html)
+        self.assertIn("renderResearchCycle()", html)
 
     def test_stage_lookup_uses_api_field_name(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
