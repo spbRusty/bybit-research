@@ -1,0 +1,101 @@
+# Research Controller — бюджеты, разрешённые оси поиска, mapping диагноз→режим.
+# См. docs/research_controller_design.md §2, §3, §4.
+#
+# Контроллер меняет ТОЛЬКО значения ниже. Приёмочные пороги (research.toml:
+# min_t_stat, bh_q, min_events, cost_grid, sample_periods) не дублируются и не
+# меняются — иначе нарушение инварианта 11.
+
+[budget]
+max_experiments_per_boundary = 12  # экспериментов на dataset boundary (cycle)
+max_experiments_per_family = 4     # экспериментов на семью гипотез в cycle
+max_tests_cumulative = 600         # кумулятивно оценённых гипотез на cycle
+
+[families]
+# Порядок перебора для FAMILY_SWITCH.
+order = ["baseline", "generator", "mr", "ob"]
+
+[horizons]
+# Только существующие таргеты из features.toml future_horizons_min.
+default = [5, 10, 30]
+
+[diagnosis]
+# Диагноз -> предпочтительный режим (первый) и запасные (остальные).
+no_signal = ["FAMILY_SWITCH", "THRESHOLD_SWEEP"]
+weak_signal = ["THRESHOLD_SWEEP", "CONDITIONAL"]
+validation_fail = ["THRESHOLD_SWEEP", "REGIME_SWEEP"]
+oos_fail = ["HORIZON_SWEEP", "FAMILY_SWITCH"]
+unstable = ["REGIME_SWEEP", "CONDITIONAL"]
+concentrated = ["CONDITIONAL", "REGIME_SWEEP"]
+cost_sensitive = ["REGIME_SWEEP", "CONDITIONAL"]
+no_candidates = ["THRESHOLD_SWEEP", "FAMILY_SWITCH"]
+infra = []
+
+# --- Ось threshold: whitelisted признаки и дискретные сетки порогов УСЛОВИЯ ---
+
+[features.relative_volume_60]
+column = "relative_volume_60"
+operator = "gt"
+entry_side = "long"
+thresholds = [2.0, 3.0, 4.0]
+
+[features.relative_range]
+column = "relative_range"
+operator = "gt"
+entry_side = "long"
+thresholds = [2.0, 3.0]
+
+[features.rsi_14_high]
+column = "rsi_14"
+operator = "gt"
+entry_side = "short"
+thresholds = [60.0, 65.0, 70.0, 75.0]
+
+[features.rsi_14_low]
+column = "rsi_14"
+operator = "lt"
+entry_side = "long"
+thresholds = [25.0, 30.0, 35.0, 40.0]
+
+[features.corr_btc_60]
+column = "corr_btc_60"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.3, 0.5]
+
+[features.breakout_20]
+column = "breakout_20"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.5, 1.0]
+
+[features.upper_wick]
+column = "upper_wick"
+operator = "gt"
+entry_side = "short"
+thresholds = [0.002, 0.003]
+
+[features.lower_wick]
+column = "lower_wick"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.002, 0.003]
+
+[mr]
+# MR-семья (FAMILY_SWITCH=mr): условие mr_sma120 < threshold + is_green.
+column = "mr_sma120"
+entry_side = "long"
+thresholds = [-0.01, -0.02, -0.03, -0.05]
+
+# --- Ось regime: AND с режимным фильтром ---
+
+[regimes]
+volatility_high = "pl.col('volatility_regime').is_in(['high', 'very_high'])"
+btc_up = "pl.col('btc_trend_regime') > 0"
+btc_down = "pl.col('btc_trend_regime') < 0"
+
+# --- Ось combination: второе условие для CONDITIONAL (AND, <= 2 условий) ---
+
+[combinations]
+volatility_high = "pl.col('volatility_regime').is_in(['high', 'very_high'])"
+btc_up = "pl.col('btc_trend_regime') > 0"
+btc_down = "pl.col('btc_trend_regime') < 0"
