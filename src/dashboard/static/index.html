@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bybit Research Dashboard</title>
+<title>Дашборд исследований Bybit</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--card-sm:8px}
@@ -40,154 +40,154 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </style>
 </head>
 <body>
-<h1><span id="status-dot" class="ok"></span>Bybit Research Dashboard <span class="sub" style="font-weight:normal">| <span id="last-update">—</span> | <span id="timer">3</span>s</span></h1>
+<h1><span id="status-dot" class="ok"></span>Дашборд исследований Bybit <span class="sub" style="font-weight:normal">| <span id="last-update">—</span> | <span id="timer">3</span>с</span></h1>
 
 <!-- ═══════ ALERTS ═══════ -->
 <div id="alerts-bar" style="margin-bottom:8px"></div>
 
 <!-- ═══════ SYSTEM STATUS ═══════ -->
 <div class="grid g3" id="row-sys">
-<div class="card"><h2>Data Collection</h2><div id="sys-data">Loading...</div></div>
-<div class="card"><h2>Research</h2><div id="sys-research">Loading...</div></div>
-<div class="card"><h2>Paper Trading</h2><div id="sys-paper">Loading...</div></div>
+<div class="card"><h2>Сбор данных</h2><div id="sys-data">Загрузка...</div></div>
+<div class="card"><h2>Исследование</h2><div id="sys-research">Загрузка...</div></div>
+<div class="card"><h2>Бумажная торговля</h2><div id="sys-paper">Загрузка...</div></div>
 </div>
 
 <!-- ═══════ RESEARCH CONTROLLER ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Research Controller</h2>
-<div id="rc-state">Loading...</div>
+<h2>Управляющий модуль</h2>
+<div id="rc-state">Загрузка...</div>
 </div>
 
 <!-- ═══════ LAST PIPELINE RUN ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Last Pipeline Run</h2>
+<h2>Последний прогон пайплайна</h2>
 <div class="pipe" id="pipeline-flow"></div>
-<table id="t-pipeline" style="margin-top:4px"><tr><td class="sub">Loading...</td></tr></table>
+<table id="t-pipeline" style="margin-top:4px"><tr><td class="sub">Загрузка...</td></tr></table>
 </div>
 
 <!-- ═══════ RESEARCH PROGRESS ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Research Progress</h2>
-<div id="rp-state">Loading...</div>
+<h2>Прогресс исследований</h2>
+<div id="rp-state">Загрузка...</div>
 </div>
 
 <!-- ═══════ RESEARCH → PAPER ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Research → Paper</h2>
-<div id="rc-content">Loading...</div>
+<h2>Исследование → Бумага</h2>
+<div id="rc-content">Загрузка...</div>
 </div>
 
 <!-- ═══════ LIVE DATA ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Live Data</h2>
-<div id="ld-rows">Loading...</div>
+<h2>Живые данные</h2>
+<div id="ld-rows">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 1: Paper Wallet ═══════ -->
 <div class="grid g4" id="row-wallet">
-<div class="card g"><span>Paper Trading</span><div class="v" id="p-status">—</div><div class="sub" id="p-reason"></div></div>
-<div class="card g"><span>Balance</span><div class="v" id="p-balance">—</div><div class="sub" id="p-equity-start"></div></div>
+<div class="card g"><span>Бумажная торговля</span><div class="v" id="p-status">—</div><div class="sub" id="p-reason"></div></div>
+<div class="card g"><span>Баланс</span><div class="v" id="p-balance">—</div><div class="sub" id="p-equity-start"></div></div>
 <div class="card g"><span>PnL</span><div class="v" id="p-pnl">—</div><div class="sub" id="p-pnl-pct"></div></div>
-<div class="card g"><span>Win Rate</span><div class="v" id="p-winrate">—</div><div class="sub" id="p-trades"></div></div>
+<div class="card g"><span>Винрейт</span><div class="v" id="p-winrate">—</div><div class="sub" id="p-trades"></div></div>
 </div>
 
 <!-- ═══════ ROW 2: Collectors ═══════ -->
 <div class="grid g2">
 <div class="card">
-<h2>Order Book Collector (Reconstructed)</h2>
-<div id="ob-collector">Loading...</div>
+<h2>Коллектор стакана (реконструкция)</h2>
+<div id="ob-collector">Загрузка...</div>
 </div>
 <div class="card">
-<h2>Candle Collector</h2>
-<div id="candle-collector">Loading...</div>
+<h2>Коллектор свечей</h2>
+<div id="candle-collector">Загрузка...</div>
 </div>
 </div>
 
 <!-- ═══════ ROW 3: Parameters + Costs ═══════ -->
 <div class="grid g3">
 <div class="card">
-<h2>Risk Management</h2>
-<table id="t-risk"><tr><td colspan="2" class="sub">Loading...</td></tr></table>
+<h2>Риск-менеджмент</h2>
+<table id="t-risk"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
 </div>
 <div class="card">
-<h2>Position Sizing</h2>
-<table id="t-sizing"><tr><td colspan="2" class="sub">Loading...</td></tr></table>
+<h2>Размер позиции</h2>
+<table id="t-sizing"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
 </div>
 <div class="card">
-<h2>Trading Costs</h2>
-<table id="t-costs"><tr><td colspan="2" class="sub">Loading...</td></tr></table>
+<h2>Издержки торговли</h2>
+<table id="t-costs"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
 </div>
 </div>
 
 <!-- ═══════ ROW 4: Stakes + Win Rate by Stake + Instrument ═══════ -->
 <div class="grid g3">
 <div class="card">
-<h2>Stake Levels</h2>
-<table id="t-stakes"><tr><td class="sub">Loading...</td></tr></table>
+<h2>Уровни ставки</h2>
+<table id="t-stakes"><tr><td class="sub">Загрузка...</td></tr></table>
 <div class="sub" id="stake-note"></div>
 </div>
 <div class="card">
-<h2>Win Rate by Stake</h2>
-<table id="t-winrate"><tr><td class="sub">Loading...</td></tr></table>
+<h2>Винрейт по ставке</h2>
+<table id="t-winrate"><tr><td class="sub">Загрузка...</td></tr></table>
 </div>
 <div class="card">
-<h2>Instrument Info</h2>
-<div id="instrument-info">Loading...</div>
+<h2>Инструменты</h2>
+<div id="instrument-info">Загрузка...</div>
 </div>
 </div>
 
 <!-- ═══════ ROW 5: Research Conclusion ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Research Conclusion</h2>
-<div id="research-conclusion">Loading...</div>
+<h2>Вывод исследования</h2>
+<div id="research-conclusion">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 6: Data Quality ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Data Quality</h2>
-<div id="data-quality">Loading...</div>
+<h2>Качество данных</h2>
+<div id="data-quality">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 7: Data + Market Streams ═══════ -->
 <div class="grid g2">
 <div class="card">
-<h2>Data Download (Klines)</h2>
-<table id="t-data"><tr><td class="sub">Loading...</td></tr></table>
+<h2>Загрузка свечей (Klines)</h2>
+<table id="t-data"><tr><td class="sub">Загрузка...</td></tr></table>
 </div>
 <div class="card">
-<h2>Legacy Market Data Streams</h2>
-<table id="t-streams"><tr><td class="sub">Loading...</td></tr></table>
+<h2>Legacy-потоки рыночных данных</h2>
+<table id="t-streams"><tr><td class="sub">Загрузка...</td></tr></table>
 </div>
 </div>
 
 <!-- ═══════ ROW 8: Signals + Hypotheses ═══════ -->
 <div class="grid g2">
 <div class="card">
-<h2>Signals / Events</h2>
-<div id="signals-content">Loading...</div>
+<h2>Сигналы / События</h2>
+<div id="signals-content">Загрузка...</div>
 </div>
 <div class="card">
-<h2>Hypotheses &amp; Research</h2>
-<div id="hyp-content">Loading...</div>
+<h2>Гипотезы и исследования</h2>
+<div id="hyp-content">Загрузка...</div>
 </div>
 </div>
 
 <!-- ═══════ ROW 9: Orderbook Captures ═══════ -->
 <div class="grid g2">
 <div class="card">
-<h2>Event-driven OB Captures</h2>
-<div id="captures-summary">Loading...</div>
+<h2>Захваты стакана по событиям</h2>
+<div id="captures-summary">Загрузка...</div>
 </div>
 <div class="card">
-<h2>Pending Triggers</h2>
-<div id="triggers-list">Loading...</div>
+<h2>Ожидающие триггеры</h2>
+<div id="triggers-list">Загрузка...</div>
 </div>
 </div>
 
 <!-- ═══════ ROW 10: Logs ═══════ -->
 <div class="card" style="margin-bottom:0">
-<h2>Logs</h2>
-<div class="log-box" id="log-content">Loading...</div>
+<h2>Логи</h2>
+<div class="log-box" id="log-content">Загрузка...</div>
 </div>
 
 <script>
@@ -201,10 +201,31 @@ function setIf(id, html) {
   _prev[id] = html;
   document.getElementById(id).innerHTML = html;
 }
+const RU = {
+  // статусы пайплайна / контроллера
+  PASS: 'ПРОЙДЕН', REJECT: 'ОТКЛОНЁН', STOP: 'СТОП', STOPPED: 'ОСТАНОВЛЕН',
+  SKIPPED: 'ПРОПУЩЕН', SKIP: 'ПРОПУСТИТЬ', ERROR: 'ОШИБКА', NOT: 'НЕТ', FAILED: 'ПРОВАЛЕН',
+  RUNNING: 'ИДЁТ', LIVE: 'АКТИВЕН', STALE: 'УСТАРЕЛО', OK: 'ОК', GAP: 'ПРОБЕЛ', ERRORS: 'ОШИБКИ',
+  UNKNOWN: 'НЕИЗВЕСТНО', 'NOT READY': 'НЕ ГОТОВО', READY: 'ГОТОВО',
+  BUDGET_EXHAUSTED: 'БЮДЖЕТ ИСЧЕРПАН', WAITING_FOR_NEW_DATA: 'ОЖИДАНИЕ НОВЫХ ДАННЫХ',
+  PASS_PENDING_PAPER: 'ПРОЙДЕН · ЖДЁТ БУМАГИ', 'NO_CANDIDATE': 'НЕТ КАНДИДАТА',
+  'NO DATA': 'НЕТ ДАННЫХ', NOT_AVAILABLE: 'НЕДОСТУПНО',
+  // вывод исследования
+  'VALIDATED EDGE FOUND': 'НАЙДЕНО ПОДТВЕРЖДЁННОЕ ПРЕИМУЩЕСТВО',
+  'NO STATISTICALLY VALIDATED EDGE': 'НЕТ СТАТИСТИЧЕСКИ ПОДТВЕРЖДЁННОГО ПРЕИМУЩЕСТВА',
+  'CANDIDATES REJECTED': 'КАНДИДАТЫ ОТКЛОНЕНЫ',
+  'PIPELINE STOPPED': 'ПАЙПЛАЙН ОСТАНОВЛЕН',
+  VALIDATED: 'ПОДТВЕРЖДЕНА',
+  // названия шагов пайплайна
+  DATA: 'ДАННЫЕ', FEATURES: 'ПРИЗНАКИ', HYPOTHESES: 'ГИПОТЕЗЫ', DISCOVERY: 'ПОИСК',
+  VALIDATION: 'ВАЛИДАЦИЯ', OOS: 'OOS', FREEZE: 'ФИКСАЦИЯ', CRITIC: 'КРИТИК', VERDICT: 'ВЕРДИКТ',
+};
+// Перевод только для показа; сырое значение остаётся для вычислений и CSS-класса.
+function t(v) { return RU[v] || v; }
 function tagHTML(v) {
   if (!v) return '';
   const c = v === 'PASS' ? 'tag-pass' : v === 'REJECT' ? 'tag-reject' : v === 'STOP' ? 'tag-stop' : v === 'ERROR' ? 'tag-error' : v === 'SKIPPED' ? 'tag-skip' : 'tag-na';
-  return `<span class="tag ${c}">${v}</span>`;
+  return `<span class="tag ${c}">${t(v)}</span>`;
 }
 function fmt(ts) {
   if (!ts) return '—';
@@ -222,14 +243,14 @@ async function renderPaper() {
   const d = await fetchJSON('/paper');
   if (!d) return;
   const stClass = d.status === 'RUNNING' ? 'status-ok' : d.status === 'NOT READY' ? 'status-na' : 'status-warn';
-  setIf('p-status', `<span class="${stClass}">${d.status}</span>`);
+  setIf('p-status', `<span class="${stClass}">${t(d.status)}</span>`);
   setIf('p-reason', d.status_reason || '');
   setIf('p-balance', d.balance != null ? money(d.balance) : 'N/A');
-  setIf('p-equity-start', `Start: ${money(d.equity_start)}`);
+  setIf('p-equity-start', `Старт: ${money(d.equity_start)}`);
   setIf('p-pnl', d.realized_pnl != null ? `<span class="${d.realized_pnl >= 0 ? 'status-ok' : 'status-err'}">${d.realized_pnl >= 0 ? '+' : ''}${money(d.realized_pnl)}</span>` : 'N/A');
   setIf('p-pnl-pct', d.pnl_pct != null ? `${d.pnl_pct >= 0 ? '+' : ''}${d.pnl_pct.toFixed(2)}%` : '');
   setIf('p-winrate', d.trade_count > 0 ? `${(d.win_rate * 100).toFixed(1)}%` : 'N/A');
-  setIf('p-trades', `${d.trade_count} trades | PF ${d.profit_factor != null ? d.profit_factor.toFixed(2) : 'N/A'}`);
+  setIf('p-trades', `${d.trade_count} сделок | PF ${d.profit_factor != null ? d.profit_factor.toFixed(2) : 'N/A'}`);
 }
 
 // ═══════ 2. Risk + Sizing + Costs ═══════
@@ -237,30 +258,30 @@ async function renderRisk() {
   const d = await fetchJSON('/risk');
   if (!d) return;
   let h = '';
-  h += `<tr><td>Max risk/trade</td><td>${pct(d.risk_per_trade_pct * 100)} (${money(d.risk_per_trade_usd)})</td></tr>`;
-  h += `<tr><td>Stop (k × vol)</td><td>${d.stop_k_vol}×</td></tr>`;
-  h += `<tr><td>Take (m × stop)</td><td>${d.take_k_stop}×</td></tr>`;
-  h += `<tr><td>Max positions</td><td>${d.max_positions}</td></tr>`;
+  h += `<tr><td>Макс. риск/сделку</td><td>${pct(d.risk_per_trade_pct * 100)} (${money(d.risk_per_trade_usd)})</td></tr>`;
+  h += `<tr><td>Стоп (k × vol)</td><td>${d.stop_k_vol}×</td></tr>`;
+  h += `<tr><td>Тейк (m × стоп)</td><td>${d.take_k_stop}×</td></tr>`;
+  h += `<tr><td>Макс. позиций</td><td>${d.max_positions}</td></tr>`;
   setIf('t-risk', h);
 
   const s = await fetchJSON('/stakes');
   if (!s) return;
   let h2 = '';
-  h2 += `<tr><td>Min stake</td><td>${money(s.min_stake_usdt)}</td></tr>`;
-  h2 += `<tr><td>Current stake</td><td>${money(s.current_stake_usdt)}</td></tr>`;
-  h2 += `<tr><td>Min lot</td><td>${s.min_lot}</td></tr>`;
-  h2 += `<tr><td>Qty step</td><td>${s.qty_step}</td></tr>`;
+  h2 += `<tr><td>Мин. ставка</td><td>${money(s.min_stake_usdt)}</td></tr>`;
+  h2 += `<tr><td>Текущая ставка</td><td>${money(s.current_stake_usdt)}</td></tr>`;
+  h2 += `<tr><td>Мин. лот</td><td>${s.min_lot}</td></tr>`;
+  h2 += `<tr><td>Шаг количества</td><td>${s.qty_step}</td></tr>`;
   setIf('t-sizing', h2);
   setIf('stake-note', s.note || '');
 
   const c = await fetchJSON('/costs');
   if (!c) return;
   let h3 = '';
-  h3 += `<tr><td>Paper fee (round-trip)</td><td>${pct(c.fee_round_trip_pct)}</td></tr>`;
-  h3 += `<tr><td>Paper slippage</td><td>${pct(c.slippage_pct)}</td></tr>`;
-  h3 += `<tr><td>Survival cost</td><td>${c.survival_cost != null ? pct(c.survival_cost * 100) : 'N/A'}</td></tr>`;
+  h3 += `<tr><td>Комиссия бумаги (туда-обратно)</td><td>${pct(c.fee_round_trip_pct)}</td></tr>`;
+  h3 += `<tr><td>Проскальзывание бумаги</td><td>${pct(c.slippage_pct)}</td></tr>`;
+  h3 += `<tr><td>Издержки выживания</td><td>${c.survival_cost != null ? pct(c.survival_cost * 100) : 'N/A'}</td></tr>`;
   if (c.backtest_cost_grid && c.backtest_cost_grid.length) {
-    h3 += `<tr><td>Backtest grid</td><td>${c.backtest_cost_grid.map(v => pct(v * 100)).join(', ')}</td></tr>`;
+    h3 += `<tr><td>Сетка бэктеста</td><td>${c.backtest_cost_grid.map(v => pct(v * 100)).join(', ')}</td></tr>`;
   }
   setIf('t-costs', h3);
 }
@@ -269,7 +290,7 @@ async function renderRisk() {
 async function renderStakes() {
   const s = await fetchJSON('/stakes');
   if (!s) return;
-  let h = '<tr><th>Level</th><th>USDT</th><th>% Bank</th></tr>';
+  let h = '<tr><th>Уровень</th><th>USDT</th><th>% капитала</th></tr>';
   for (const l of s.levels) {
     const isCurrent = l.level === s.current_level;
     h += `<tr${isCurrent ? ' style="font-weight:700"' : ''}><td>${l.level}</td><td>${money(l.stake_usdt)}</td><td>${pct(l.pct_bankroll)}</td></tr>`;
@@ -280,8 +301,8 @@ async function renderStakes() {
 // ═══════ 4. Win Rate by Stake ═══════
 async function renderWinrate() {
   const d = await fetchJSON('/winrate');
-  if (!d || !d.length) { setIf('t-winrate', '<tr><td class="sub">No data</td></tr>'); return; }
-  let h = '<tr><th>Level</th><th>Trades</th><th>Win%</th><th>PnL</th><th>Avg</th></tr>';
+  if (!d || !d.length) { setIf('t-winrate', '<tr><td class="sub">Нет данных</td></tr>'); return; }
+  let h = '<tr><th>Уровень</th><th>Сделки</th><th>Вин%</th><th>PnL</th><th>Среднее</th></tr>';
   for (const r of d) {
     const wr = r.win_rate != null ? r.win_rate.toFixed(1) + '%' : 'N/A';
     const pnl = r.pnl != null ? `<span class="${r.pnl >= 0 ? 'status-ok' : 'status-err'}">${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(4)}</span>` : 'N/A';
@@ -297,10 +318,10 @@ async function renderInstruments() {
   if (!d) return;
   let h = '';
   if (!d.available) {
-    h = `<div class="status-na">NOT AVAILABLE</div>`;
+    h = `<div class="status-na">НЕДОСТУПНО</div>`;
     h += `<div class="sub">${d.reason}</div>`;
-    h += `<div class="sub" style="margin-top:4px">Symbols in list: ${d.symbols_count}</div>`;
-    h += `<div class="sub">Missing: ${d.fields_missing.join(', ')}</div>`;
+    h += `<div class="sub" style="margin-top:4px">Символов в списке: ${d.symbols_count}</div>`;
+    h += `<div class="sub">Отсутствуют: ${d.fields_missing.join(', ')}</div>`;
   }
   setIf('instrument-info', h);
 }
@@ -329,23 +350,23 @@ async function renderPipeline() {
       const found = d.stages.find(s => s.stage === stage);
       status = found ? found.status : 'NOT';
     }
-    flowHtml += `<span class="step ${status}">${name}: ${status}</span>`;
+    flowHtml += `<span class="step ${status}">${t(name)}: ${t(status)}</span>`;
   }
   setIf('pipeline-flow', flowHtml);
 
   if (!d.has_report) {
-    setIf('t-pipeline', '<tr><td class="sub">No acceptance report</td></tr>');
+    setIf('t-pipeline', '<tr><td class="sub">Нет отчёта о приёмке</td></tr>');
     return;
   }
   let h = '';
-  h += `<tr><td>Run</td><td class="mono">${d.run_id || '—'}</td></tr>`;
-  h += `<tr><td>Verdict</td><td>${tagHTML(d.verdict)}</td></tr>`;
-  h += `<tr><td>Hypotheses</td><td>${d.n_hypotheses || 0}</td></tr>`;
-  h += `<tr><td>Events</td><td>${(d.n_events_total || 0).toLocaleString()}</td></tr>`;
-  h += `<tr><td>Candidates</td><td>${d.n_candidates || 0}</td></tr>`;
-  h += `<tr><td>Finalist</td><td>${d.finalist ? d.finalist.hypothesis_id : '—'}</td></tr>`;
+  h += `<tr><td>Прогон</td><td class="mono">${d.run_id || '—'}</td></tr>`;
+  h += `<tr><td>Вердикт</td><td>${tagHTML(d.verdict)}</td></tr>`;
+  h += `<tr><td>Гипотезы</td><td>${d.n_hypotheses || 0}</td></tr>`;
+  h += `<tr><td>События</td><td>${(d.n_events_total || 0).toLocaleString()}</td></tr>`;
+  h += `<tr><td>Кандидаты</td><td>${d.n_candidates || 0}</td></tr>`;
+  h += `<tr><td>Финалист</td><td>${d.finalist ? d.finalist.hypothesis_id : '—'}</td></tr>`;
   if (d.reject_reasons && d.reject_reasons.length) {
-    h += `<tr><td>Reason</td><td class="status-err">${d.reject_reasons[0]}</td></tr>`;
+    h += `<tr><td>Причина</td><td class="status-err">${d.reject_reasons[0]}</td></tr>`;
   }
   setIf('t-pipeline', h);
 }
@@ -354,15 +375,15 @@ async function renderPipeline() {
 async function renderData() {
   const d = await fetchJSON('/data');
   if (!d) return;
-  let h = '<tr><th>Category</th><th>Files</th><th>Size</th><th>Oldest</th><th>Newest</th><th>Lag</th><th>Status</th></tr>';
+  let h = '<tr><th>Категория</th><th>Файлов</th><th>Размер</th><th>Старейший</th><th>Новейший</th><th>Отставание</th><th>Статус</th></tr>';
   for (const [cat, info] of Object.entries(d.klines)) {
     const sc = info.status === 'LIVE' ? 'status-ok' : info.status === 'STALE' ? 'status-err' : 'status-na';
     const lag = info.lag_min != null ? (info.lag_min < 60 ? Math.round(info.lag_min) + 'm' : Math.round(info.lag_min / 60) + 'h') : '—';
     const old = info.oldest ? info.oldest.slice(0, 10) : '—';
     const newest = info.newest ? info.newest.slice(0, 16) : '—';
-    h += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td><td class="mono">${old}</td><td class="mono">${newest}</td><td>${lag}</td><td class="${sc}">${info.status}</td></tr>`;
+    h += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td><td class="mono">${old}</td><td class="mono">${newest}</td><td>${lag}</td><td class="${sc}">${t(info.status)}</td></tr>`;
   }
-  h += `<tr><td colspan="7" class="sub">Total: ${d.total_files} files, ${d.total_size_mb} MB</td></tr>`;
+  h += `<tr><td colspan="7" class="sub">Всего: ${d.total_files} файлов, ${d.total_size_mb} MB</td></tr>`;
   setIf('t-data', h);
 }
 
@@ -370,11 +391,11 @@ async function renderData() {
 async function renderStreams() {
   const d = await fetchJSON('/market-data');
   if (!d) return;
-  let h = '<tr><th>Stream</th><th>Files</th><th>Status</th><th>Lag</th></tr>';
+  let h = '<tr><th>Поток</th><th>Файлов</th><th>Статус</th><th>Отставание</th></tr>';
   for (const [name, info] of Object.entries(d.streams)) {
     const sc = info.status === 'LIVE' ? 'status-ok' : info.status === 'STALE' ? 'status-warn' : 'status-err';
     const lag = info.lag_min != null ? (info.lag_min < 60 ? Math.round(info.lag_min) + 'm' : Math.round(info.lag_min / 60) + 'h') : '—';
-    h += `<tr><td>${name}</td><td>${info.count}</td><td class="${sc}">${info.status}</td><td>${lag}</td></tr>`;
+    h += `<tr><td>${name}</td><td>${info.count}</td><td class="${sc}">${t(info.status)}</td><td>${lag}</td></tr>`;
   }
   setIf('t-streams', h);
 }
@@ -383,9 +404,9 @@ async function renderStreams() {
 async function renderSignals() {
   const d = await fetchJSON('/signals');
   if (!d) return;
-  let html = `<div style="font-size:20px;font-weight:700">${d.count.toLocaleString()}</div><div class="sub">total events</div>`;
+  let html = `<div style="font-size:20px;font-weight:700">${d.count.toLocaleString()}</div><div class="sub">всего событий</div>`;
   if (d.symbols && d.symbols.length) {
-    html += '<table><tr><th>Symbol</th><th>Events</th></tr>';
+    html += '<table><tr><th>Символ</th><th>Событий</th></tr>';
     for (const s of d.symbols.slice(0, 8))
       html += `<tr><td class="mono">${s.symbol}</td><td>${s.count.toLocaleString()}</td></tr>`;
     html += '</table>';
@@ -397,17 +418,17 @@ async function renderSignals() {
 async function renderHypotheses() {
   const d = await fetchJSON('/hypotheses');
   if (!d) return;
-  let html = `<div style="font-size:14px;font-weight:700">${d.count}</div><div class="sub">hypotheses</div>`;
+  let html = `<div style="font-size:14px;font-weight:700">${d.count}</div><div class="sub">гипотез</div>`;
   const gate = await fetchJSON('/research-gate');
   if (gate) {
     const gc = gate.status === 'READY' ? 'status-ok' : gate.status === 'SKIP' ? 'status-warn' : 'status-na';
-    html += `<div style="margin-top:6px"><span class="${gc}" style="font-weight:700">Gate: ${gate.status}</span>`;
+    html += `<div style="margin-top:6px"><span class="${gc}" style="font-weight:700">Гейт: ${t(gate.status)}</span>`;
     if (gate.reason) html += `<div class="sub">${gate.reason}</div>`;
-    if (gate.next_run_utc) html += `<div class="sub">Next run: ${gate.next_run_utc}</div>`;
+    if (gate.next_run_utc) html += `<div class="sub">Следующий запуск: ${gate.next_run_utc}</div>`;
     html += '</div>';
   }
   if (d.research_runs && d.research_runs.length) {
-    html += '<table style="margin-top:4px"><tr><th>Run</th><th>Hyps</th><th>Cands</th><th>Verdict</th></tr>';
+    html += '<table style="margin-top:4px"><tr><th>Прогон</th><th>Гипотезы</th><th>Кандидаты</th><th>Вердикт</th></tr>';
     for (const r of d.research_runs.slice(0, 3)) {
       html += `<tr><td class="mono">${(r.run_id || '').slice(0, 15)}</td><td>${r.n_hypotheses || '—'}</td><td>${r.n_candidates || 0}</td><td>${tagHTML(r.verdict)}</td></tr>`;
     }
@@ -416,10 +437,10 @@ async function renderHypotheses() {
   const rejected = d.hypotheses.filter(h => h.display_status === 'REJECTED_BY_PIPELINE');
   const active = d.hypotheses.filter(h => h.display_status !== 'REJECTED_BY_PIPELINE');
   if (active.length) {
-    html += `<div style="margin-top:4px" class="sub">Active candidates: ${active.length}</div>`;
+    html += `<div style="margin-top:4px" class="sub">Активных кандидатов: ${active.length}</div>`;
   }
   if (rejected.length) {
-    html += `<div style="margin-top:2px" class="sub">Rejected: ${rejected.length}</div>`;
+    html += `<div style="margin-top:2px" class="sub">Отклонено: ${rejected.length}</div>`;
   }
   setIf('hyp-content', html);
 }
@@ -429,9 +450,9 @@ async function renderCaptures() {
   const d = await fetchJSON('/captures');
   if (!d) return;
   const sc = d.captures_count > 0 ? 'status-ok' : 'status-na';
-  let html = `<div style="font-size:20px;font-weight:700" class="${sc}">${d.captures_count}</div><div class="sub">completed | ${d.pending_count} pending | max ${d.max_concurrent} concurrent | cooldown ${d.cooldown_sec}s</div>`;
+  let html = `<div style="font-size:20px;font-weight:700" class="${sc}">${d.captures_count}</div><div class="sub">завершено | в ожидании: ${d.pending_count} | максимум одновременно: ${d.max_concurrent} | пауза ${d.cooldown_sec}с</div>`;
   if (d.captures && d.captures.length) {
-    html += '<table style="margin-top:4px"><tr><th>Symbol</th><th>Event</th><th>Size</th><th>Age</th></tr>';
+    html += '<table style="margin-top:4px"><tr><th>Символ</th><th>Событие</th><th>Размер</th><th>Возраст</th></tr>';
     for (const c of d.captures.slice(0, 10)) {
       html += `<tr><td class="mono">${c.symbol}</td><td class="mono" title="${c.event_id}">${(c.event_id || '').slice(0, 22)}</td><td>${c.size_mb} MB</td><td>${c.age_min < 60 ? Math.round(c.age_min) + 'm' : Math.round(c.age_min / 60) + 'h'}</td></tr>`;
     }
@@ -441,13 +462,13 @@ async function renderCaptures() {
 
   let trig = '';
   if (d.pending && d.pending.length) {
-    trig = '<table><tr><th>Symbol</th><th>Event</th><th>Created</th></tr>';
+    trig = '<table><tr><th>Символ</th><th>Событие</th><th>Создано</th></tr>';
     for (const t of d.pending.slice(0, 10)) {
       trig += `<tr><td class="mono">${t.symbol}</td><td class="mono">${(t.event_id || '').slice(0, 22)}</td><td>${fmt(t.created_at)}</td></tr>`;
     }
     trig += '</table>';
   } else {
-    trig = '<div class="sub">No pending triggers</div>';
+    trig = '<div class="sub">Нет ожидающих триггеров</div>';
   }
   setIf('triggers-list', trig);
 }
@@ -463,7 +484,7 @@ async function renderLogsPoll() {
   const d = await fetchJSON('/logs?n=20');
   if (!d) return;
   const all = [...(d.research || []).slice(-8), ...(d.collector || []).slice(-5)];
-  const text = all.join('\n') || 'No logs';
+  const text = all.join('\n') || 'Логов нет';
   setIf('log-content', text);
 }
 
@@ -484,17 +505,17 @@ async function renderOBCollector() {
   const d = await fetchJSON('/ob-collector');
   if (!d) return;
   const stClass = d.status === 'RUNNING' ? 'status-ok' : d.status === 'ERRORS' ? 'status-err' : 'status-na';
-  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${d.status}</div>`;
-  html += `<div class="sub">${d.symbols_count || 0} symbols | ${(d.total_updates || 0).toLocaleString()} updates | ${(d.total_rows || 0).toLocaleString()} rows</div>`;
+  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${t(d.status)}</div>`;
+  html += `<div class="sub">${d.symbols_count || 0} символов | ${(d.total_updates || 0).toLocaleString()} обновлений | ${(d.total_rows || 0).toLocaleString()} строк</div>`;
   if (d.disk_free_gb != null) {
     const diskClass = d.disk_free_gb < 5 ? 'status-err' : d.disk_free_gb < 10 ? 'status-warn' : 'status-ok';
-    html += `<div class="sub">Disk: <span class="${diskClass}">${d.disk_free_gb.toFixed(1)} GB</span> free | Reconnects: ${d.total_reconnects || 0} | Errors: ${d.total_errors || 0}</div>`;
+    html += `<div class="sub">Диск: <span class="${diskClass}">${d.disk_free_gb.toFixed(1)} ГБ</span> свободно | Переподключения: ${d.total_reconnects || 0} | Ошибки: ${d.total_errors || 0}</div>`;
   }
   if (d.symbols && d.symbols.length) {
-    html += '<table style="margin-top:4px"><tr><th>Symbol</th><th>Status</th><th>Updates</th><th>Rows</th><th>Errors</th></tr>';
+    html += '<table style="margin-top:4px"><tr><th>Символ</th><th>Статус</th><th>Обновлений</th><th>Строк</th><th>Ошибок</th></tr>';
     for (const s of d.symbols.slice(0, 8)) {
       const sc = s.status === 'OK' ? 'tag-pass' : s.status === 'GAP' ? 'tag-stop' : 'tag-na';
-      html += `<tr><td class="mono">${s.symbol}</td><td><span class="tag ${sc}">${s.status}</span></td><td>${s.updates.toLocaleString()}</td><td>${s.rows.toLocaleString()}</td><td>${s.errors}</td></tr>`;
+      html += `<tr><td class="mono">${s.symbol}</td><td><span class="tag ${sc}">${t(s.status)}</span></td><td>${s.updates.toLocaleString()}</td><td>${s.rows.toLocaleString()}</td><td>${s.errors}</td></tr>`;
     }
     html += '</table>';
   }
@@ -506,15 +527,15 @@ async function renderCandleCollector() {
   const d = await fetchJSON('/candle-collector');
   if (!d) return;
   const stClass = d.status === 'RUNNING' ? 'status-ok' : 'status-na';
-  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${d.status}</div>`;
-  html += `<div class="sub">${d.total_files || 0} files | ${(d.total_size_mb || 0).toFixed(1)} MB</div>`;
+  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${t(d.status)}</div>`;
+  html += `<div class="sub">${d.total_files || 0} файлов | ${(d.total_size_mb || 0).toFixed(1)} MB</div>`;
   if (d.categories) {
-    html += '<table style="margin-top:4px"><tr><th>Category</th><th>Files</th><th>Size</th><th>Newest</th><th>Lag</th><th>Status</th></tr>';
+    html += '<table style="margin-top:4px"><tr><th>Категория</th><th>Файлов</th><th>Размер</th><th>Новейший</th><th>Отставание</th><th>Статус</th></tr>';
     for (const [cat, info] of Object.entries(d.categories)) {
       const sc = info.status === 'LIVE' ? 'tag-pass' : info.status === 'STALE' ? 'tag-stop' : 'tag-na';
       const lag = info.lag_min != null ? (info.lag_min < 60 ? Math.round(info.lag_min) + 'm' : Math.round(info.lag_min / 60) + 'h') : '—';
       const newest = info.newest ? info.newest.slice(0, 16) : '—';
-      html += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td><td class="mono">${newest}</td><td>${lag}</td><td><span class="tag ${sc}">${info.status}</span></td></tr>`;
+      html += `<tr><td>${cat}</td><td>${info.files}</td><td>${info.total_size_mb} MB</td><td class="mono">${newest}</td><td>${lag}</td><td><span class="tag ${sc}">${t(info.status)}</span></td></tr>`;
     }
     html += '</table>';
   }
@@ -527,17 +548,17 @@ async function renderDataQuality() {
   if (!d) return;
   let html = '<div style="display:flex;gap:16px">';
   if (d.orderbook) {
-    html += '<div><div class="sub">Orderbook</div>';
-    html += `<span class="tag tag-pass">OK: ${d.orderbook.ok}</span> `;
-    html += `<span class="tag tag-stop">Gap: ${d.orderbook.gap}</span> `;
-    html += `<span class="tag tag-reject">Stale: ${d.orderbook.stale}</span>`;
+    html += '<div><div class="sub">Стакан</div>';
+    html += `<span class="tag tag-pass">ОК: ${d.orderbook.ok}</span> `;
+    html += `<span class="tag tag-stop">Пробелы: ${d.orderbook.gap}</span> `;
+    html += `<span class="tag tag-reject">Устаревшие: ${d.orderbook.stale}</span>`;
     html += '</div>';
   }
   if (d.klines) {
     html += '<div><div class="sub">Klines</div>';
-    html += `<span class="tag tag-pass">OK: ${d.klines.ok}</span> `;
-    html += `<span class="tag tag-stop">Stale: ${d.klines.stale}</span> `;
-    html += `<span class="tag tag-reject">Missing: ${d.klines.missing}</span>`;
+    html += `<span class="tag tag-pass">ОК: ${d.klines.ok}</span> `;
+    html += `<span class="tag tag-stop">Устаревшие: ${d.klines.stale}</span> `;
+    html += `<span class="tag tag-reject">Отсутствуют: ${d.klines.missing}</span>`;
     html += '</div>';
   }
   html += '</div>';
@@ -549,10 +570,10 @@ async function renderResearchConclusion() {
   const d = await fetchJSON('/research-conclusion');
   if (!d) return;
   const stClass = d.verdict === 'PASS' ? 'status-ok' : d.verdict === 'NO_CANDIDATE' ? 'status-na' : 'status-warn';
-  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${d.status || 'NO DATA'}</div>`;
+  let html = `<div style="font-size:14px;font-weight:700" class="${stClass}">${t(d.status) || 'НЕТ ДАННЫХ'}</div>`;
   if (d.reason) html += `<div class="sub">${d.reason}</div>`;
-  if (d.n_hypotheses) html += `<div class="sub">Tested ${d.n_hypotheses} hypotheses, ${d.n_candidates || 0} candidates</div>`;
-  if (d.finalist) html += `<div class="sub">Finalist: <span class="mono">${d.finalist.hypothesis_id || 'N/A'}</span></div>`;
+  if (d.n_hypotheses) html += `<div class="sub">Проверено гипотез: ${d.n_hypotheses}, кандидатов: ${d.n_candidates || 0}</div>`;
+  if (d.finalist) html += `<div class="sub">Финалист: <span class="mono">${d.finalist.hypothesis_id || 'N/A'}</span></div>`;
   setIf('research-conclusion', html);
 }
 
@@ -560,7 +581,7 @@ async function renderResearchConclusion() {
 async function renderSysStatus() {
   const rc = await fetchJSON('/research-controller');
   if (!rc) {
-    setIf('sys-research', '<span class="tag tag-na">UNKNOWN</span>');
+    setIf('sys-research', '<span class="tag tag-na">НЕИЗВЕСТНО</span>');
   } else {
     const cls = rc.status === 'BUDGET_EXHAUSTED' ? 'tag-stop'
       : rc.status === 'WAITING_FOR_NEW_DATA' ? 'tag-skip'
@@ -568,41 +589,41 @@ async function renderSysStatus() {
       : rc.status === 'PASS_PENDING_PAPER' ? 'tag-pass'
       : rc.status === 'STOPPED' ? 'tag-reject'
       : rc.status === 'ERROR' ? 'tag-error' : 'tag-na';
-    let sub = `<div class="sub">${rc.state || rc.status} · budget ${rc.budget_used}/${rc.budget_max}</div>`;
+    let sub = `<div class="sub">${t(rc.state || rc.status)} · бюджет ${rc.budget_used}/${rc.budget_max}</div>`;
     const cyc = rc.cycle_id || (rc.frozen_next && rc.frozen_next.cycle_id);
-    if (cyc) sub += `<div class="sub">Cycle: <span class="mono">${(cyc || '').slice(0, 32)}</span></div>`;
-    if (rc.updated_at_utc) sub += `<div class="sub">Updated: ${fmt(rc.updated_at_utc)}</div>`;
-    setIf('sys-research', `<span class="tag ${cls}">${rc.status}</span>${sub}`);
+    if (cyc) sub += `<div class="sub">Цикл: <span class="mono">${(cyc || '').slice(0, 32)}</span></div>`;
+    if (rc.updated_at_utc) sub += `<div class="sub">Обновлено: ${fmt(rc.updated_at_utc)}</div>`;
+    setIf('sys-research', `<span class="tag ${cls}">${t(rc.status)}</span>${sub}`);
   }
 
   const p = await fetchJSON('/paper');
   if (!p) {
-    setIf('sys-paper', '<span class="tag tag-na">UNKNOWN</span>');
+    setIf('sys-paper', '<span class="tag tag-na">НЕИЗВЕСТНО</span>');
   } else {
     let tag, cls;
-    if (p.status === 'NOT READY') { tag = 'WAITING FOR VALIDATED HYPOTHESIS'; cls = 'tag-stop'; }
-    else if (p.status === 'STOPPED') { tag = 'STOPPED'; cls = 'tag-reject'; }
-    else if (p.status === 'RUNNING') { tag = 'RUNNING'; cls = 'tag-pass'; }
-    else { tag = 'UNKNOWN'; cls = 'tag-na'; }
-    setIf('sys-paper', `<span class="tag ${cls}">${tag}</span>${p.hypothesis_id ? `<div class="sub">Hypothesis: <span class="mono">${p.hypothesis_id}</span></div>` : ''}${p.status_reason ? `<div class="sub">${p.status_reason}</div>` : ''}`);
+    if (p.status === 'NOT READY') { tag = 'ОЖИДАНИЕ ВАЛИДНОЙ ГИПОТЕЗЫ'; cls = 'tag-stop'; }
+    else if (p.status === 'STOPPED') { tag = 'ОСТАНОВЛЕН'; cls = 'tag-reject'; }
+    else if (p.status === 'RUNNING') { tag = 'ИДЁТ'; cls = 'tag-pass'; }
+    else { tag = 'НЕИЗВЕСТНО'; cls = 'tag-na'; }
+    setIf('sys-paper', `<span class="tag ${cls}">${tag}</span>${p.hypothesis_id ? `<div class="sub">Гипотеза: <span class="mono">${p.hypothesis_id}</span></div>` : ''}${p.status_reason ? `<div class="sub">${p.status_reason}</div>` : ''}`);
   }
 
   const [cc, md, ob] = await Promise.all([
     fetchJSON('/candle-collector'), fetchJSON('/market-data'), fetchJSON('/ob-collector')
   ]);
   if (!cc || !md || !ob) {
-    setIf('sys-data', '<span class="tag tag-na">UNKNOWN</span>');
+    setIf('sys-data', '<span class="tag tag-na">НЕИЗВЕСТНО</span>');
   } else {
     const streams = md.streams || {};
     // Research Data (candles + orderbook) — источник для research pipeline.
     // Legacy-стримы (trades/futures/liquidation/ratio) намеренно останавливаются
     // на время research-цикла (Research Runner фаза A) — они не влияют на статус.
     const researchOk = cc.status === 'RUNNING' && ob.status === 'RUNNING';
-    const parts = [`Candles ${cc.status}`, `OB ${ob.status}`];
+    const parts = [`Свечи ${t(cc.status)}`, `Стакан ${t(ob.status)}`];
     const legacy = [];
-    for (const k of ['trades', 'futures', 'liquidation', 'ratio']) {
+    for (const [k, label] of [['trades', 'Сделки'], ['futures', 'Фьючерсы'], ['liquidation', 'Ликвидации'], ['ratio', 'Отношение']]) {
       const s = streams[k];
-      legacy.push(`${k[0].toUpperCase() + k.slice(1)} ${s ? s.status : 'UNKNOWN'}`);
+      legacy.push(`${label} ${s ? t(s.status) : 'НЕИЗВЕСТНО'}`);
     }
     setIf('sys-data', `${researchOk ? tagHTML('PASS') : tagHTML('ERROR')}<div class="sub" style="margin-top:2px">${parts.join(' · ')}</div><div class="sub">LEGACY: ${legacy.join(' · ')}</div>`);
   }
@@ -612,7 +633,7 @@ async function renderSysStatus() {
 async function renderResearchProgress() {
   const d = await fetchJSON('/research-progress');
   if (!d) {
-    setIf('rp-state', '<span class="tag tag-na">UNKNOWN</span>');
+    setIf('rp-state', '<span class="tag tag-na">НЕИЗВЕСТНО</span>');
     return;
   }
   const stCls = d.status === 'BUDGET_EXHAUSTED' ? 'tag-stop'
@@ -622,17 +643,17 @@ async function renderResearchProgress() {
     : d.status === 'STOPPED' ? 'tag-reject'
     : d.status === 'ERROR' ? 'tag-error' : 'tag-na';
   const c = d.counts || {};
-  let html = `<span class="tag ${stCls}">${d.status}</span> ${d.status_reason || ''}`;
-  html += `<div style="margin-top:4px">Experiments: <span class="mono"><b>${d.budget_used}/${d.budget_max}</b></span> budget | <span class="mono"><b>${d.experiments_in_cycle}</b></span> in cycle <span class="mono">${(d.cycle_id || '—').slice(0, 32)}</span></div>`;
-  html += `<div class="pipe" style="margin-top:4px"><span class="step NOT">RUNNING: ${c.RUNNING || 0}</span><span class="step PASS">PASS: ${c.PASS || 0}</span><span class="step REJECT">REJECT: ${c.REJECT || 0}</span><span class="step ERROR">FAILED: ${c.FAILED || 0}</span></div>`;
+  let html = `<span class="tag ${stCls}">${t(d.status)}</span> ${d.status_reason || ''}`;
+  html += `<div style="margin-top:4px">Эксперименты: <span class="mono"><b>${d.budget_used}/${d.budget_max}</b></span> бюджет | <span class="mono"><b>${d.experiments_in_cycle}</b></span> в цикле <span class="mono">${(d.cycle_id || '—').slice(0, 32)}</span></div>`;
+  html += `<div class="pipe" style="margin-top:4px"><span class="step NOT">ИДЁТ: ${c.RUNNING || 0}</span><span class="step PASS">ПРОЙДЕНО: ${c.PASS || 0}</span><span class="step REJECT">ОТКЛОНЕНО: ${c.REJECT || 0}</span><span class="step ERROR">ПРОВАЛЕНО: ${c.FAILED || 0}</span></div>`;
   const le = d.last_experiment;
   if (le) {
-    html += `<div style="margin-top:4px">Last: <span class="mono">${le.experiment_id || '—'}</span> · ${le.mode || '—'} · ${tagHTML(le.final_verdict || le.status || '—')}</div>`;
+    html += `<div style="margin-top:4px">Последний: <span class="mono">${le.experiment_id || '—'}</span> · ${le.mode || '—'} · ${tagHTML(le.final_verdict || le.status || '—')}</div>`;
     if (le.reject_reason) {
-      html += `<div class="sub">Last REJECT reason: ${le.reject_reason}</div>`;
+      html += `<div class="sub">Причина последнего отклонения: ${le.reject_reason}</div>`;
     }
   }
-  if (!d.journal_ok) html += `<div class="sub">N/A (experiments.jsonl)</div>`;
+  if (!d.journal_ok) html += `<div class="sub">Н/Д (experiments.jsonl)</div>`;
   setIf('rp-state', html);
 }
 
@@ -640,7 +661,7 @@ async function renderResearchProgress() {
 async function renderResearchController() {
   const d = await fetchJSON('/research-controller');
   if (!d) {
-    setIf('rc-state', '<span class="tag tag-na">UNKNOWN</span><div class="sub">N/A (API)</div>');
+    setIf('rc-state', '<span class="tag tag-na">НЕИЗВЕСТНО</span><div class="sub">Н/Д (API)</div>');
     return;
   }
   const stCls = d.status === 'BUDGET_EXHAUSTED' ? 'tag-stop'
@@ -652,17 +673,17 @@ async function renderResearchController() {
   const e = d.last_experiment;
   const n = d.next_experiment;
   const fr = d.frozen_next;
-  let html = `<span class="tag ${stCls}">${d.status}</span> <span class="sub">${d.status_reason || ''}</span>`;
+  let html = `<span class="tag ${stCls}">${t(d.status)}</span> <span class="sub">${d.status_reason || ''}</span>`;
   html += '<table style="margin-top:4px">';
-  html += `<tr><td>Cycle ID</td><td class="mono">${d.cycle_id || 'N/A'}${d.cycle_id ? '' : ' <span class="sub">(N/A: controller_state.json)</span>'}</td></tr>`;
-  html += `<tr><td>Controller state</td><td>${d.state || 'N/A'}${d.pass_pending ? `<div class="sub">PASS pending: ${d.pass_pending.experiment_id || '—'}</div>` : ''}</td></tr>`;
-  html += `<tr><td>Budget used/max</td><td class="mono">${d.budget_used}/${d.budget_max}</td></tr>`;
+  html += `<tr><td>ID цикла</td><td class="mono">${d.cycle_id || 'N/A'}${d.cycle_id ? '' : ' <span class="sub">(Н/Д: controller_state.json)</span>'}</td></tr>`;
+  html += `<tr><td>Состояние модуля</td><td>${t(d.state) || 'Н/Д'}${d.pass_pending ? `<div class="sub">ПРОЙДЕНО в ожидании: ${d.pass_pending.experiment_id || '—'}</div>` : ''}</td></tr>`;
+  html += `<tr><td>Бюджет использован/макс</td><td class="mono">${d.budget_used}/${d.budget_max}</td></tr>`;
   if (e) {
-    html += `<tr><td>Last experiment</td><td class="mono">${e.experiment_id || '—'}${e.mode ? ` · ${e.mode}` : ''}</td></tr>`;
-    html += `<tr><td>Verdict</td><td>${e.final_verdict ? tagHTML(e.final_verdict) : (e.status || '—')}</td></tr>`;
-    html += `<tr><td>Diagnosis</td><td>${e.diagnosis || '—'}</td></tr>`;
+    html += `<tr><td>Последний эксперимент</td><td class="mono">${e.experiment_id || '—'}${e.mode ? ` · ${e.mode}` : ''}</td></tr>`;
+    html += `<tr><td>Вердикт</td><td>${e.final_verdict ? tagHTML(e.final_verdict) : (t(e.status) || '—')}</td></tr>`;
+    html += `<tr><td>Диагноз</td><td>${e.diagnosis || '—'}</td></tr>`;
     if (e.reject_reasons && e.reject_reasons.length) {
-      html += `<tr><td>Reject reason</td><td class="sub">${e.reject_reasons[0]}</td></tr>`;
+      html += `<tr><td>Причина отклонения</td><td class="sub">${e.reject_reasons[0]}</td></tr>`;
     }
   }
   if (n && n.mode) {
@@ -670,12 +691,12 @@ async function renderResearchController() {
     if (n.feature) ndesc += ` · ${n.feature} ${n.operator || ''} ${n.threshold ?? ''}${n.entry_side ? ` ${n.entry_side}` : ''}`;
     if (n.regime_key) ndesc += ` (${n.regime_key})`;
     if (n.horizons && n.horizons.length) ndesc += ` · H${n.horizons.join('/')}`;
-    html += `<tr><td>Next experiment</td><td class="mono">${ndesc}</td></tr>`;
+    html += `<tr><td>Следующий эксперимент</td><td class="mono">${ndesc}</td></tr>`;
   }
   const bnd = d.boundary_klines_max || (fr && fr.klines_max);
-  html += `<tr><td>Data boundary (klines_max)</td><td class="mono">${bnd || 'N/A'}</td></tr>`;
-  if (fr) html += `<tr><td>Frozen next (log)</td><td class="mono">${fr.klines_max || '—'}${fr.cycle_id ? `<div class="sub">${fr.cycle_id}</div>` : ''}</td></tr>`;
-  html += `<tr><td>Last change (UTC)</td><td class="mono">${d.updated_at_utc ? d.updated_at_utc.slice(0, 19).replace('T', ' ') : 'N/A'}</td></tr>`;
+  html += `<tr><td>Граница данных (klines_max)</td><td class="mono">${bnd || 'N/A'}</td></tr>`;
+  if (fr) html += `<tr><td>Зафиксировано следующее (лог)</td><td class="mono">${fr.klines_max || '—'}${fr.cycle_id ? `<div class="sub">${fr.cycle_id}</div>` : ''}</td></tr>`;
+  html += `<tr><td>Последнее изменение (UTC)</td><td class="mono">${d.updated_at_utc ? d.updated_at_utc.slice(0, 19).replace('T', ' ') : 'N/A'}</td></tr>`;
   html += '</table>';
   setIf('rc-state', html);
 }
@@ -683,27 +704,27 @@ async function renderResearchController() {
 // ═══════ 20b. Research Cycle → Paper ═══════
 async function renderResearchCycle() {
   const d = await fetchJSON('/research-cycle');
-  if (!d) { setIf('rc-content', '<span class="sub">No data</span>'); return; }
-  const st = d.state || 'UNKNOWN';
+  if (!d) { setIf('rc-content', '<span class="sub">Нет данных</span>'); return; }
+  const st = d.state || 'НЕИЗВЕСТНО';
   const stCls = st === 'PASS_PENDING_PAPER' ? 'tag-pass' : st === 'STOPPED' ? 'tag-reject' : 'tag-na';
-  let html = `<div><span class="tag ${stCls}">${st}</span> <span class="sub">cycle ${(d.cycle_id || '—')} · budget ${d.budget_used || 0}/${d.budget_max || '—'}</span></div>`;
+  let html = `<div><span class="tag ${stCls}">${t(st)}</span> <span class="sub">цикл ${(d.cycle_id || '—')} · бюджет ${d.budget_used || 0}/${d.budget_max || '—'}</span></div>`;
   if (d.experiment) {
     const e = d.experiment;
-    html += `<div class="sub">Experiment: <span class="mono">${e.experiment_id || '—'}</span> · ${e.mode || '—'} · ${e.final_verdict || e.status || '—'}${e.n_hypotheses ? ` · ${e.n_hypotheses} hyp` : ''}</div>`;
-    if (e.diagnosis) html += `<div class="sub">Diagnosis: ${e.diagnosis}</div>`;
+    html += `<div class="sub">Эксперимент: <span class="mono">${e.experiment_id || '—'}</span> · ${e.mode || '—'} · ${t(e.final_verdict || e.status) || '—'}${e.n_hypotheses ? ` · гипотез: ${e.n_hypotheses}` : ''}</div>`;
+    if (e.diagnosis) html += `<div class="sub">Диагноз: ${e.diagnosis}</div>`;
   }
   const p = d.paper || {};
   if (p.hypothesis_id) {
     const prov = p.provenance || {};
-    html += `<div style="margin-top:4px"><span class="tag ${p.mode === 'VALIDATED' ? 'tag-pass' : 'tag-na'}">PAPER ${p.mode || '—'}</span> <span class="mono">${p.hypothesis_id}</span></div>`;
+    html += `<div style="margin-top:4px"><span class="tag ${p.mode === 'VALIDATED' ? 'tag-pass' : 'tag-na'}">БУМАГА ${t(p.mode) || '—'}</span> <span class="mono">${p.hypothesis_id}</span></div>`;
     if (p.trade_count > 0) {
-      html += `<div class="sub">Balance ${(p.balance || 0).toFixed(2)} · PnL ${(p.realized_pnl || 0).toFixed(2)} (${p.pnl_pct != null ? p.pnl_pct.toFixed(2) : '0.00'}%) · ${p.trade_count} trades</div>`;
+      html += `<div class="sub">Баланс ${(p.balance || 0).toFixed(2)} · PnL ${(p.realized_pnl || 0).toFixed(2)} (${p.pnl_pct != null ? p.pnl_pct.toFixed(2) : '0.00'}%) · ${p.trade_count} сделок</div>`;
     } else {
-      html += `<div class="sub">Started ${fmt(p.started_at)} · equity ${(p.balance || 0).toFixed(2)} · 0 trades</div>`;
+      html += `<div class="sub">Запуск ${fmt(p.started_at)} · капитал ${(p.balance || 0).toFixed(2)} · 0 сделок</div>`;
     }
-    if (prov.experiment_id) html += `<div class="sub">Bound to ${prov.experiment_id} (cycle ${prov.cycle_id || '—'})</div>`;
+    if (prov.experiment_id) html += `<div class="sub">Привязан к ${prov.experiment_id} (цикл ${prov.cycle_id || '—'})</div>`;
   } else {
-    html += '<div class="sub" style="margin-top:4px">No paper launched yet</div>';
+    html += '<div class="sub" style="margin-top:4px">Бумажная торговля ещё не запущена</div>';
   }
   setIf('rc-content', html);
 }
@@ -718,37 +739,37 @@ async function renderLiveData() {
 
   let h = '';
   if (!cc) {
-    h += row('Candles', 'UNKNOWN', 'tag-na', '');
+    h += row('Свечи', 'НЕИЗВЕСТНО', 'tag-na', '');
   } else {
     const live = cc.status === 'RUNNING';
     let sub = '';
     if (cc.categories) {
-      sub = Object.entries(cc.categories).map(([n, i]) => `${n} ${i.status}`).join(' · ');
+      sub = Object.entries(cc.categories).map(([n, i]) => `${n} ${t(i.status)}`).join(' · ');
     }
-    h += row('Candles', live ? 'LIVE' : 'STOPPED', live ? 'tag-pass' : 'tag-na', sub);
+    h += row('Свечи', live ? 'АКТИВЕН' : 'ОСТАНОВЛЕН', live ? 'tag-pass' : 'tag-na', sub);
   }
 
   const streams = md ? (md.streams || {}) : null;
-  for (const [label, key] of [['Trades', 'trades'], ['Futures', 'futures'], ['Liquidations', 'liquidation']]) {
+  for (const [label, key] of [['Сделки', 'trades'], ['Фьючерсы', 'futures'], ['Ликвидации', 'liquidation']]) {
     const s = streams ? streams[key] : null;
     if (!s) { h += row(label, 'UNKNOWN', 'tag-na', ''); continue; }
     const live = s.status === 'LIVE';
-    h += row(label, live ? 'LIVE' : s.status, live ? 'tag-pass' : 'tag-na', s.lag_min != null ? `lag ${s.lag_min} min` : '');
+    h += row(label, live ? 'АКТИВЕН' : t(s.status), live ? 'tag-pass' : 'tag-na', s.lag_min != null ? `отставание ${s.lag_min} мин` : '');
   }
 
   if (!ob) {
-    h += row('Orderbook', 'UNKNOWN', 'tag-na', '');
+    h += row('Стакан', 'НЕИЗВЕСТНО', 'tag-na', '');
   } else {
     const live = ob.status === 'RUNNING';
-    h += row('Orderbook', live ? 'LIVE' : 'STOPPED', live ? 'tag-pass' : 'tag-na', 'event-driven captures');
+    h += row('Стакан', live ? 'АКТИВЕН' : 'ОСТАНОВЛЕН', live ? 'tag-pass' : 'tag-na', 'захваты по событиям');
   }
 
   if (!cap || cap.captures_count == null) {
-    h += row('OB captures', 'UNKNOWN', 'tag-na', '');
+    h += row('Захваты стакана', 'НЕИЗВЕСТНО', 'tag-na', '');
   } else {
-    let sub = `${cap.captures_count} captures completed`;
-    if (cap.pending_count > 0) sub += ` · ${cap.pending_count} pending`;
-    h += row('OB captures', `${cap.captures_count} done`, 'tag-pass', sub);
+    let sub = `${cap.captures_count} захватов завершено`;
+    if (cap.pending_count > 0) sub += ` · в ожидании: ${cap.pending_count}`;
+    h += row('Захваты стакана', `${cap.captures_count} готово`, 'tag-pass', sub);
   }
   setIf('ld-rows', h);
 }

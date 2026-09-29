@@ -99,10 +99,10 @@ def get_paper() -> dict:
 
     if not has_state and not has_trades:
         status = "NOT READY"
-        status_reason = "No trades executed"
+        status_reason = "Сделок ещё не было"
     else:
         status = "STOPPED"
-        status_reason = "Not running (manual mode)"
+        status_reason = "Не запущено (ручной режим)"
 
     pnl_pct = None
     profit_factor = None
@@ -203,7 +203,7 @@ def get_instrument_info() -> dict:
 
     return {
         "available": False,
-        "reason": "Collector fetches instruments-info from Bybit but does NOT save per-symbol specs (minOrderQty, qtyStep, tickSize). Only symbol list is preserved.",
+        "reason": "Коллектор получает instruments-info от Bybit, но НЕ сохраняет спецификации по символам (minOrderQty, qtyStep, tickSize). Сохраняется только список символов.",
         "symbols_count": n_symbols,
         "fields_missing": ["minOrderQty", "qtyStep", "tickSize", "minNotional", "pricePrecision", "qtyPrecision"],
     }
@@ -250,7 +250,7 @@ def get_stake_levels() -> dict:
         "qty_step": qty_step,
         "min_lot": min_lot,
         "levels": levels,
-        "note": "Position sizing: qty = risk_usd / stop_distance, rounded down to qty_step. Single-level system (risk_per_trade_pct of current equity).",
+        "note": "Размер позиции: qty = risk_usd / stop_distance, округление вниз до qty_step. Одноуровневая система (risk_per_trade_pct от текущего капитала).",
     }
 
 
@@ -955,19 +955,19 @@ def get_research_conclusion() -> dict:
     
     if verdict == "PASS" and finalist:
         conclusion = "VALIDATED EDGE FOUND"
-        reason = f"Finalist: {finalist.get('hypothesis_id', 'N/A')}"
+        reason = f"Финалист: {finalist.get('hypothesis_id', 'Н/Д')}"
     elif verdict == "NO_CANDIDATE":
         conclusion = "NO STATISTICALLY VALIDATED EDGE"
-        reason = f"Tested {n_hyp} hypotheses, {len(candidates)} candidates, 0 survived all gates"
+        reason = f"Проверено гипотез: {n_hyp}, кандидатов: {len(candidates)}, не прошли все проверки: 0"
     elif verdict == "REJECT":
         conclusion = "CANDIDATES REJECTED"
-        reason = reject_reasons[0] if reject_reasons else "Unknown rejection reason"
+        reason = reject_reasons[0] if reject_reasons else "Причина отклонения неизвестна"
     elif verdict == "STOP":
         conclusion = "PIPELINE STOPPED"
-        reason = reject_reasons[0] if reject_reasons else "Data validation failed"
+        reason = reject_reasons[0] if reject_reasons else "Провалена валидация данных"
     else:
         conclusion = "UNKNOWN"
-        reason = f"Verdict: {verdict}"
+        reason = f"Вердикт: {verdict}"
     
     return {
         "status": conclusion,
@@ -1127,19 +1127,19 @@ def get_research_controller() -> dict:
     src = "controller_state.json"
 
     if not ctrl:
-        status, reason = "ERROR", "N/A (controller_state.json)"
+        status, reason = "ERROR", "Н/Д (controller_state.json)"
     elif budget_used >= budget_max:
-        status, reason = "BUDGET_EXHAUSTED", f"budget {budget_used}/{budget_max} used"
+        status, reason = "BUDGET_EXHAUSTED", f"бюджет {budget_used}/{budget_max} израсходован"
     elif state == "RUNNING":
-        status, reason = "RUNNING", f"experiment in progress: {eid}"
+        status, reason = "RUNNING", f"идёт эксперимент: {eid}"
     elif state == "SELECT_NEXT":
-        status, reason = "WAITING_FOR_NEW_DATA", f"SELECT_NEXT, budget left {budget_max - budget_used}"
+        status, reason = "WAITING_FOR_NEW_DATA", f"выбор следующего, остаток бюджета {budget_max - budget_used}"
     elif state == "PASS_PENDING_PAPER":
-        status, reason = "PASS_PENDING_PAPER", "waiting paper validation"
+        status, reason = "PASS_PENDING_PAPER", "ожидает валидации бумаги"
     elif state == "STOPPED":
-        status, reason = "STOPPED", ctrl.get("stop_reason") or "controller stopped"
+        status, reason = "STOPPED", ctrl.get("stop_reason") or "модуль остановлен"
     else:
-        status, reason = state or "UNKNOWN", f"source: {src}"
+        status, reason = state or "UNKNOWN", f"источник: {src}"
 
     return {
         "status": status,
@@ -1219,17 +1219,17 @@ def get_research_progress() -> dict:
 
     state = ctrl.get("state")
     if not ctrl:
-        status, reason = "ERROR", "N/A (controller_state.json)"
+        status, reason = "ERROR", "Н/Д (controller_state.json)"
     elif budget_used >= budget_max:
-        status, reason = "BUDGET_EXHAUSTED", f"budget {budget_used}/{budget_max} used"
+        status, reason = "BUDGET_EXHAUSTED", f"бюджет {budget_used}/{budget_max} израсходован"
     elif state == "RUNNING":
-        status, reason = "RUNNING", f"experiment in progress: {(last_exp or {}).get('experiment_id')}"
+        status, reason = "RUNNING", f"идёт эксперимент: {(last_exp or {}).get('experiment_id')}"
     elif state == "SELECT_NEXT":
-        status, reason = "WAITING_FOR_NEW_DATA", f"SELECT_NEXT, budget left {budget_max - budget_used}"
+        status, reason = "WAITING_FOR_NEW_DATA", f"выбор следующего, остаток бюджета {budget_max - budget_used}"
     elif state == "PASS_PENDING_PAPER":
-        status, reason = "PASS_PENDING_PAPER", "waiting paper validation"
+        status, reason = "PASS_PENDING_PAPER", "ожидает валидации бумаги"
     else:
-        status, reason = state or "UNKNOWN", "source: controller_state.json"
+        status, reason = state or "UNKNOWN", "источник: controller_state.json"
 
     return {
         "status": status,
@@ -1285,11 +1285,11 @@ def get_research_gate() -> dict:
                 next_run = cooldown_until
             else:
                 status = "READY"
-                reason = "Cooldown expired"
+                reason = "Пауза истекла"
                 next_run = None
         except Exception:
             status = "UNKNOWN"
-            reason = "Cannot parse cooldown"
+            reason = "Не удалось разобрать паузу"
             next_run = None
     elif last_run and last_run.get("verdict"):
         status = "READY"
@@ -1297,7 +1297,7 @@ def get_research_gate() -> dict:
         next_run = None
     else:
         status = "READY"
-        reason = "No previous runs"
+        reason = "Предыдущих запусков нет"
         next_run = None
 
     return {
@@ -1319,9 +1319,9 @@ def get_alerts() -> list[dict]:
     # Check OB collector
     ob = get_ob_collector()
     if ob["status"] == "NOT RUNNING":
-        alerts.append({"level": "error", "source": "OB Collector", "message": "Collector not running"})
+        alerts.append({"level": "error", "source": "Коллектор стакана", "message": "Коллектор не запущен"})
     elif ob["status"] == "NO DATA":
-        alerts.append({"level": "warning", "source": "OB Collector", "message": "No data received"})
+        alerts.append({"level": "warning", "source": "Коллектор стакана", "message": "Данные не поступают"})
     elif ob["status"] == "ERRORS":
         alerts.append({"level": "error", "source": "OB Collector", "message": f"{ob['total_errors']} write errors"})
     
@@ -1331,7 +1331,7 @@ def get_alerts() -> list[dict]:
     # Check candle collector
     cc = get_candle_collector()
     if cc["status"] == "NO DATA":
-        alerts.append({"level": "warning", "source": "Candle Collector", "message": "No kline data"})
+        alerts.append({"level": "warning", "source": "Коллектор свечей", "message": "Нет данных свечей"})
     
     # Check data quality
     dq = get_data_quality()
@@ -1341,14 +1341,14 @@ def get_alerts() -> list[dict]:
     # Check pipeline
     pipeline = get_pipeline_status()
     if pipeline.get("verdict") == "STOP":
-        alerts.append({"level": "error", "source": "Pipeline", "message": "Pipeline stopped"})
+        alerts.append({"level": "error", "source": "Пайплайн", "message": "Пайплайн остановлен"})
     elif pipeline.get("verdict") == "ERROR":
-        alerts.append({"level": "error", "source": "Pipeline", "message": "Pipeline error"})
+        alerts.append({"level": "error", "source": "Пайплайн", "message": "Ошибка пайплайна"})
     
     # Check system status
     status = get_system_status()
     if status.get("any_stale"):
-        alerts.append({"level": "warning", "source": "System", "message": "Some log files are stale"})
+        alerts.append({"level": "warning", "source": "Система", "message": "Некоторые лог-файлы устарели"})
     
     return alerts
 
