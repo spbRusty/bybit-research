@@ -467,10 +467,11 @@ def should_notify(status: str, severity: str, notify_on_pass: bool) -> bool:
 def notify_review(status: str, context: dict, summary: str, severity: str) -> bool:
     """Отправка через существующий ntfy-механизм (src.notify.notify)."""
     head = context.get("git_head") or "?"
-    msg = (f"[System Review {head}] status={status}, severity={severity}\n"
+    msg = (f"[Системный ревью {head}] статус={status}, критичность={severity}\n"
            f"{summary[:400] or 'см. docs/system_review_*.md'}")
     tags = "rotating_light" if status == "FAIL" else "mag"
-    return notify(f"SYSTEM REVIEW: {status}", msg, tags=tags)
+    status_ru = "ПРОВАЛ" if status == "FAIL" else ("ПРЕДУПРЕЖДЕНИЯ" if status == "PASS_WITH_WARNINGS" else "УСПЕХ")
+    return notify(f"СИСТЕМНЫЙ РЕВЬЮ: {status_ru}", msg, tags=tags)
 
 
 # --- Основной цикл ------------------------------------------------------
@@ -551,7 +552,7 @@ def main() -> None:
                 pass  # notify уже отправлен внутри run_review
         except Exception as e:
             logger.exception("review crash: %s", e)
-            notify("SYSTEM REVIEW: ERROR", f"reviewer crash: {e}", tags="rotating_light")
+            notify("СИСТЕМНЫЙ РЕВЬЮ: ОШИБКА", f"сбой ревьюера: {e}", tags="rotating_light")
         finally:
             lock.release()
 
