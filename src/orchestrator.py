@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.settings import LOGS_DIR, RESULTS_DIR, REPORTS_DIR, load_toml
 from src import candle_trigger as ct_mod
 from src import data as data_mod
+from src import data_ready
 from src import events as events_mod
 from src import features as features_mod
 from src import features_breadth as breadth_mod
@@ -85,12 +86,12 @@ def _log_stage(s: StageResult) -> None:
                 "; ".join(s.errors) if s.errors else "OK")
 
 
-_COND_COL_RE = re.compile(r"pl\.col\('([^']+)'\)")
+_COND_COL_RE = re.compile(r"pl\.col\((['\"])([^'\"]+)\1\)")
 
 
 def _condition_cols(condition: str) -> set[str]:
-    """Колонки, упомянутые в polars-условии гипотезы (pl.col('X'))."""
-    return set(_COND_COL_RE.findall(condition))
+    """Колонки, упомянутые в polars-условии гипотезы (pl.col('X') или pl.col("X"))."""
+    return {m.group(2) for m in _COND_COL_RE.finditer(condition)}
 
 
 def _required_columns(extra_conditions: tuple[str, ...] = ()) -> list[str]:
@@ -104,12 +105,17 @@ def _required_columns(extra_conditions: tuple[str, ...] = ()) -> list[str]:
       - таргеты return_/mfe_/mae_{h}m из features.toml future_horizons_min;
       - мета: open_time, symbol, category, event_id, entry_price;
       - vol_gk_30d (consumer: paper.shadow_run / paper_run_backtest — риск-стоп);
-      - OB feature columns (_get_ob_columns) + ob_data_quality.
+      - OB feature columns (_get_ob_columns) + ob_data_quality;
+      - extra_conditions: колонки гипотез Controller, инжектированных через
+        hypothesis_specs (иначе slim вырежет их из events и filter упадёт).
     """
     cols: set[str] = set()
     # 1. Условия гипотез (baseline + mr-control)
     for hyp in list(research_mod.HYPOTHESES) + _mr_hypotheses():
         cols |= _condition_cols(hyp.condition)
+    # 1a. Колонки гипотез, инжектированных Research Controller (hypothesis_specs)
+    for cond in extra_conditions:
+        cols |= _condition_cols(cond)
     # 2. Правила генерации гипотез (candle + OB)
     for rule in hgen_mod.all_rules():
         cols.add(rule.feature_id)
@@ -273,7 +279,17 @@ def run_pipeline(limit: int | None = None, category: str | None = None,
     # Обязательно после data/feature validation: триггерный файл в _TRIGGERS_DIR
     # наблюдается Rust-collector'ом → подписка на реальный OB-захват не должна
     # стартовать ранее, чем прошли все валидационные гейты.
-    triggers = ct_mod.evaluate_all_triggers(events)
+    triggers = []
+    if data_ready.load_frozen_boundary() is not None:
+        # Research Runner приостановил marketdata (фаза A, frozen_boundary.json):
+        # триггеры не могут быть захвачены, пока collector остановлен — не плодим
+        # backlog, который протухнет к рестарту (TTL в marketdata.rs).
+        logger.info(
+            "Candle triggers: skipped (marketdata paused for research, "
+            "frozen_boundary active)"
+        )
+    else:
+        triggers = ct_mod.evaluate_all_triggers(events)
     if triggers:
         logger.info("Candle triggers fired: %d (orderbook captures queued)",
                      len(triggers))

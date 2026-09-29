@@ -12,7 +12,8 @@ max_tests_cumulative = 600         # кумулятивно оценённых �
 
 [families]
 # Порядок перебора для FAMILY_SWITCH.
-order = ["baseline", "generator", "mr", "ob"]
+# mr исключён: колонка mr_sma120 отсутствует в signal events (сломанная ветка).
+order = ["baseline", "generator", "ob"]
 
 [horizons]
 # Только существующие таргеты из features.toml future_horizons_min.
@@ -80,11 +81,95 @@ operator = "gt"
 entry_side = "long"
 thresholds = [0.002, 0.003]
 
-[mr]
-# MR-семья (FAMILY_SWITCH=mr): условие mr_sma120 < threshold + is_green.
-column = "mr_sma120"
+[features.ma_slope_20_gt]
+column = "ma_slope_20"
+operator = "gt"
 entry_side = "long"
-thresholds = [-0.01, -0.02, -0.03, -0.05]
+thresholds = [0.001, 0.002]
+
+[features.ma_slope_20_lt]
+column = "ma_slope_20"
+operator = "lt"
+entry_side = "short"
+thresholds = [-0.001, -0.002]
+
+[features.breakout_failure]
+column = "breakout_failure"
+operator = "gt"
+entry_side = "short"
+thresholds = [0.5]
+
+[features.breakout_magnitude_gt]
+column = "breakout_magnitude"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.002, 0.005]
+
+[features.breakout_magnitude_lt]
+column = "breakout_magnitude"
+operator = "lt"
+entry_side = "short"
+thresholds = [-0.005, -0.01]
+
+[features.corr_eth_60]
+column = "corr_eth_60"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.6, 0.8]
+
+[features.fng_value_lt]
+column = "fng_value"
+operator = "lt"
+entry_side = "long"
+thresholds = [25.0, 30.0]
+
+[features.fng_value_gt]
+column = "fng_value"
+operator = "gt"
+entry_side = "short"
+thresholds = [65.0, 70.0]
+
+[features.ema_dist_20_gt]
+column = "ema_dist_20"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.005, 0.01]
+
+[features.ema_dist_20_lt]
+column = "ema_dist_20"
+operator = "lt"
+entry_side = "short"
+thresholds = [-0.005, -0.01]
+
+[features.btc_roc_20_gt]
+column = "btc_roc_20"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.005, 0.01]
+
+[features.btc_roc_20_lt]
+column = "btc_roc_20"
+operator = "lt"
+entry_side = "short"
+thresholds = [-0.005, -0.01]
+
+[features.eth_roc_20_gt]
+column = "eth_roc_20"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.005, 0.01]
+
+[features.eth_roc_20_lt]
+column = "eth_roc_20"
+operator = "lt"
+entry_side = "short"
+thresholds = [-0.005, -0.01]
+
+[features.consolidation]
+column = "consolidation_duration"
+operator = "gt"
+entry_side = "long"
+thresholds = [0.5]
 
 # --- Ось regime: AND с режимным фильтром ---
 
@@ -92,6 +177,10 @@ thresholds = [-0.01, -0.02, -0.03, -0.05]
 volatility_high = "pl.col('volatility_regime').is_in(['high', 'very_high'])"
 btc_up = "pl.col('btc_trend_regime') > 0"
 btc_down = "pl.col('btc_trend_regime') < 0"
+liquidity_high = "pl.col('liquidity_regime') == 'high'"
+breadth_positive = "pl.col('market_breadth_regime') > 0"
+corr_high = "pl.col('correlation_regime') == 'high'"
+session_asia = "pl.col('session') == 'asia'"
 
 # --- Ось combination: второе условие для CONDITIONAL (AND, <= 2 условий) ---
 
@@ -99,3 +188,6 @@ btc_down = "pl.col('btc_trend_regime') < 0"
 volatility_high = "pl.col('volatility_regime').is_in(['high', 'very_high'])"
 btc_up = "pl.col('btc_trend_regime') > 0"
 btc_down = "pl.col('btc_trend_regime') < 0"
+liquidity_high = "pl.col('liquidity_regime') == 'high'"
+breadth_positive = "pl.col('market_breadth_regime') > 0"
+corr_high = "pl.col('correlation_regime') == 'high'"

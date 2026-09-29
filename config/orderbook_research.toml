@@ -2,7 +2,7 @@
 # Continuous reconstructed orderbook for research
 
 # Reconstruction
-reconstruction_version = "1.0"
+reconstruction_version = "2.0"
 snapshot_frequency_sec = 5          # how often to write reconstructed state
 book_depth_levels = 50              # max levels from Bybit orderbook.50
 
@@ -17,7 +17,9 @@ post_event_minutes = 20             # M: how far forward for response features
 
 # Storage
 retention_days_raw = 7              # keep raw WS messages for N days (debug)
-retention_days_reconstructed = 365  # keep reconstructed snapshots
+retention_days_reconstructed = 3    # keep reconstructed snapshots
+disk_warning_gb = 15                # warn below this much free disk space
+disk_emergency_gb = 5               # clean up and shut down below this
 
 # Gap handling
 max_gap_before_snapshot = 10        # if >N updates missed, request new snapshot

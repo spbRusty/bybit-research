@@ -133,6 +133,16 @@ def api_research_cycle():
     return JSONResponse(collectors.get_research_cycle())
 
 
+@app.get("/api/research-controller")
+def api_research_controller():
+    return JSONResponse(collectors.get_research_controller())
+
+
+@app.get("/api/research-progress")
+def api_research_progress():
+    return JSONResponse(collectors.get_research_progress())
+
+
 @app.get("/api/alerts")
 def api_alerts():
     return JSONResponse(collectors.get_alerts())

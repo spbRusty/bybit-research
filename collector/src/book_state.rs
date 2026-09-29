@@ -72,7 +72,7 @@ impl BookState {
             last_update_id: 0,
             last_timestamp_ms: 0,
             has_valid_state: false,
-            reconstruction_version: "1.0".to_string(),
+            reconstruction_version: "2.0".to_string(),
             update_count: 0,
             snapshot_count: 0,
             update_id_jumps: 0,

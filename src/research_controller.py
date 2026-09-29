@@ -11,8 +11,10 @@ PAPER контроллером НИКОГДА не запускается: то�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +43,10 @@ FALLBACK_MODES = ["THRESHOLD_SWEEP", "REGIME_SWEEP", "HORIZON_SWEEP",
 
 TERMINAL_VERDICTS = ("ERROR", "STOP")
 
+# C4: после N подряд экспериментов одной области предпочитаем другие режимы/области.
+AREA_ROTATION_LIMIT = 3
+ROTATION_MODES = ["FAMILY_SWITCH", "THRESHOLD_SWEEP", "HORIZON_SWEEP"]
+
 
 def default_state() -> dict:
     return {
@@ -51,6 +57,9 @@ def default_state() -> dict:
         "n_tests_cumulative": 0,
         "family_usage": {},
         "used_config_hashes": [],
+        "tested_signatures": [],
+        "last_area": None,
+        "consecutive_same_area": 0,
         "last_experiment_id": None,
         "last_diagnosis": None,
         "last_mode": None,
@@ -134,6 +143,73 @@ class ResearchController:
                 logger.warning("controller journal: bad line skipped")
         return out
 
+    def _spec_records_for(self, mode: str, params: dict) -> list[dict]:
+        specs = build_hypothesis_specs(mode, params)
+        return [spec_record(h) for h in specs] if specs is not None else []
+
+    def _journal_history(self) -> tuple[list[str], list[str]]:
+        """Хеши и сигнатуры всех экспериментов журнала (включая прерванные).
+
+        RUNNING-записи несут parameters; из них и восстанавливаются сигнатуры.
+        """
+        hashes: list[str] = []
+        sigs: list[str] = []
+        for e in self._read_journal():
+            h = e.get("config_hash")
+            if h and h not in hashes:
+                hashes.append(h)
+            mode = e.get("mode")
+            params = e.get("parameters")
+            if not mode or not params:
+                continue
+            try:
+                sig = self._signature_for(mode, params,
+                                          self._spec_records_for(mode, params))
+            except Exception:
+                continue
+            if sig not in sigs:
+                sigs.append(sig)
+        return hashes, sigs
+
+    # --- signatures (§C3) -------------------------------------------------
+    @staticmethod
+    def _norm_condition(cond) -> str:
+        return "".join(str(cond).split())
+
+    @classmethod
+    def _signature_from_specs(cls, spec_records: list[dict]) -> str:
+        canon = sorted(
+            (cls._norm_condition(r.get("condition", "")),
+             r.get("entry_side") or "",
+             r.get("horizon_min") or "",
+             r.get("target_column") or "",
+             r.get("stop_loss") or "",
+             r.get("version") or "")
+            for r in spec_records)
+        raw = json.dumps(canon, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    @classmethod
+    def _signature_from_params(cls, params: dict) -> str:
+        raw = json.dumps(params, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _signature_for(self, mode: str, params: dict, spec_records: list[dict]) -> str:
+        """Каноническая сигнатура исследовательской проверки, БЕЗ mode.
+
+        BASELINE/FAMILY_SWITCH без спека -> по параметрам; иначе по спекам
+        (условия нормализованы по пробелам), чтобы REGIME_SWEEP и CONDITIONAL
+        с одинаковым условием давали один и тот же signature.
+        """
+        if spec_records:
+            return self._signature_from_specs(spec_records)
+        return self._signature_from_params(params)
+
+    @staticmethod
+    def _area_of(params: dict) -> str | None:
+        area = params.get("column")
+        return area if area else params.get("family")
+
     def _artifact_path(self, experiment_id: str) -> Path:
         return self._artifacts_dir / f"{experiment_id}.json"
 
@@ -178,25 +254,24 @@ class ResearchController:
                                            "reject_reasons": ["interrupted"]}
                 self._write_artifact(Experiment.from_dict(art))
 
-        # Собрать ledger конфигураций из журнала (включая прерванные).
-        entries = self._read_journal()
-        hashes: list[str] = []
-        for e in entries:
-            h = e.get("config_hash")
-            if h and h not in hashes:
-                hashes.append(h)
+        # Собрать ledger конфигураций и сигнатур из журнала (включая прерванные).
+        hashes, signatures = self._journal_history()
 
         if self._state_path.exists():
             state = self._load_state()
             for h in hashes:
                 if h not in state["used_config_hashes"]:
                     state["used_config_hashes"].append(h)
+            for s in signatures:
+                if s not in state["tested_signatures"]:
+                    state["tested_signatures"].append(s)
             if state["state"] == "RUNNING":
                 state["state"] = "SELECT_NEXT"
                 state["next_selection"] = None
         else:
             state = default_state()
             state["used_config_hashes"] = list(hashes)
+            state["tested_signatures"] = list(signatures)
             if entries:
                 last_entry = entries[-1]
                 state["cycle_id"] = last_entry.get("cycle_id")
@@ -233,7 +308,10 @@ class ResearchController:
         state["budget_used"] = 0
         state["n_tests_cumulative"] = 0
         state["family_usage"] = {}
-        state["used_config_hashes"] = []   # дедуп в пределах boundary; история — в журнале
+        # C1: история tested/used конфигураций переносится между циклами из журнала
+        hashes, signatures = self._journal_history()
+        state["used_config_hashes"] = hashes
+        state["tested_signatures"] = signatures
         state["next_selection"] = None
         state["last_diagnosis"] = None
         state["stop_reason"] = None
@@ -251,6 +329,26 @@ class ResearchController:
         return int(self.cfg.get("budget", {}).get("max_tests_cumulative", 600))
 
     # --- diagnosis (§3) --------------------------------------------------
+    def _best_t(self, report: dict) -> float | None:
+        """Лучший discovery t из отчёта: discovery_summary.max_t_stat или текст critic.
+
+        Реальный acceptance-отчёт (build_acceptance_report) не несёт
+        discovery_summary; t живёт только в тексте critic-ошибки вида
+        'costs: сильнейший discovery t=-77.63 <= 2.0 ...'. Парсим и то и другое.
+        """
+        ds = report.get("discovery_summary") or {}
+        max_t = ds.get("max_t_stat")
+        if max_t is not None:
+            return float(max_t)
+        for s in report.get("stages", []):
+            if s.get("stage") != "critic":
+                continue
+            for err in s.get("errors", []):
+                m = re.search(r"t=(-?\d+(?:\.\d+)?)", err)
+                if m:
+                    return float(m.group(1))
+        return None
+
     def _diagnose(self, report: dict) -> str:
         verdict = report.get("verdict")
         if verdict in ("ERROR", "STOP"):
@@ -265,6 +363,15 @@ class ResearchController:
             if "concentration" in reason or "dependency" in reason:
                 return "concentrated"
             if "costs" in reason:
+                # critic "costs" — это на деле порог t (best_t > min_t_stat,
+                # см. critic.review), а не стресс издержек. Диагноз следует
+                # за сигналом: t<=0 -> no_signal; t<=min_t_stat -> weak_signal;
+                # t>min_t_stat -> reject именно из-за издержек.
+                best_t = self._best_t(report)
+                if best_t is not None and best_t <= 0:
+                    return "no_signal"
+                if best_t is not None and best_t <= self._min_t_stat:
+                    return "weak_signal"
                 return "cost_sensitive"
 
         if stages.get("validation_gate", {}).get("status") == "REJECT":
@@ -276,7 +383,7 @@ class ResearchController:
 
         ds = report.get("discovery_summary") or {}
         max_t = ds.get("max_t_stat")
-        if (max_t is not None and max_t <= self._min_t_stat) or ds.get("n_positive_t", 0) == 0:
+        if (max_t is not None and max_t <= 0) or ds.get("n_positive_t", 0) == 0:
             return "no_signal"
         return "weak_signal"
 
@@ -367,24 +474,52 @@ class ResearchController:
         if allow_baseline and state.get("budget_used", 0) == 0:
             modes = ["BASELINE"] + [m for m in modes if m != "BASELINE"]
 
+        # C4: после нескольких подряд экспериментов одной области ротируемся.
+        last_area = state.get("last_area")
+        rotating = state.get("consecutive_same_area", 0) >= AREA_ROTATION_LIMIT
+        if rotating and last_area:
+            preferred = [m for m in ROTATION_MODES if m in modes]
+            modes = preferred + [m for m in modes if m not in preferred]
+
+        fallback = None
         for mode in modes:
             for variant in self._variants(mode, parent):
                 params = variant["parameters"]
                 fam = params.get("family")
                 if fam and self._family_used(state, fam) >= self._max_per_family():
                     continue
-                specs = build_hypothesis_specs(mode, params)
-                spec_records = [spec_record(h) for h in specs] if specs is not None else []
+                spec_records = self._spec_records_for(mode, params)
                 chash = compute_experiment_hash(mode, params, spec_records)
                 if chash in state.get("used_config_hashes", []):
                     continue
-                variant.update({
+                sig = self._signature_for(mode, params, spec_records)
+                if sig in state.get("tested_signatures", []):
+                    continue
+                built = {
                     "mode": mode,
+                    "parameters": params,
                     "config_hash": chash,
                     "hypothesis_specs": spec_records,
-                })
-                return variant
-        return None
+                }
+                area = self._area_of(params)
+                if rotating and last_area and area == last_area:
+                    if fallback is None:
+                        fallback = built
+                    continue
+                return built
+        return fallback
+
+    def _selection_stale(self, state: dict, selection: dict) -> bool:
+        chash = selection.get("config_hash")
+        if chash and chash in state.get("used_config_hashes", []):
+            return True
+        mode = selection.get("mode")
+        params = selection.get("parameters")
+        if not mode or not params:
+            return False
+        sig = self._signature_for(mode, params,
+                                  selection.get("hypothesis_specs") or [])
+        return sig in state.get("tested_signatures", [])
 
     def _parent_experiment(self, state: dict) -> Experiment | None:
         eid = state.get("last_experiment_id")
@@ -403,20 +538,25 @@ class ResearchController:
             self._recover()
             state = self._load_state()
 
-            if state["state"] == "STOPPED":
-                return {"state": "STOPPED", "stop_reason": state.get("stop_reason")}
-            if state["state"] == "PASS_PENDING_PAPER":
-                return {"state": "PASS_PENDING_PAPER",
-                        "experiment_id": state.get("pass_pending")}
-
             ready, reasons, metrics = self._gate()
             if not ready:
+                if state["state"] in ("STOPPED", "PASS_PENDING_PAPER"):
+                    # терминальные состояния не затираются WAIT_DATA
+                    return {"state": state["state"],
+                            "stop_reason": state.get("stop_reason")}
                 state["state"] = "WAIT_DATA"
                 self._save_state(state)
                 return {"state": "WAIT_DATA", "reasons": reasons}
 
             boundary = self._boundary(metrics)
             cycle_id = self._cycle_id(boundary)
+            if state["state"] == "PASS_PENDING_PAPER":
+                return {"state": "PASS_PENDING_PAPER",
+                        "experiment_id": state.get("pass_pending")}
+            # Терминальный STOPPED относится к cycle_id: при смене boundary цикл
+            # возобновляется (_reset_cycle -> budget_used=0, READY, BASELINE).
+            if state["state"] == "STOPPED" and state.get("cycle_id") == cycle_id:
+                return {"state": "STOPPED", "stop_reason": state.get("stop_reason")}
             if state.get("cycle_id") != cycle_id:
                 state = self._reset_cycle(state, cycle_id, boundary, metrics)
 
@@ -433,6 +573,11 @@ class ResearchController:
 
             parent = self._parent_experiment(state)
             selection = state.get("next_selection")
+            if selection and self._selection_stale(state, selection):
+                logger.info("Cached next_selection %s уже использован: перевыбор",
+                            selection.get("config_hash"))
+                state["next_selection"] = None
+                selection = None
             if not selection:
                 selection = self._select_next(state, parent,
                                               state.get("last_diagnosis"),
@@ -543,6 +688,15 @@ class ResearchController:
         state["n_tests_cumulative"] += int(n_tests or 0)
         if exp.config_hash not in state["used_config_hashes"]:
             state["used_config_hashes"].append(exp.config_hash)
+        sig = self._signature_for(mode, params, selection["hypothesis_specs"] or [])
+        if sig not in state["tested_signatures"]:
+            state["tested_signatures"].append(sig)
+        area = self._area_of(params)
+        if area and area == state.get("last_area"):
+            state["consecutive_same_area"] = state.get("consecutive_same_area", 0) + 1
+        else:
+            state["last_area"] = area
+            state["consecutive_same_area"] = 1 if area else 0
         fam = params.get("family")
         if fam:
             state["family_usage"][fam] = self._family_used(state, fam) + 1

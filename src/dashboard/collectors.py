@@ -554,14 +554,19 @@ def get_signals() -> dict:
         if not events_path.exists():
             return {"count": 0, "symbols": []}
         try:
-            df = pl.read_parquet(events_path)
+            # Lazy scan: читается только колонка symbol, а не весь файл (~6.8 GB RAM)
+            sym_counts = (pl.scan_parquet(events_path)
+                          .group_by("symbol")
+                          .agg(pl.len().alias("count"))
+                          .sort("count", descending=True)
+                          .collect())
         except Exception:
             return {"count": 0, "symbols": []}
-        if df.height == 0:
+        if sym_counts.height == 0:
             return {"count": 0, "symbols": []}
-        sym_counts = [_sanitize(d) for d in (df.group_by("symbol").agg(pl.len().alias("count"))
-                      .sort("count", descending=True).to_dicts())]
-        return {"count": df.height, "symbols": sym_counts[:15]}
+        total = int(sym_counts["count"].sum())
+        symbols = [_sanitize(d) for d in sym_counts.to_dicts()]
+        return {"count": total, "symbols": symbols[:15]}
     return _cached("signals", 30, _load)
 
 
@@ -683,29 +688,26 @@ def get_ob_collector() -> dict:
             "disk_free_gb": None,
         }
     
-    entries = []
+    by_symbol = {}
     try:
+        size = metrics_path.stat().st_size
         with open(metrics_path) as f:
-            for line in f:
+            f.seek(max(0, size - 2 * 1024 * 1024))
+            f.readline()
+            for line in deque(f, maxlen=20000):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    e = json.loads(line)
+                    by_symbol[e.get("symbol", "?")] = e
                 except json.JSONDecodeError:
                     continue
     except Exception:
         return {"status": "ERROR", "reason": "Cannot read metrics file"}
     
-    if not entries:
+    if not by_symbol:
         return {"status": "NO DATA", "reason": "Metrics file empty"}
-    
-    by_symbol = {}
-    for e in entries:
-        sym = e.get("symbol", "?")
-        if sym not in by_symbol:
-            by_symbol[sym] = []
-        by_symbol[sym].append(e)
     
     symbols = []
     total_updates = 0
@@ -715,10 +717,7 @@ def get_ob_collector() -> dict:
     disk_free = None
     latest_ts = None
     
-    for sym, sym_entries in by_symbol.items():
-        sym_entries.sort(key=lambda x: x.get("timestamp", ""))
-        last = sym_entries[-1]
-        
+    for sym, last in by_symbol.items():
         updates = last.get("updates_received", 0)
         rows = last.get("rows_written", 0)
         reconnects = last.get("reconnects", 0)
@@ -1017,22 +1016,11 @@ def get_research_cycle() -> dict:
                     "config_hash": art.get("config_hash"),
                     "status": art.get("status"),
                     "final_verdict": art.get("final_verdict"),
-                    "diagnosis": art.get("reject_diagnosis"),
+                    "diagnosis": (art.get("reject_diagnosis") or {}).get("category"),
                     "n_hypotheses": len(art.get("hypothesis_specs") or []),
                 }
             except Exception:
                 experiment = None
-
-    verdict = None
-    finalist = None
-    reports = sorted(RESULTS_DIR.glob("acceptance_*.json"), reverse=True)
-    if reports:
-        try:
-            rep = json.loads(reports[0].read_text())
-            finalist = rep.get("finalist")
-            verdict = rep.get("verdict")
-        except Exception:
-            pass
 
     ctl_cfg = _load_toml("research_controller.toml")
     paper = get_paper()
@@ -1052,8 +1040,6 @@ def get_research_cycle() -> dict:
         "pass_pending": ctrl.get("pass_pending"),
         "paper_handoff": ctrl.get("paper_handoff"),
         "experiment": experiment,
-        "verdict": verdict,
-        "finalist": finalist,
         "paper": {
             "mode": paper.get("mode"),
             "hypothesis_id": paper.get("hypothesis_id"),
@@ -1065,6 +1051,196 @@ def get_research_cycle() -> dict:
             "started_at": paper.get("started_at"),
             "provenance": paper.get("provenance"),
         },
+    }
+
+
+# ─── 18c. Research Controller — real state from controller files ──
+
+def _read_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _latest_frozen_boundary() -> dict | None:
+    """Latest frozen boundary the runner saved (research_cycle.log), if any."""
+    log_path = LOGS_DIR / "research_cycle.log"
+    if not log_path.exists():
+        return None
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()[-200:]
+    except Exception:
+        return None
+    import re
+    for line in reversed(lines):
+        m = re.search(r"Frozen boundary saved: klines_max=(\S+) cycle_id=(\S+)", line)
+        if m:
+            return {"klines_max": m.group(1), "cycle_id": m.group(2)}
+        m = re.search(r"New cycle boundary from data: klines_max=(\S+) config_hash=(\S+)", line)
+        if m:
+            return {"klines_max": m.group(1), "cycle_id": None}
+    return None
+
+
+def get_research_controller() -> dict:
+    """Research Controller real state: controller_state.json + journal artifact + runner log."""
+    ctrl = _read_json_file(RESEARCH_DIR / "controller_state.json")
+    ctl_cfg = _load_toml("research_controller.toml")
+    budget_max = int(ctl_cfg.get("budget", {}).get("max_experiments_per_boundary", 12))
+    budget_used = int(ctrl.get("budget_used", 0) or 0)
+
+    last_exp = None
+    eid = ctrl.get("last_experiment_id")
+    if eid:
+        art = _read_json_file(RESEARCH_DIR / "experiments" / f"{eid}.json")
+        diag = art.get("reject_diagnosis") or {}
+        last_exp = {
+            "experiment_id": eid,
+            "mode": art.get("mode") or ctrl.get("last_mode"),
+            "status": art.get("status"),
+            "final_verdict": art.get("final_verdict"),
+            "diagnosis": diag.get("category") or ctrl.get("last_diagnosis"),
+            "reject_reasons": diag.get("reject_reasons", []),
+            "finished_at_utc": art.get("finished_at_utc"),
+        }
+
+    ns = ctrl.get("next_selection") or {}
+    params = ns.get("parameters") or {}
+    next_exp = None
+    if ns:
+        next_exp = {
+            "mode": ns.get("mode"),
+            "feature": params.get("feature"),
+            "operator": params.get("operator"),
+            "entry_side": params.get("entry_side"),
+            "threshold": params.get("threshold"),
+            "regime_key": params.get("regime_key"),
+            "horizons": params.get("horizons"),
+            "config_hash": ns.get("config_hash"),
+        }
+
+    frozen = _latest_frozen_boundary()
+    state = ctrl.get("state")
+    src = "controller_state.json"
+
+    if not ctrl:
+        status, reason = "ERROR", "N/A (controller_state.json)"
+    elif budget_used >= budget_max:
+        status, reason = "BUDGET_EXHAUSTED", f"budget {budget_used}/{budget_max} used"
+    elif state == "RUNNING":
+        status, reason = "RUNNING", f"experiment in progress: {eid}"
+    elif state == "SELECT_NEXT":
+        status, reason = "WAITING_FOR_NEW_DATA", f"SELECT_NEXT, budget left {budget_max - budget_used}"
+    elif state == "PASS_PENDING_PAPER":
+        status, reason = "PASS_PENDING_PAPER", "waiting paper validation"
+    elif state == "STOPPED":
+        status, reason = "STOPPED", ctrl.get("stop_reason") or "controller stopped"
+    else:
+        status, reason = state or "UNKNOWN", f"source: {src}"
+
+    return {
+        "status": status,
+        "status_reason": reason,
+        "state": state,
+        "cycle_id": ctrl.get("cycle_id"),
+        "budget_used": budget_used,
+        "budget_max": budget_max,
+        "boundary_klines_max": (ctrl.get("boundary") or {}).get("klines_max"),
+        "boundary_config_hash": (ctrl.get("boundary") or {}).get("gate_config_hash"),
+        "frozen_next": frozen,
+        "last_experiment": last_exp,
+        "last_diagnosis": ctrl.get("last_diagnosis"),
+        "last_mode": ctrl.get("last_mode"),
+        "next_experiment": next_exp,
+        "pass_pending": ctrl.get("pass_pending"),
+        "stop_reason": ctrl.get("stop_reason"),
+        "updated_at_utc": ctrl.get("updated_at_utc"),
+        "source": src,
+    }
+
+
+def get_research_progress() -> dict:
+    """Progress of the current controller cycle from experiments.jsonl + artifacts."""
+    ctrl = _read_json_file(RESEARCH_DIR / "controller_state.json")
+    ctl_cfg = _load_toml("research_controller.toml")
+    budget_max = int(ctl_cfg.get("budget", {}).get("max_experiments_per_boundary", 12))
+    budget_used = int(ctrl.get("budget_used", 0) or 0)
+    cycle_id = ctrl.get("cycle_id")
+
+    journal_path = RESEARCH_DIR / "experiments.jsonl"
+    exps: dict[str, dict] = {}
+    journal_ok = False
+    if journal_path.exists():
+        try:
+            for line in journal_path.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                eid = rec.get("experiment_id")
+                if not eid:
+                    continue
+                entry = exps.setdefault(eid, {})
+                entry.update(rec)  # terminal record wins (last line per experiment)
+                for k in ("mode", "parameters", "created_at_utc"):
+                    if k in rec and k not in entry:
+                        entry[k] = rec[k]
+            journal_ok = True
+        except Exception:
+            pass
+
+    in_cycle = [e for e in exps.values() if e.get("cycle_id") == cycle_id]
+
+    n_running = sum(1 for e in in_cycle if e.get("status") == "RUNNING")
+    n_pass = sum(1 for e in in_cycle if e.get("final_verdict") in ("PASS", "CANDIDATE"))
+    n_reject = sum(1 for e in in_cycle if e.get("final_verdict") == "REJECT")
+    n_failed = sum(1 for e in in_cycle if e.get("status") == "FAILED")
+
+    last_exp = None
+    if in_cycle:
+        last = max(in_cycle, key=lambda e: e.get("finished_at_utc") or e.get("created_at_utc") or "")
+        last_reject_reason = None
+        if last.get("final_verdict") == "REJECT":
+            art = _read_json_file(RESEARCH_DIR / "experiments" / f"{last['experiment_id']}.json")
+            diag = art.get("reject_diagnosis") or {}
+            reasons = diag.get("reject_reasons", [])
+            last_reject_reason = reasons[0] if reasons else None
+        last_exp = {
+            "experiment_id": last.get("experiment_id"),
+            "mode": last.get("mode"),
+            "status": last.get("status"),
+            "final_verdict": last.get("final_verdict"),
+            "finished_at_utc": last.get("finished_at_utc"),
+            "reject_reason": last_reject_reason,
+        }
+
+    state = ctrl.get("state")
+    if not ctrl:
+        status, reason = "ERROR", "N/A (controller_state.json)"
+    elif budget_used >= budget_max:
+        status, reason = "BUDGET_EXHAUSTED", f"budget {budget_used}/{budget_max} used"
+    elif state == "RUNNING":
+        status, reason = "RUNNING", f"experiment in progress: {(last_exp or {}).get('experiment_id')}"
+    elif state == "SELECT_NEXT":
+        status, reason = "WAITING_FOR_NEW_DATA", f"SELECT_NEXT, budget left {budget_max - budget_used}"
+    elif state == "PASS_PENDING_PAPER":
+        status, reason = "PASS_PENDING_PAPER", "waiting paper validation"
+    else:
+        status, reason = state or "UNKNOWN", "source: controller_state.json"
+
+    return {
+        "status": status,
+        "status_reason": reason,
+        "cycle_id": cycle_id,
+        "budget_used": budget_used,
+        "budget_max": budget_max,
+        "journal_ok": journal_ok,
+        "experiments_in_cycle": len(in_cycle),
+        "counts": {"RUNNING": n_running, "PASS": n_pass, "REJECT": n_reject, "FAILED": n_failed},
+        "last_experiment": last_exp,
     }
 
 

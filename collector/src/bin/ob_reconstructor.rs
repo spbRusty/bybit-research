@@ -3,10 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
@@ -23,9 +23,7 @@ const DEFAULT_DATA_ROOT: &str = "data/market/orderbook/reconstructed";
 const PING_INTERVAL: u64 = 30;
 const WS_ACTIVITY_TIMEOUT: u64 = 90;
 const MAX_BACKOFF: u64 = 60;
-const DISK_WARNING_GB: u64 = 10;
-const DISK_CRITICAL_GB: u64 = 5;
-const DISK_EMERGENCY_GB: u64 = 1;
+const METRICS_RETENTION_DAYS: u64 = 2;
 const UNIVERSE_REFRESH_INTERVAL: u64 = 86400;
 const WRITER_QUEUE_CAP: usize = 4096;
 const N_SHARDS: usize = 8;
@@ -176,6 +174,80 @@ struct Config {
     data_root: PathBuf,
     raw_data_root: PathBuf,
     no_raw: bool,
+    storage: StorageConfig,
+}
+
+/// Настройки хранения/диска из config/orderbook_research.toml.
+/// Читаются только целочисленные ключи вида `key = N` (без секций/массивов).
+#[derive(Debug, Clone, Copy)]
+struct StorageConfig {
+    retention_days_raw: u64,
+    retention_days_reconstructed: u64,
+    disk_warning_gb: u64,
+    disk_emergency_gb: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            retention_days_raw: 7,
+            retention_days_reconstructed: 365,
+            disk_warning_gb: 15,
+            disk_emergency_gb: 5,
+        }
+    }
+}
+
+/// Минимальный парсер TOML-конфига: ищет `key = N` по всей строке, игнорируя комментарии.
+/// Ошибочное/отсутствующее значение = None (вызывающий оставляет дефолт).
+fn read_toml_uint(content: &str, key: &str) -> Option<u64> {
+    for line in content.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+impl StorageConfig {
+    fn from_toml(content: &str) -> Self {
+        let defaults = Self::default();
+        Self {
+            retention_days_raw: read_toml_uint(content, "retention_days_raw").unwrap_or(defaults.retention_days_raw),
+            retention_days_reconstructed: read_toml_uint(content, "retention_days_reconstructed").unwrap_or(defaults.retention_days_reconstructed),
+            disk_warning_gb: read_toml_uint(content, "disk_warning_gb").unwrap_or(defaults.disk_warning_gb),
+            disk_emergency_gb: read_toml_uint(content, "disk_emergency_gb").unwrap_or(defaults.disk_emergency_gb),
+        }
+    }
+
+    /// Пути поиска конфига: явный --config, затем config/ и ../config/ от CWD.
+    fn load(config_arg: Option<&Path>) -> Self {
+        let candidates: Vec<PathBuf> = config_arg
+            .map(|p| vec![p.to_path_buf()])
+            .unwrap_or_default()
+            .into_iter()
+            .chain([
+                PathBuf::from("config/orderbook_research.toml"),
+                PathBuf::from("../config/orderbook_research.toml"),
+            ])
+            .collect();
+        for path in &candidates {
+            if let Ok(content) = fs::read_to_string(path) {
+                let storage = Self::from_toml(&content);
+                eprintln!("[config] storage from {}", path.display());
+                return storage;
+            }
+        }
+        eprintln!("[config] storage config not found (used defaults: raw={}d recon={}d warn={}GB emerg={}GB)",
+            Self::default().retention_days_raw, Self::default().retention_days_reconstructed,
+            Self::default().disk_warning_gb, Self::default().disk_emergency_gb);
+        Self::default()
+    }
 }
 
 impl Config {
@@ -187,6 +259,7 @@ impl Config {
         let mut data_root = PathBuf::from(DEFAULT_DATA_ROOT);
         let mut raw_data_root = PathBuf::from("data/market/orderbook/raw");
         let mut no_raw = false;
+        let mut config_arg: Option<PathBuf> = None;
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
@@ -204,6 +277,7 @@ impl Config {
                 "--data-root" => { i += 1; if let Some(d) = args.get(i) { data_root = PathBuf::from(d); } }
                 "--raw-data-root" => { i += 1; if let Some(d) = args.get(i) { raw_data_root = PathBuf::from(d); } }
                 "--no-raw" => { no_raw = true; }
+                "--config" => { i += 1; if let Some(p) = args.get(i) { config_arg = Some(PathBuf::from(p)); } }
                 _ => {}
             }
             i += 1;
@@ -221,7 +295,8 @@ impl Config {
             }
         }
         if symbols.is_empty() { symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]; }
-        Self { symbols, universe_path, freq, data_root, raw_data_root, no_raw }
+        let storage = StorageConfig::load(config_arg.as_deref());
+        Self { symbols, universe_path, freq, data_root, raw_data_root, no_raw, storage }
     }
 
     fn load_universe(&self) -> Vec<String> {
@@ -361,6 +436,7 @@ struct SymState {
     reconnect_count: u64,
     last_write: std::time::Instant,
     last_snap_req: std::time::Instant,
+    last_snapshot: std::time::Instant,
     no_raw: bool,
     freq: Duration,
     updates_received: u64,
@@ -381,6 +457,7 @@ impl SymState {
             reconnect_count: 0,
             last_write: std::time::Instant::now(),
             last_snap_req: std::time::Instant::now(),
+            last_snapshot: std::time::Instant::now(),
             no_raw,
             freq,
             updates_received: 0,
@@ -415,6 +492,8 @@ impl SymState {
     }
 
     fn maybe_snapshot(&mut self) {
+        if self.last_snapshot.elapsed() < self.freq { return; }
+        self.last_snapshot = std::time::Instant::now();
         if let Some(snap) = self.book.snapshot() { self.pending.push(snap); }
     }
 
@@ -577,33 +656,66 @@ async fn flush_metrics_loop(metrics_rx: &mut mpsc::Receiver<MetricsEntry>, metri
         Ok(f) => f,
         Err(e) => { eprintln!("[metrics] cannot open {metrics_path:?}: {e:#}"); return; }
     };
+    let mut last_compact = SystemTime::now();
     while let Some(entry) = metrics_rx.recv().await {
         if let Ok(json) = serde_json::to_string(&entry) {
             let _ = writeln!(file, "{json}");
         }
+        if last_compact.elapsed().unwrap_or_default() >= Duration::from_secs(3600) {
+            file.flush().ok();
+            let _ = compact_metrics(metrics_path, METRICS_RETENTION_DAYS);
+            match fs::OpenOptions::new().create(true).append(true).open(metrics_path) {
+                Ok(f) => file = f,
+                Err(e) => { eprintln!("[metrics] cannot reopen {metrics_path:?}: {e:#}"); break; }
+            }
+            last_compact = SystemTime::now();
+        }
     }
 }
 
-async fn cleanup_raw_data(raw_data_root: &Path, shutdown: Arc<AtomicBool>) {
-    let retention = Duration::from_secs(7 * 86400);
-    loop {
-        if shutdown.load(Ordering::Relaxed) { break; }
-        sleep(Duration::from_secs(3600)).await;
-        if let Ok(entries) = fs::read_dir(raw_data_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Ok(sym_entries) = fs::read_dir(&path) {
-                        for sym_entry in sym_entries.flatten() {
-                            let file_path = sym_entry.path();
-                            if file_path.extension().map_or(false, |e| e == "jsonl") {
-                                if let Ok(meta) = file_path.metadata() {
-                                    if let Ok(modified) = meta.modified() {
-                                        if modified.elapsed().unwrap_or_default() > retention {
-                                            let _ = fs::remove_file(&file_path);
-                                            eprintln!("[cleanup] deleted raw: {}", file_path.display());
-                                        }
-                                    }
+/// Сжимает _metrics.jsonl: переписывает файл, оставляя строки не старше retention_days.
+fn compact_metrics(metrics_path: &Path, retention_days: u64) -> Result<u64> {
+    use std::io::{BufRead, BufReader, Write};
+    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
+    let src = fs::File::open(metrics_path)?;
+    let tmp = metrics_path.with_extension("jsonl.tmp");
+    let mut dst = fs::File::create(&tmp)?;
+    let mut kept: u64 = 0;
+    for line in BufReader::new(src).lines() {
+        let line = line?;
+        let keep = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|v| v["timestamp"].as_str().map(|s| s.to_string()))
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .is_some_and(|ts| ts > cutoff);
+        if keep {
+            writeln!(dst, "{line}")?;
+            kept += 1;
+        }
+    }
+    drop(dst);
+    fs::rename(&tmp, metrics_path)?;
+    Ok(kept)
+}
+
+/// Синхронная очистка raw: удаляет .jsonl старше retention_days (по mtime). Возвращает число удалённых.
+fn cleanup_raw_once(raw_data_root: &Path, retention_days: u64) -> u64 {
+    let retention = Duration::from_secs(retention_days * 86400);
+    let mut deleted = 0u64;
+    let Ok(entries) = fs::read_dir(raw_data_root) else { return deleted };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(sym_entries) = fs::read_dir(&path) {
+                for sym_entry in sym_entries.flatten() {
+                    let file_path = sym_entry.path();
+                    if file_path.extension().map_or(false, |e| e == "jsonl") {
+                        if let Ok(meta) = file_path.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                if modified.elapsed().unwrap_or_default() > retention {
+                                    let _ = fs::remove_file(&file_path);
+                                    eprintln!("[cleanup] deleted raw: {}", file_path.display());
+                                    deleted += 1;
                                 }
                             }
                         }
@@ -611,6 +723,52 @@ async fn cleanup_raw_data(raw_data_root: &Path, shutdown: Arc<AtomicBool>) {
                 }
             }
         }
+    }
+    deleted
+}
+
+async fn cleanup_raw_data(raw_data_root: &Path, retention_days: u64, shutdown: Arc<AtomicBool>) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) { break; }
+        sleep(Duration::from_secs(3600)).await;
+        cleanup_raw_once(raw_data_root, retention_days);
+    }
+}
+
+/// Удаляет reconstructed-файлы, дата которых (из имени {YYYY-MM-DD}[-HH].parquet)
+/// старше retention_days. Текущий день и .tmp/прочие файлы не трогаются;
+/// legacy-файлы {date}.parquet (без часа) тоже учитываются.
+fn cleanup_reconstructed_once(data_root: &Path, retention_days: u64, today: NaiveDate) -> u64 {
+    if retention_days == 0 { return 0; }
+    let cutoff = today - chrono::Duration::days(retention_days as i64);
+    let mut deleted = 0u64;
+    let Ok(entries) = fs::read_dir(data_root) else { return 0 };
+    for entry in entries.flatten() {
+        let sym_dir = entry.path();
+        if !sym_dir.is_dir() { continue; }
+        let Ok(files) = fs::read_dir(&sym_dir) else { continue };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().map_or(false, |e| e != "parquet") { continue; }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(date_str) = name.get(..10) else { continue };
+            let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else { continue };
+            if date < cutoff {
+                let _ = fs::remove_file(&path);
+                eprintln!("[cleanup] deleted reconstructed: {}", path.display());
+                deleted += 1;
+            }
+        }
+    }
+    deleted
+}
+
+async fn cleanup_reconstructed_data(data_root: &Path, retention_days: u64, shutdown: Arc<AtomicBool>) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) { break; }
+        sleep(Duration::from_secs(3600)).await;
+        let today = Utc::now().date_naive();
+        cleanup_reconstructed_once(data_root, retention_days, today);
     }
 }
 
@@ -958,8 +1116,15 @@ async fn main() -> Result<()> {
 
     if !config.no_raw {
         let raw_root = config.raw_data_root.clone();
+        let raw_retention = config.storage.retention_days_raw;
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { cleanup_raw_data(&raw_root, shutdown).await; });
+        tokio::spawn(async move { cleanup_raw_data(&raw_root, raw_retention, shutdown).await; });
+    }
+    {
+        let recon_root = config.data_root.clone();
+        let recon_retention = config.storage.retention_days_reconstructed;
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { cleanup_reconstructed_data(&recon_root, recon_retention, shutdown).await; });
     }
 
     {
@@ -1013,14 +1178,27 @@ async fn main() -> Result<()> {
         }
 
         if last_metrics.elapsed() >= Duration::from_secs(60) {
-            let disk_free = get_disk_free_gb(&config.data_root);
-            if disk_free > 0.0 && disk_free < DISK_CRITICAL_GB as f64 {
+            let mut disk_free = get_disk_free_gb(&config.data_root);
+            if disk_free > 0.0 && disk_free < config.storage.disk_warning_gb as f64 {
                 eprintln!("[disk] WARNING: {:.1} GB free", disk_free);
             }
-            if disk_free > 0.0 && disk_free < DISK_EMERGENCY_GB as f64 {
-                eprintln!("[disk] EMERGENCY: {:.1} GB free, shutting down", disk_free);
-                shutdown.store(true, Ordering::SeqCst);
-                break;
+            if disk_free > 0.0 && disk_free < config.storage.disk_emergency_gb as f64 {
+                eprintln!("[disk] EMERGENCY: {:.1} GB free, running cleanup", disk_free);
+                let raw_root = config.raw_data_root.clone();
+                let recon_root = config.data_root.clone();
+                let raw_retention = config.storage.retention_days_raw;
+                let recon_retention = config.storage.retention_days_reconstructed;
+                let today = Utc::now().date_naive();
+                let deleted_raw = if config.no_raw { 0 } else { cleanup_raw_once(&raw_root, raw_retention) };
+                let deleted_recon = cleanup_reconstructed_once(&recon_root, recon_retention, today);
+                eprintln!("[disk] cleanup done: raw={deleted_raw} reconstructed={deleted_recon}");
+                let disk_after = get_disk_free_gb(&config.data_root);
+                if disk_after > 0.0 && disk_after < config.storage.disk_emergency_gb as f64 {
+                    eprintln!("[disk] EMERGENCY: {:.1} GB free after cleanup, shutting down", disk_after);
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+                disk_free = disk_after;
             }
             let states_read = states.read().await;
             for state in states_read.values() {
@@ -1250,6 +1428,143 @@ mod tests {
         let mut total = 0u64;
         for batch in reader { total += batch.unwrap().num_rows() as u64; }
         assert_eq!(total, 10, "written file must contain all buffered rows");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_storage_config_reads_raw_retention() {
+        let content = "retention_days_raw = 7\nretention_days_reconstructed = 3\ndisk_warning_gb = 15\ndisk_emergency_gb = 5\n";
+        let cfg = StorageConfig::from_toml(content);
+        assert_eq!(cfg.retention_days_raw, 7);
+    }
+
+    #[test]
+    fn test_storage_config_reads_reconstructed_retention() {
+        let content = "retention_days_raw = 7\nretention_days_reconstructed = 3\ndisk_warning_gb = 15\ndisk_emergency_gb = 5\n";
+        let cfg = StorageConfig::from_toml(content);
+        assert_eq!(cfg.retention_days_reconstructed, 3);
+    }
+
+    #[test]
+    fn test_storage_config_reads_disk_limits() {
+        let content = "retention_days_raw = 7\nretention_days_reconstructed = 3\ndisk_warning_gb = 15\ndisk_emergency_gb = 5\n";
+        let cfg = StorageConfig::from_toml(content);
+        assert_eq!(cfg.disk_warning_gb, 15);
+        assert_eq!(cfg.disk_emergency_gb, 5);
+    }
+
+    #[test]
+    fn test_storage_config_defaults_when_missing() {
+        let cfg = StorageConfig::from_toml("# no storage keys here");
+        assert_eq!(cfg.retention_days_raw, 7);
+        assert_eq!(cfg.retention_days_reconstructed, 365);
+        assert_eq!(cfg.disk_warning_gb, 15);
+        assert_eq!(cfg.disk_emergency_gb, 5);
+    }
+
+    fn set_mtime(path: &Path, age: Duration) {
+        let f = fs::File::open(path).unwrap();
+        let _ = f.set_times(
+            SystemTime::now()
+                .checked_sub(age)
+                .map(|t| fs::FileTimes::new().set_modified(t))
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_cleanup_raw_keeps_recent_files() {
+        let dir = std::env::temp_dir().join(format!("ob_recon_raw_keep_{}", std::process::id()));
+        let sym = dir.join("BTCUSDT");
+        fs::create_dir_all(&sym).unwrap();
+        let recent = sym.join("2026-09-24.jsonl");
+        fs::write(&recent, "{}").unwrap();
+        set_mtime(&recent, Duration::from_secs(3600));
+
+        let deleted = cleanup_raw_once(&dir, 7);
+        assert_eq!(deleted, 0);
+        assert!(recent.exists(), "recent raw file must be kept");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cleanup_raw_removes_old_files() {
+        let dir = std::env::temp_dir().join(format!("ob_recon_raw_del_{}", std::process::id()));
+        let sym = dir.join("BTCUSDT");
+        fs::create_dir_all(&sym).unwrap();
+        let old = sym.join("2026-09-10.jsonl");
+        fs::write(&old, "{}").unwrap();
+        set_mtime(&old, Duration::from_secs(10 * 86400));
+
+        let deleted = cleanup_raw_once(&dir, 7);
+        assert_eq!(deleted, 1);
+        assert!(!old.exists(), "raw file older than retention must be deleted");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cleanup_reconstructed_removes_old_keeps_today() {
+        let dir = std::env::temp_dir().join(format!("ob_recon_recon_{}", std::process::id()));
+        let sym = dir.join("BTCUSDT");
+        fs::create_dir_all(&sym).unwrap();
+        let old_hourly = sym.join("2026-09-10-08.parquet");
+        let old_daily = sym.join("2026-09-10.parquet");
+        let today_hourly = sym.join("2026-09-24-09.parquet");
+        let tmp_file = sym.join("2026-09-10-08.parquet.tmp");
+        for p in [&old_hourly, &old_daily, &today_hourly, &tmp_file] {
+            fs::write(p, "x").unwrap();
+        }
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let deleted = cleanup_reconstructed_once(&dir, 3, today);
+        assert_eq!(deleted, 2, "old hourly+daily deleted, today kept, .tmp untouched");
+        assert!(!old_hourly.exists());
+        assert!(!old_daily.exists());
+        assert!(today_hourly.exists(), "current-day file must be kept");
+        assert!(tmp_file.exists(), "non-parquet file (.tmp) must be kept");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cleanup_reconstructed_disabled_when_zero() {
+        let dir = std::env::temp_dir().join(format!("ob_recon_recon0_{}", std::process::id()));
+        let sym = dir.join("BTCUSDT");
+        fs::create_dir_all(&sym).unwrap();
+        let old = sym.join("2026-01-01-00.parquet");
+        fs::write(&old, "x").unwrap();
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let deleted = cleanup_reconstructed_once(&dir, 0, today);
+        assert_eq!(deleted, 0, "retention 0 disables cleanup");
+        assert!(old.exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_compact_metrics_retention() {
+        let dir = std::env::temp_dir().join(format!("ob_recon_metrics_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("_metrics.jsonl");
+        let fresh_ts = Utc::now().to_rfc3339();
+        let old_ts = (Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        fs::write(
+            &path,
+            format!(
+                "{{\"symbol\":\"X\",\"timestamp\":\"{old_ts}\"}}\n{{\"symbol\":\"Y\",\"timestamp\":\"{fresh_ts}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let kept = compact_metrics(&path, 2).unwrap();
+        assert_eq!(kept, 1);
+        let remaining = fs::read_to_string(&path).unwrap();
+        assert!(remaining.contains(&fresh_ts), "fresh line kept");
+        assert!(!remaining.contains(&old_ts), "stale line removed");
 
         fs::remove_dir_all(&dir).ok();
     }

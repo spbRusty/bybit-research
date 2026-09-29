@@ -52,13 +52,23 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 <div class="card"><h2>Paper Trading</h2><div id="sys-paper">Loading...</div></div>
 </div>
 
+<!-- ═══════ RESEARCH CONTROLLER ═══════ -->
+<div class="card" style="margin-bottom:8px">
+<h2>Research Controller</h2>
+<div id="rc-state">Loading...</div>
+</div>
+
+<!-- ═══════ LAST PIPELINE RUN ═══════ -->
+<div class="card" style="margin-bottom:8px">
+<h2>Last Pipeline Run</h2>
+<div class="pipe" id="pipeline-flow"></div>
+<table id="t-pipeline" style="margin-top:4px"><tr><td class="sub">Loading...</td></tr></table>
+</div>
+
 <!-- ═══════ RESEARCH PROGRESS ═══════ -->
 <div class="card" style="margin-bottom:8px">
 <h2>Research Progress</h2>
-<div class="pipe" id="rp-flow"></div>
-<div class="sub" id="rp-gate"></div>
-<div class="sub" id="rp-state"></div>
-<div class="sub" id="rp-reason"></div>
+<div id="rp-state">Loading...</div>
 </div>
 
 <!-- ═══════ RESEARCH → PAPER ═══════ -->
@@ -126,17 +136,10 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 </div>
 </div>
 
-<!-- ═══════ ROW 5: Pipeline + Research Conclusion ═══════ -->
-<div class="grid g2">
-<div class="card">
-<h2>Pipeline</h2>
-<div class="pipe" id="pipeline-flow"></div>
-<table id="t-pipeline" style="margin-top:4px"><tr><td class="sub">Loading...</td></tr></table>
-</div>
-<div class="card">
+<!-- ═══════ ROW 5: Research Conclusion ═══════ -->
+<div class="card" style="margin-bottom:8px">
 <h2>Research Conclusion</h2>
 <div id="research-conclusion">Loading...</div>
-</div>
 </div>
 
 <!-- ═══════ ROW 6: Data Quality ═══════ -->
@@ -555,47 +558,21 @@ async function renderResearchConclusion() {
 
 // ═══════ 18. System Status ═══════
 async function renderSysStatus() {
-  const [cc, md, ob] = await Promise.all([
-    fetchJSON('/candle-collector'), fetchJSON('/market-data'), fetchJSON('/ob-collector')
-  ]);
-  if (!cc || !md || !ob) {
-    setIf('sys-data', '<span class="tag tag-na">UNKNOWN</span>');
-  } else {
-    const streams = md.streams || {};
-    const ok = cc.status === 'RUNNING' &&
-      streams.trades && streams.trades.status === 'LIVE' &&
-      streams.futures && streams.futures.status === 'LIVE' &&
-      streams.liquidation && streams.liquidation.status === 'LIVE' &&
-      streams.ratio && streams.ratio.status === 'LIVE' &&
-      ob.status === 'RUNNING';
-    const parts = [`Candles ${cc.status}`];
-    for (const k of ['trades', 'futures', 'liquidation', 'ratio']) {
-      const s = streams[k];
-      parts.push(`${k[0].toUpperCase() + k.slice(1)} ${s ? s.status : 'UNKNOWN'}`);
-    }
-    parts.push(`OB ${ob.status}`);
-    setIf('sys-data', `${ok ? tagHTML('PASS') : tagHTML('ERROR')}<div class="sub" style="margin-top:2px">${parts.join(' · ')}</div>`);
-  }
-
-  const [gate, concl] = await Promise.all([
-    fetchJSON('/research-gate'), fetchJSON('/research-conclusion')
-  ]);
-  if (!gate && !concl) {
+  const rc = await fetchJSON('/research-controller');
+  if (!rc) {
     setIf('sys-research', '<span class="tag tag-na">UNKNOWN</span>');
   } else {
-    let tag, cls;
-    if (gate && gate.status === 'SKIP') { tag = 'WAITING'; cls = 'tag-stop'; }
-    else if (concl && concl.verdict === 'PASS') { tag = 'READY'; cls = 'tag-pass'; }
-    else { tag = 'REJECTED'; cls = 'tag-reject'; }
-    let sub = '';
-    const ts = (concl && concl.timestamp) || (gate && gate.last_run_finished);
-    if (ts) sub += `<div class="sub">Last research: ${fmt(ts)}</div>`;
-    if (concl) {
-      sub += `<div class="sub">Result: ${concl.n_hypotheses} hypotheses → ${concl.n_candidates} candidates → ${concl.verdict}</div>`;
-    } else if (gate && gate.last_run_verdict) {
-      sub += `<div class="sub">Result: ${gate.last_run_verdict}</div>`;
-    }
-    setIf('sys-research', `<span class="tag ${cls}">${tag}</span>${sub}`);
+    const cls = rc.status === 'BUDGET_EXHAUSTED' ? 'tag-stop'
+      : rc.status === 'WAITING_FOR_NEW_DATA' ? 'tag-skip'
+      : rc.status === 'RUNNING' ? 'tag-pass'
+      : rc.status === 'PASS_PENDING_PAPER' ? 'tag-pass'
+      : rc.status === 'STOPPED' ? 'tag-reject'
+      : rc.status === 'ERROR' ? 'tag-error' : 'tag-na';
+    let sub = `<div class="sub">${rc.state || rc.status} · budget ${rc.budget_used}/${rc.budget_max}</div>`;
+    const cyc = rc.cycle_id || (rc.frozen_next && rc.frozen_next.cycle_id);
+    if (cyc) sub += `<div class="sub">Cycle: <span class="mono">${(cyc || '').slice(0, 32)}</span></div>`;
+    if (rc.updated_at_utc) sub += `<div class="sub">Updated: ${fmt(rc.updated_at_utc)}</div>`;
+    setIf('sys-research', `<span class="tag ${cls}">${rc.status}</span>${sub}`);
   }
 
   const p = await fetchJSON('/paper');
@@ -609,52 +586,98 @@ async function renderSysStatus() {
     else { tag = 'UNKNOWN'; cls = 'tag-na'; }
     setIf('sys-paper', `<span class="tag ${cls}">${tag}</span>${p.hypothesis_id ? `<div class="sub">Hypothesis: <span class="mono">${p.hypothesis_id}</span></div>` : ''}${p.status_reason ? `<div class="sub">${p.status_reason}</div>` : ''}`);
   }
+
+  const [cc, md, ob] = await Promise.all([
+    fetchJSON('/candle-collector'), fetchJSON('/market-data'), fetchJSON('/ob-collector')
+  ]);
+  if (!cc || !md || !ob) {
+    setIf('sys-data', '<span class="tag tag-na">UNKNOWN</span>');
+  } else {
+    const streams = md.streams || {};
+    // Research Data (candles + orderbook) — источник для research pipeline.
+    // Legacy-стримы (trades/futures/liquidation/ratio) намеренно останавливаются
+    // на время research-цикла (Research Runner фаза A) — они не влияют на статус.
+    const researchOk = cc.status === 'RUNNING' && ob.status === 'RUNNING';
+    const parts = [`Candles ${cc.status}`, `OB ${ob.status}`];
+    const legacy = [];
+    for (const k of ['trades', 'futures', 'liquidation', 'ratio']) {
+      const s = streams[k];
+      legacy.push(`${k[0].toUpperCase() + k.slice(1)} ${s ? s.status : 'UNKNOWN'}`);
+    }
+    setIf('sys-data', `${researchOk ? tagHTML('PASS') : tagHTML('ERROR')}<div class="sub" style="margin-top:2px">${parts.join(' · ')}</div><div class="sub">LEGACY: ${legacy.join(' · ')}</div>`);
+  }
 }
 
 // ═══════ 19. Research Progress ═══════
 async function renderResearchProgress() {
-  const [d, gate, paper] = await Promise.all([
-    fetchJSON('/pipeline'), fetchJSON('/research-gate'), fetchJSON('/paper')
-  ]);
+  const d = await fetchJSON('/research-progress');
   if (!d) {
-    setIf('rp-flow', '<span class="step NOT">UNKNOWN</span>');
-    setIf('rp-gate', ''); setIf('rp-state', ''); setIf('rp-reason', '');
+    setIf('rp-state', '<span class="tag tag-na">UNKNOWN</span>');
     return;
   }
-  const names = ['DATA', 'FEATURES', 'HYPOTHESES', 'DISCOVERY', 'VALIDATION', 'OOS', 'CRITIC', 'PAPER'];
-  const mapping = {
-    'DATA': 'data_validation', 'FEATURES': 'feature_validation', 'HYPOTHESES': null,
-    'DISCOVERY': null, 'VALIDATION': null, 'OOS': null, 'CRITIC': 'critic', 'PAPER': null
-  };
-  let flowHtml = '';
-  for (const name of names) {
-    const stage = mapping[name];
-    let status = 'NOT';
-    if (name === 'HYPOTHESES') {
-      status = d.n_hypotheses > 0 ? 'PASS' : 'NOT';
-    } else if (name === 'PAPER') {
-      status = !paper ? 'NOT' : paper.status === 'RUNNING' ? 'PASS' : paper.status === 'NOT READY' ? 'NOT' : 'STOP';
-    } else if (stage && d.stages) {
-      const found = d.stages.find(s => s.stage === stage);
-      status = found ? found.status : 'NOT';
+  const stCls = d.status === 'BUDGET_EXHAUSTED' ? 'tag-stop'
+    : d.status === 'WAITING_FOR_NEW_DATA' ? 'tag-skip'
+    : d.status === 'RUNNING' ? 'tag-pass'
+    : d.status === 'PASS_PENDING_PAPER' ? 'tag-pass'
+    : d.status === 'STOPPED' ? 'tag-reject'
+    : d.status === 'ERROR' ? 'tag-error' : 'tag-na';
+  const c = d.counts || {};
+  let html = `<span class="tag ${stCls}">${d.status}</span> ${d.status_reason || ''}`;
+  html += `<div style="margin-top:4px">Experiments: <span class="mono"><b>${d.budget_used}/${d.budget_max}</b></span> budget | <span class="mono"><b>${d.experiments_in_cycle}</b></span> in cycle <span class="mono">${(d.cycle_id || '—').slice(0, 32)}</span></div>`;
+  html += `<div class="pipe" style="margin-top:4px"><span class="step NOT">RUNNING: ${c.RUNNING || 0}</span><span class="step PASS">PASS: ${c.PASS || 0}</span><span class="step REJECT">REJECT: ${c.REJECT || 0}</span><span class="step ERROR">FAILED: ${c.FAILED || 0}</span></div>`;
+  const le = d.last_experiment;
+  if (le) {
+    html += `<div style="margin-top:4px">Last: <span class="mono">${le.experiment_id || '—'}</span> · ${le.mode || '—'} · ${tagHTML(le.final_verdict || le.status || '—')}</div>`;
+    if (le.reject_reason) {
+      html += `<div class="sub">Last REJECT reason: ${le.reject_reason}</div>`;
     }
-    flowHtml += `<span class="step ${status}">${name}: ${status}</span>`;
   }
-  setIf('rp-flow', flowHtml);
+  if (!d.journal_ok) html += `<div class="sub">N/A (experiments.jsonl)</div>`;
+  setIf('rp-state', html);
+}
 
-  if (gate) {
-    setIf('rp-gate', `Research gate: <span class="tag ${gate.status === 'SKIP' ? 'tag-skip' : 'tag-na'}">${gate.status}</span>`);
-    if (gate.status === 'READY') {
-      setIf('rp-state', 'Current state: WAITING FOR NEXT RESEARCH RUN');
-    } else if (gate.status === 'SKIP') {
-      setIf('rp-state', `Current state: RESEARCH COOLDOWN${gate.next_run_utc ? ` · next run: ${fmt(gate.next_run_utc)}` : ''}`);
-    } else {
-      setIf('rp-state', '');
-    }
-    setIf('rp-reason', gate.reason ? `Reason: ${gate.reason}` : '');
-  } else {
-    setIf('rp-gate', ''); setIf('rp-state', ''); setIf('rp-reason', '');
+// ═══════ 19b. Research Controller ═══════
+async function renderResearchController() {
+  const d = await fetchJSON('/research-controller');
+  if (!d) {
+    setIf('rc-state', '<span class="tag tag-na">UNKNOWN</span><div class="sub">N/A (API)</div>');
+    return;
   }
+  const stCls = d.status === 'BUDGET_EXHAUSTED' ? 'tag-stop'
+    : d.status === 'WAITING_FOR_NEW_DATA' ? 'tag-skip'
+    : d.status === 'RUNNING' ? 'tag-pass'
+    : d.status === 'PASS_PENDING_PAPER' ? 'tag-pass'
+    : d.status === 'STOPPED' ? 'tag-reject'
+    : d.status === 'ERROR' ? 'tag-error' : 'tag-na';
+  const e = d.last_experiment;
+  const n = d.next_experiment;
+  const fr = d.frozen_next;
+  let html = `<span class="tag ${stCls}">${d.status}</span> <span class="sub">${d.status_reason || ''}</span>`;
+  html += '<table style="margin-top:4px">';
+  html += `<tr><td>Cycle ID</td><td class="mono">${d.cycle_id || 'N/A'}${d.cycle_id ? '' : ' <span class="sub">(N/A: controller_state.json)</span>'}</td></tr>`;
+  html += `<tr><td>Controller state</td><td>${d.state || 'N/A'}${d.pass_pending ? `<div class="sub">PASS pending: ${d.pass_pending.experiment_id || '—'}</div>` : ''}</td></tr>`;
+  html += `<tr><td>Budget used/max</td><td class="mono">${d.budget_used}/${d.budget_max}</td></tr>`;
+  if (e) {
+    html += `<tr><td>Last experiment</td><td class="mono">${e.experiment_id || '—'}${e.mode ? ` · ${e.mode}` : ''}</td></tr>`;
+    html += `<tr><td>Verdict</td><td>${e.final_verdict ? tagHTML(e.final_verdict) : (e.status || '—')}</td></tr>`;
+    html += `<tr><td>Diagnosis</td><td>${e.diagnosis || '—'}</td></tr>`;
+    if (e.reject_reasons && e.reject_reasons.length) {
+      html += `<tr><td>Reject reason</td><td class="sub">${e.reject_reasons[0]}</td></tr>`;
+    }
+  }
+  if (n && n.mode) {
+    let ndesc = n.mode;
+    if (n.feature) ndesc += ` · ${n.feature} ${n.operator || ''} ${n.threshold ?? ''}${n.entry_side ? ` ${n.entry_side}` : ''}`;
+    if (n.regime_key) ndesc += ` (${n.regime_key})`;
+    if (n.horizons && n.horizons.length) ndesc += ` · H${n.horizons.join('/')}`;
+    html += `<tr><td>Next experiment</td><td class="mono">${ndesc}</td></tr>`;
+  }
+  const bnd = d.boundary_klines_max || (fr && fr.klines_max);
+  html += `<tr><td>Data boundary (klines_max)</td><td class="mono">${bnd || 'N/A'}</td></tr>`;
+  if (fr) html += `<tr><td>Frozen next (log)</td><td class="mono">${fr.klines_max || '—'}${fr.cycle_id ? `<div class="sub">${fr.cycle_id}</div>` : ''}</td></tr>`;
+  html += `<tr><td>Last change (UTC)</td><td class="mono">${d.updated_at_utc ? d.updated_at_utc.slice(0, 19).replace('T', ' ') : 'N/A'}</td></tr>`;
+  html += '</table>';
+  setIf('rc-state', html);
 }
 
 // ═══════ 20b. Research Cycle → Paper ═══════
@@ -668,11 +691,6 @@ async function renderResearchCycle() {
     const e = d.experiment;
     html += `<div class="sub">Experiment: <span class="mono">${e.experiment_id || '—'}</span> · ${e.mode || '—'} · ${e.final_verdict || e.status || '—'}${e.n_hypotheses ? ` · ${e.n_hypotheses} hyp` : ''}</div>`;
     if (e.diagnosis) html += `<div class="sub">Diagnosis: ${e.diagnosis}</div>`;
-  }
-  if (d.finalist) {
-    html += `<div class="sub">Candidate: <span class="mono">${d.finalist.hypothesis_id}</span> · ${d.finalist.entry_side || ''} @ ${d.finalist.horizon_min || '?'}m</div>`;
-  } else if (d.verdict) {
-    html += `<div class="sub">Last verdict: ${d.verdict}</div>`;
   }
   const p = d.paper || {};
   if (p.hypothesis_id) {
@@ -760,7 +778,7 @@ async function refreshAll() {
     renderInstruments(), renderPipeline(), renderData(), renderStreams(),
     renderSignals(), renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll(),
     renderAlerts(), renderOBCollector(), renderCandleCollector(), renderDataQuality(), renderResearchConclusion(),
-    renderSysStatus(), renderResearchProgress(), renderResearchCycle(), renderLiveData()
+    renderSysStatus(), renderResearchProgress(), renderResearchController(), renderResearchCycle(), renderLiveData()
   ]);
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
   countdown = 3;

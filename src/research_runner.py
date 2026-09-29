@@ -206,7 +206,9 @@ def _restore_marketdata_if_was_active(marketdata_was_active: bool) -> None:
 
 def _active_cycle_boundary() -> dict | None:
     st = _read_state()
-    if not st.get("cycle_id") or st.get("state") in ("STOPPED", "PASS_PENDING_PAPER"):
+    if (not st.get("cycle_id")
+            or st.get("state") in ("STOPPED", "PASS_PENDING_PAPER")
+            or int(st.get("budget_used", 0)) >= _max_experiments()):
         return None
     b = st.get("boundary") or {}
     if not b.get("klines_max") or not b.get("gate_config_hash"):
@@ -216,6 +218,12 @@ def _active_cycle_boundary() -> dict | None:
 
 def _phase_data_boundary() -> tuple[dict | None, dict]:
     ready, reasons, metrics = check_ready()
+    if not ready and any(r.startswith("OB valid symbols") for r in reasons):
+        # reconstructor после finish/abort остановлен -> OB-гейт без этой
+        # подкачки застревает в вечном SKIP (OB свежий только при его работе)
+        logger.info("Gate OB-stale: refreshing OB before SKIP")
+        _refresh_ob_once()
+        ready, reasons, metrics = check_ready()
     if not ready:
         logger.info("Runner SKIP: %s", "; ".join(reasons))
         return None, {"verdict": "SKIP", "reasons": reasons,
@@ -275,12 +283,13 @@ def _phase_data_boundary() -> tuple[dict | None, dict]:
 
 # --- B. OB ---------------------------------------------------------------
 
-def _refresh_ob(frozen: dict) -> None:
+def _refresh_ob_once() -> dict:
+    """Поднимает reconstructor для обновления OB-метрик, ждёт OB_TIMEOUT_SEC,
+    гасит его и возвращает последний снапшот OB."""
     ob = scan_ob()
     if ob["ob_valid_symbols"] >= _GATE["min_ob_symbols"]:
         logger.info("OB fresh: %d valid symbols", ob["ob_valid_symbols"])
-        _sync_frozen_ob(frozen, ob)
-        return
+        return ob
 
     logger.info("OB stale (%d valid < %d): refreshing via reconstructor",
                 ob["ob_valid_symbols"], _GATE["min_ob_symbols"])
@@ -288,8 +297,7 @@ def _refresh_ob(frozen: dict) -> None:
         service_start(RECONSTRUCTOR_SERVICE)
     except RuntimeError as e:
         logger.warning("reconstructor start failed (OB non-fatal): %s", e)
-        _sync_frozen_ob(frozen, ob)
-        return
+        return ob
 
     deadline = time.monotonic() + OB_TIMEOUT_SEC
     last_ob = ob
@@ -307,7 +315,11 @@ def _refresh_ob(frozen: dict) -> None:
         logger.info("reconstructor stopped before research")
     except RuntimeError as e:
         logger.warning("reconstructor stop failed: %s", e)
-    _sync_frozen_ob(frozen, last_ob)
+    return last_ob
+
+
+def _refresh_ob(frozen: dict) -> None:
+    _sync_frozen_ob(frozen, _refresh_ob_once())
 
 
 def _sync_frozen_ob(frozen: dict, ob: dict) -> None:
@@ -327,9 +339,9 @@ def _max_experiments() -> int:
     return int(_CTL_CFG.get("budget", {}).get("max_experiments_per_boundary", 12))
 
 
-def _abort_cycle(frozen: dict, reason: str) -> dict:
+def _abort_cycle(frozen: dict, reason: str, finished: bool = True) -> dict:
     logger.error("Cycle ABORT: %s", reason)
-    return {"verdict": "ABORT", "reason": reason, "finished": True}
+    return {"verdict": "ABORT", "reason": reason, "finished": finished}
 
 
 def _mark_dangling_interrupted(frozen_cycle_id: str) -> int:
@@ -393,6 +405,11 @@ def _launch_paper(state: dict) -> dict:
         return {"verdict": "ALREADY_LAUNCHED", "reason": f"bound:{prov['experiment_id']}",
                 "experiment_id": prov["experiment_id"],
                 "hypothesis_id": pstate.get("hypothesis_id")}
+    if pstate.get("hypothesis_id") and not prov:
+        # legacy-bound: бумага привязана к гипотезе из эпохи до provenance
+        # (например HG120). provenance пуст — обновить нельзя, не перезаписываем.
+        return {"verdict": "ALREADY_LAUNCHED", "reason": "legacy_bound",
+                "hypothesis_id": pstate.get("hypothesis_id")}
 
     launched_at = now_utc().isoformat()
     pstate = reset_state()
@@ -439,6 +456,9 @@ def _phase_research_loop(frozen: dict, limit: int | None,
     while True:
         state = _read_state()
         st = state.get("state")
+        # Терминальные проверки только для текущего frozen-цикла: при смене
+        # boundary контроллер сам сбросит цикл (_reset_cycle -> READY/BASELINE).
+        same_cycle = state.get("cycle_id") == frozen_cycle_id
         if st == "PASS_PENDING_PAPER":
             handoff = _launch_paper(state)
             if handoff.get("verdict") in ("LAUNCHED", "ALREADY_LAUNCHED"):
@@ -454,12 +474,12 @@ def _phase_research_loop(frozen: dict, limit: int | None,
             return {"verdict": "PASS_PENDING_PAPER", "paper_handoff": handoff,
                     "experiments": len(_cycle_experiments(frozen_cycle_id)),
                     "finished": True}
-        if st == "STOPPED":
+        if same_cycle and st == "STOPPED":
             logger.info("Cycle terminal: state=%s", st)
             return {"verdict": "DONE",
                     "experiments": len(_cycle_experiments(frozen_cycle_id)),
                     "finished": True}
-        if int(state.get("budget_used", 0)) >= budget:
+        if same_cycle and int(state.get("budget_used", 0)) >= budget:
             logger.info("Budget exhausted (%s/%s)", state.get("budget_used"), budget)
             return {"verdict": "DONE", "stop_reason": "budget_per_boundary",
                     "experiments": len(_cycle_experiments(frozen_cycle_id)),
@@ -470,8 +490,9 @@ def _phase_research_loop(frozen: dict, limit: int | None,
 
         ok, why = _mem_ok()
         if not ok:
+            # Пауза, а не терминальный ABORT: frozen сохраняется -> recovery продолжит цикл
             logger.error("Resource pressure: %s", why)
-            return _abort_cycle(frozen, f"resource_pressure: {why}")
+            return _abort_cycle(frozen, f"resource_pressure: {why}", finished=False)
 
         logger.info("Launching controller (iteration %s/%s)",
                     iterations + 1, budget)
@@ -498,12 +519,12 @@ def _phase_research_loop(frozen: dict, limit: int | None,
             return _abort_cycle(frozen, "unexpected_baseline")
 
         if once:
-            st2 = _read_state().get("state")
-            if st2 == "PASS_PENDING_PAPER":
+            st2 = _read_state()
+            if st2.get("state") == "PASS_PENDING_PAPER":
                 # хендовер Research->Paper обрабатывается началом цикла
                 continue
-            if st2 == "STOPPED":
-                logger.info("Cycle terminal after step: state=%s", st2)
+            if st2.get("state") == "STOPPED" and st2.get("cycle_id") == frozen_cycle_id:
+                logger.info("Cycle terminal after step: state=%s", st2.get("state"))
                 return {"verdict": "DONE",
                         "experiments": len(_cycle_experiments(frozen_cycle_id)),
                         "finished": True}

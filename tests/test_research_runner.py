@@ -124,6 +124,49 @@ class TestPhaseDataBoundary(RunnerBase):
         rr._refresh_ob(_frozen())
         rr.service_start.assert_not_called()
 
+    def test_gate_ob_stale_refreshes_before_skip(self):
+        # Гейт падает только по OB -> runner сам поднимает reconstructor,
+        # перечитывает check_ready и замораживает boundary вместо вечного SKIP.
+        metrics_bad = {
+            "klines": {"klines_max": _km(), "n_files": 10, "fresh_symbols": 93},
+            "ob": {"ob_valid_symbols": 0, "ob_unique_symbols": 0, "ob_rows": 0},
+            "config_hash": "9be56a1fe207", "git_head": "test", "data_version": "1.0",
+        }
+        metrics_ok = {
+            "klines": {"klines_max": _km(), "n_files": 10, "fresh_symbols": 93},
+            "ob": {"ob_valid_symbols": 744, "ob_unique_symbols": 100,
+                   "ob_rows": 5000},
+            "config_hash": "9be56a1fe207", "git_head": "test", "data_version": "1.0",
+        }
+        rr.check_ready.side_effect = [
+            (False, ["OB valid symbols 0 < 20"], metrics_bad),
+            (True, [], metrics_ok),
+        ]
+        rr.scan_ob.side_effect = [
+            {"ob_valid_symbols": 0, "ob_unique_symbols": 0, "ob_rows": 0},
+            {"ob_valid_symbols": 744, "ob_unique_symbols": 100, "ob_rows": 5000},
+        ]
+        frozen, result = rr._phase_data_boundary()
+        self.assertEqual(result["verdict"], "FROZEN")
+        rr.service_start.assert_called_once_with(rr.RECONSTRUCTOR_SERVICE)
+        rr.service_stop.assert_called_once_with(rr.RECONSTRUCTOR_SERVICE)
+        self.assertEqual(frozen["ob_valid_symbols"], 744)
+
+    def test_gate_ob_stale_refresh_failure_still_skips(self):
+        # Refresh не помог (reconstructor не смог обновить) -> SKIP, не паника.
+        metrics_bad = {
+            "klines": {"klines_max": _km(), "n_files": 10, "fresh_symbols": 93},
+            "ob": {"ob_valid_symbols": 0, "ob_unique_symbols": 0, "ob_rows": 0},
+            "config_hash": "9be56a1fe207", "git_head": "test", "data_version": "1.0",
+        }
+        rr.check_ready.return_value = (False, ["OB valid symbols 0 < 20"], metrics_bad)
+        rr.scan_ob.return_value = {"ob_valid_symbols": 0, "ob_unique_symbols": 0,
+                                   "ob_rows": 0}
+        rr.service_start.side_effect = RuntimeError("denied")
+        frozen, result = rr._phase_data_boundary()
+        self.assertIsNone(frozen)
+        self.assertEqual(result["verdict"], "SKIP")
+
 
 class TestResearchLoop(RunnerBase):
     def test_continues_selected_experiment(self):
@@ -163,6 +206,26 @@ class TestResearchLoop(RunnerBase):
         self.assertEqual(result["stop_reason"], "budget_per_boundary")
         rr.run_controller.assert_not_called()
 
+    def test_new_boundary_invokes_controller_after_budget_exhausted(self):
+        # Старый cycle 12/12, но frozen boundary уже новый (klines_max сменился):
+        # бюджет относится к старому циклу — контроллер должен быть вызван,
+        # чтобы сделать _reset_cycle (budget_used=0, READY, BASELINE).
+        self._write_state(budget_used=12, state="SELECT_NEXT")
+        frozen = _frozen(klines_max="2026-09-22T14:50:00")
+        result = rr._phase_research_loop(frozen, limit=40, category=None,
+                                         once=True)
+        self.assertEqual(result["verdict"], "STEP")
+        rr.run_controller.assert_called_once_with(limit=40, category=None)
+
+    def test_new_boundary_invokes_controller_after_terminal_old_cycle(self):
+        # Аналогично для STOPPED старого цикла: новый boundary -> controller reset.
+        self._write_state(state="STOPPED", budget_used=12)
+        frozen = _frozen(klines_max="2026-09-22T14:50:00")
+        result = rr._phase_research_loop(frozen, limit=40, category=None,
+                                         once=True)
+        self.assertEqual(result["verdict"], "STEP")
+        rr.run_controller.assert_called_once_with(limit=40, category=None)
+
     def test_terminal_state_stops_cycle(self):
         self._write_state(state="STOPPED", budget_used=2)
         result = rr._phase_research_loop(_frozen(), limit=40, category=None,
@@ -181,6 +244,38 @@ class TestResourceSafety(RunnerBase):
         self.assertIn("resource_pressure", result["reason"])
         rr.run_controller.assert_not_called()
 
+    def test_resource_pressure_pauses_not_finishes(self):
+        # Пауза: frozen boundary НЕ сбрасывается, следующий запуск возобновит цикл
+        data_ready.save_frozen_boundary(_frozen())
+        rr._mem_info.return_value = {"MemAvailable": 50.0, "SwapFree": 0.5}
+        self._write_state(budget_used=8, state="SELECT_NEXT")
+        result = rr._phase_research_loop(_frozen(), limit=40, category=None,
+                                         once=False)
+        self.assertEqual(result["verdict"], "ABORT")
+        self.assertIn("resource_pressure", result["reason"])
+        self.assertFalse(result["finished"])
+        rr.run_controller.assert_not_called()
+        self.assertTrue(data_ready.frozen_boundary_path().exists())
+
+    def test_resource_pressure_pause_resumes_same_cycle(self):
+        # Следующий запуск после паузы -> recovery-путь (frozen на месте),
+        # 9-й эксперимент запускается без пересоздания boundary.
+        data_ready.save_frozen_boundary(_frozen())
+        self._write_state(budget_used=8, state="SELECT_NEXT")
+        rr._mem_info.return_value = {"MemAvailable": 50.0, "SwapFree": 0.5}
+        result = rr.run_cycle(limit=40, once=True)
+        self.assertEqual(result["verdict"], "ABORT")
+        self.assertFalse(result["finished"])
+        self.assertTrue(data_ready.frozen_boundary_path().exists())
+
+        rr._mem_info.return_value = {"MemAvailable": 50.0, "SwapFree": 20.0}
+        result = rr.run_cycle(limit=40, once=True)
+        self.assertEqual(result["verdict"], "STEP")
+        self.assertFalse(result["finished"])
+        rr.run_controller.assert_called_once_with(limit=40, category=None)
+        self.assertTrue(data_ready.frozen_boundary_path().exists())
+        data_ready.clear_frozen_boundary()
+
     def test_oom_marks_interrupted_and_aborts(self):
         journal = self.td / "experiments.jsonl"
         journal.write_text(self._journal_line("EXP_A", status="RUNNING"))
@@ -194,6 +289,8 @@ class TestResourceSafety(RunnerBase):
         last = json.loads(lines[-1])
         self.assertEqual(last["status"], "FAILED")
         self.assertEqual(last["reason"], "interrupted")
+        # controller_exit остаётся терминальным (в отличие от resource_pressure)
+        self.assertTrue(result["finished"])
 
 
 class TestRecoveryAndFinish(RunnerBase):
@@ -290,6 +387,21 @@ class TestPaperHandoff(RunnerBase):
         self.assertEqual(res["verdict"], "ALREADY_LAUNCHED")
         self.assertIn("bound", res["reason"])
         self.assertEqual(self.paper.load_state()["hypothesis_id"], "HG111")
+
+    def test_launch_paper_does_not_overwrite_legacy_bound(self):
+        # Legacy-эпоха: hypothesis привязан БЕЗ provenance (как исторический HG120).
+        # Новый PASS не должен перезаписать бумагу, привязанную к старой гипотезе.
+        (self.td / "paper_state.json").write_text(json.dumps({
+            "mode": "VALIDATED", "hypothesis_id": "HG120",
+            "started_at": "2026-09-18T00:00:00+00:00",
+            "equity_start": 1000.0, "balance": 900.0,
+            "provenance": {},
+        }))
+        self._write_artifact("EXP_1", {"hypothesis_id": "HG222"})
+        res = rr._launch_paper({"pass_pending": "EXP_1", "cycle_id": FROZEN_CYCLE})
+        self.assertEqual(res["verdict"], "ALREADY_LAUNCHED")
+        self.assertEqual(res["reason"], "legacy_bound")
+        self.assertEqual(self.paper.load_state()["hypothesis_id"], "HG120")
 
     def test_launch_paper_skips_without_finalist(self):
         eid = "EXP_1"

@@ -450,34 +450,89 @@ struct TriggerFile {
     #[allow(dead_code)]
     horizons: Vec<u64>,
     capture_duration_sec: u64,
-    #[allow(dead_code)]
     created_at: String,
 }
 
-/// Наблюдатель за директорией триггеров. Обнаруживает новые JSON-файлы.
-async fn trigger_watcher(tx: mpsc::Sender<PathBuf>) {
-    let dir = Path::new(TRIGGERS_DIR);
-    let mut known: HashMap<String, bool> = HashMap::new();
+/// Возраст триггера в секундах относительно UTC now (None если created_at не парсится).
+fn trigger_age_secs(created_at: &str) -> Option<u64> {
+    let dt = chrono::DateTime::parse_from_rfc3339(created_at).ok()?;
+    Some((Utc::now() - dt.with_timezone(&Utc)).num_seconds().max(0) as u64)
+}
 
-    loop {
-        if dir.exists() {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "json") {
-                        let key = path.to_string_lossy().to_string();
-                        if !known.contains_key(&key) {
-                            known.insert(key, true);
-                            // Читаем и парсим чтобы убедиться что это валидный триггер
-                            if let Ok(contents) = fs::read_to_string(&path) {
-                                if serde_json::from_str::<TriggerFile>(&contents).is_ok() {
-                                    if tx.send(path).await.is_err() { return; }
+/// Единый источник TTL-порога для триггеров (env OB_TRIGGER_TTL_SEC, default 7200).
+fn trigger_ttl_sec() -> u64 {
+    std::env::var("OB_TRIGGER_TTL_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7200)
+}
+
+/// Триггер считается устаревшим, если его создали раньше, чем ttl_sec назад.
+/// Устаревшие события не захватываются (backlog, рестарт-восстановление).
+/// malformed created_at НЕ считается устаревшим (не удаляется автоматически).
+fn trigger_expired(created_at: &str, ttl_sec: u64) -> bool {
+    match trigger_age_secs(created_at) {
+        Some(age) => age > ttl_sec,
+        None => false,
+    }
+}
+
+/// Проход 1 watcher'а: сканирует директорию триггеров и удаляет устаревшие (TTL).
+/// Возвращает пути только "свежих" триггеров для отправки в очередь захвата.
+/// Никаких блокировок на канале здесь нет — expired-бэклог очищается даже
+/// при полностью заполненной capture-очереди.
+/// malformed created_at не удаляется и в очередь не попадает (сохраняется на диске).
+fn scan_triggers(dir: &Path, known: &mut HashMap<String, bool>) -> Vec<PathBuf> {
+    let mut fresh: Vec<PathBuf> = Vec::new();
+    let ttl_sec = trigger_ttl_sec();
+    if dir.exists() {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "json") {
+                    let key = path.to_string_lossy().to_string();
+                    if !known.contains_key(&key) {
+                        known.insert(key, true);
+                        // Читаем и парсим чтобы убедиться что это валидный триггер
+                        if let Ok(contents) = fs::read_to_string(&path) {
+                            if let Ok(tf) = serde_json::from_str::<TriggerFile>(&contents) {
+                                match trigger_age_secs(&tf.created_at) {
+                                    Some(age) if age > ttl_sec => {
+                                        eprintln!(
+                                            "[trigger_watcher] устаревший триггер удалён (TTL {}s): {:?}",
+                                            ttl_sec,
+                                            path
+                                        );
+                                        let _ = fs::remove_file(&path);
+                                    }
+                                    Some(_) => fresh.push(path),
+                                    None => {
+                                        eprintln!(
+                                            "[trigger_watcher] непарсимый created_at, триггер сохранён: {:?}",
+                                            path
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+    fresh
+}
+
+/// Наблюдатель за директорией триггеров. Обнаруживает новые JSON-файлы.
+/// Двухпроходный скан: проход 1 очищает expired по всему каталогу (не
+/// блокируется заполненной очередью захвата), проход 2 ставит fresh в очередь.
+async fn trigger_watcher(tx: mpsc::Sender<PathBuf>, dir: &Path) {
+    let mut known: HashMap<String, bool> = HashMap::new();
+
+    loop {
+        let fresh = scan_triggers(dir, &mut known);
+        for path in fresh {
+            if tx.send(path).await.is_err() { return; }
         }
         known.retain(|k, _| Path::new(k).exists());
         sleep(Duration::from_secs(2)).await;
@@ -680,6 +735,17 @@ async fn capture_manager(
             }
         };
 
+        // TTL: устаревшие триггеры (backlog, marketdata был остановлен) не захватываются
+        // (backstop: watcher уже удалил их до постановки в очередь)
+        let ttl_sec = trigger_ttl_sec();
+        if trigger_expired(&trigger.created_at, ttl_sec) {
+            eprintln!(
+                "[capture_manager] триггер устарел (age > {ttl_sec}s), пропускаю и удаляю {path:?}"
+            );
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+
         let handle = tokio::spawn(async move {
             ob_capture_task(trigger).await;
         });
@@ -810,7 +876,7 @@ async fn main() -> Result<()> {
     {
         let tx = tx.clone();
         let (trigger_tx, trigger_rx) = mpsc::channel(64);
-        tokio::spawn(async move { trigger_watcher(trigger_tx).await });
+        tokio::spawn(async move { trigger_watcher(trigger_tx, Path::new(TRIGGERS_DIR)).await });
         tokio::spawn(async move { capture_manager(trigger_rx, tx, max_concurrent).await });
     }
 
@@ -877,5 +943,105 @@ mod tests {
         assert_eq!(trigger.event_id, "20260905T120000Z_BTCUSDT_abc123");
         assert_eq!(trigger.symbol, "BTCUSDT");
         assert_eq!(trigger.capture_duration_sec, 1200);
+    }
+
+    #[test]
+    fn trigger_ttl_expiry() {
+        let old = "2026-09-05T12:00:00Z";
+        assert_eq!(trigger_age_secs(old).unwrap() > 7200, true);
+        assert!(trigger_expired(old, 7200));
+
+        let fresh = Utc::now().to_rfc3339();
+        assert_eq!(trigger_age_secs(&fresh).unwrap(), 0);
+        assert!(!trigger_expired(&fresh, 7200));
+
+        // Непарсимый created_at не удаляем (страховка вместо паники)
+        assert_eq!(trigger_age_secs("garbage"), None);
+        assert!(!trigger_expired("garbage", 7200));
+    }
+
+    #[test]
+    fn trigger_ttl_sec_default_and_override() {
+        // default 7200, валидный env переопределяет, мусор игнорируется
+        let original = std::env::var("OB_TRIGGER_TTL_SEC").ok();
+        unsafe { std::env::remove_var("OB_TRIGGER_TTL_SEC") };
+        assert_eq!(trigger_ttl_sec(), 7200);
+        unsafe { std::env::set_var("OB_TRIGGER_TTL_SEC", "3600") };
+        assert_eq!(trigger_ttl_sec(), 3600);
+        unsafe { std::env::set_var("OB_TRIGGER_TTL_SEC", "not-a-number") };
+        assert_eq!(trigger_ttl_sec(), 7200);
+        match original {
+            Some(v) => unsafe { std::env::set_var("OB_TRIGGER_TTL_SEC", v) },
+            None => unsafe { std::env::remove_var("OB_TRIGGER_TTL_SEC") },
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_clears_expired_despite_full_channel() {
+        let tmp = std::env::temp_dir().join(format!("marketdata_watcher_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let write_trigger = |name: &str, created_at: &str| {
+            let body = json!({
+                "event_id": format!("20260905T120000Z_{name}"),
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "trigger_type": "candle_features",
+                "trigger_version": "1.0",
+                "trigger_config_hash": "abc123def456",
+                "trigger_params": {"relative_volume": 5.0},
+                "horizons": [5, 10],
+                "capture_duration_sec": 1200,
+                "created_at": created_at,
+            });
+            fs::write(tmp.join(name), serde_json::to_vec(&body).unwrap()).unwrap();
+        };
+
+        for i in 0..50 {
+            write_trigger(&format!("expired_{i}.json"), "2020-01-01T00:00:00Z");
+        }
+        for i in 0..3 {
+            write_trigger(&format!("fresh_{i}.json"), &Utc::now().to_rfc3339());
+        }
+        write_trigger("malformed.json", "garbage");
+
+        // канал ёмкостью 1, заполнен сразу — отправка fresh блокируется
+        let (tx, mut rx) = mpsc::channel::<PathBuf>(1);
+        tx.send(PathBuf::from("filler")).await.unwrap();
+
+        let dir = tmp.clone();
+        let handle = tokio::spawn(async move { trigger_watcher(tx, &dir).await });
+
+        // expired удаляются, несмотря на полный канал (проход 1 не блокируется)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let expired: Vec<_> = fs::read_dir(&tmp).unwrap().flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with("expired_"))
+                .collect();
+            if expired.is_empty() { break; }
+            assert!(tokio::time::Instant::now() < deadline, "expired не удалены: {expired:?}");
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(tmp.join("malformed.json").exists());
+
+        let mut got: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while got.iter().filter(|n| n.starts_with("fresh_")).count() < 3 {
+            assert!(tokio::time::Instant::now() < deadline, "fresh потеряны: {got:?}");
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(p)) => got.push(p.file_name().unwrap().to_string_lossy().to_string()),
+                _ => break,
+            }
+        }
+        for i in 0..3 {
+            assert!(got.contains(&format!("fresh_{i}.json")), "нет fresh_{i}: {got:?}");
+        }
+        assert!(!got.contains(&"malformed.json".to_string()), "malformed отправлен: {got:?}");
+
+        handle.abort();
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
