@@ -1,10 +1,11 @@
 """Tests for orderbook_reader — reconstructed orderbook data reader."""
 from __future__ import annotations
 
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import polars as pl
 
@@ -44,14 +45,14 @@ class TestReadReconstructed(unittest.TestCase):
         result = read_reconstructed("NOSYMBOL_NONEXISTENT_42", "2099-01-01")
         self.assertIsNone(result)
 
-    @patch("src.orderbook_reader.pl.read_parquet")
-    @patch("src.orderbook_reader._RECON_DIR")
-    def test_reads_parquet(self, mock_dir, mock_read):
-        real_path = MagicMock(spec=Path)
-        real_path.exists.return_value = True
-        mock_dir.__truediv__ = MagicMock(return_value=real_path)
-        mock_read.return_value = pl.DataFrame({"timestamp_ms": [1000], "best_bid": [100.0]})
-        result = read_reconstructed("BTCUSDT", "2026-01-15")
+    def test_reads_parquet(self):
+        with tempfile.TemporaryDirectory() as td:
+            sym_dir = Path(td) / "BTCUSDT"
+            sym_dir.mkdir()
+            pl.DataFrame({"timestamp_ms": [1000], "best_bid": [100.0]}).write_parquet(
+                sym_dir / "2026-01-15.parquet")
+            with patch("src.orderbook_reader._RECON_DIR", Path(td)):
+                result = read_reconstructed("BTCUSDT", "2026-01-15")
         self.assertIsNotNone(result)
         self.assertEqual(result.height, 1)
 

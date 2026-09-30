@@ -80,6 +80,10 @@ class TestCooldown(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._old = data_ready.STATE_PATH
+        self._old_dir = data_ready.RESEARCH_DIR
+        # Живой frozen_boundary.json от идущего цикла вызывает ранний return
+        # в check_ready() и скрывает cooldown — изолируем и его.
+        data_ready.RESEARCH_DIR = Path(self._tmp.name)
         data_ready.STATE_PATH = Path(self._tmp.name) / "last_run.json"
         data_ready.STATE_PATH.write_text(
             __import__("json").dumps(_state(
@@ -89,6 +93,7 @@ class TestCooldown(unittest.TestCase):
 
     def tearDown(self):
         data_ready.STATE_PATH = self._old
+        data_ready.RESEARCH_DIR = self._old_dir
         self._tmp.cleanup()
 
     def test_fresh_run_blocked_by_cooldown(self):
