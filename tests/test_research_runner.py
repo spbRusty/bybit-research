@@ -58,6 +58,7 @@ class RunnerBase(unittest.TestCase):
                    return_value={"ob_valid_symbols": 744, "ob_unique_symbols": 100,
                                  "ob_rows": 5000}),
             patch.object(rr, "run_controller", return_value=(0, "{}")),
+            patch.object(rr, "notify_cycle_report"),
             patch.object(rr, "_mem_info",
                    return_value={"MemAvailable": 50.0, "SwapFree": 20.0}),
             patch.object(rr, "FREEZE_POLL_SEC", 0.01),
@@ -315,6 +316,20 @@ class TestRecoveryAndFinish(RunnerBase):
         rr.service_start.assert_called_once_with(rr.MARKETDATA_SERVICE)
         self.assertFalse(data_ready.frozen_boundary_path().exists())
         self.assertFalse((self.td / "runner_state.json").exists())
+
+    def test_finish_reports_completed_experiments(self):
+        data_ready.save_frozen_boundary(_frozen())
+        (self.td / "experiments.jsonl").write_text(
+            self._journal_line("EXP_A", status="DONE"))
+        self._write_state(state="PASS_PENDING_PAPER", budget_used=2)
+        rr.run_cycle(limit=40)
+        rr.notify_cycle_report.assert_called_once()
+
+    def test_finish_without_experiments_sends_no_report(self):
+        data_ready.save_frozen_boundary(_frozen())
+        self._write_state(state="PASS_PENDING_PAPER", budget_used=2)
+        rr.run_cycle(limit=40)
+        rr.notify_cycle_report.assert_not_called()
 
     def test_finish_restores_frozen_after_terminal_step(self):
         data_ready.save_frozen_boundary(_frozen(marketdata_was_active=True))

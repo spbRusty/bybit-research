@@ -595,10 +595,12 @@ def run_cycle(limit: int | None = LIMIT_DEFAULT,
 
         if result.get("finished"):
             cycle_id = _frozen_cycle_id(frozen)
+            experiments = _cycle_experiments(cycle_id)
             state = _read_state()
             _phase_finish(frozen)
             _runner_state_clear()
-            notify_cycle_report(_cycle_experiments(cycle_id), state)
+            if experiments:
+                notify_cycle_report(experiments, state)
         return result
     finally:
         lock.release()
