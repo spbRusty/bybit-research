@@ -217,7 +217,7 @@ class TestResearchGate(unittest.TestCase):
              patch("src.dashboard.collectors.LOGS_DIR", self.logs):
             d = collectors.get_research_gate()
         self.assertEqual(d["status"], "READY")
-        self.assertEqual(d["reason"], "Cooldown expired")
+        self.assertEqual(d["reason"], "Пауза истекла")
         self.assertIsNone(d["next_run_utc"])
 
     def test_ready_from_last_run_verdict(self):
@@ -233,7 +233,7 @@ class TestResearchGate(unittest.TestCase):
              patch("src.dashboard.collectors.LOGS_DIR", self.logs):
             d = collectors.get_research_gate()
         self.assertEqual(d["status"], "READY")
-        self.assertEqual(d["reason"], "No previous runs")
+        self.assertEqual(d["reason"], "Предыдущих запусков нет")
 
 
 class TestHypothesesDisplayStatus(unittest.TestCase):
@@ -275,9 +275,9 @@ class TestOrderbookNaming(unittest.TestCase):
 
     def test_headers_renamed(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
-        self.assertIn("<h2>Order Book Collector (Reconstructed)</h2>", html)
-        self.assertIn("<h2>Legacy Market Data Streams</h2>", html)
-        self.assertIn("<h2>Event-driven OB Captures</h2>", html)
+        self.assertIn("<h2>Коллектор стакана (реконструкция)</h2>", html)
+        self.assertIn("<h2>Legacy-потоки рыночных данных</h2>", html)
+        self.assertIn("<h2>Захваты стакана по событиям</h2>", html)
 
 
 class TestResearchGateRoute(unittest.TestCase):
