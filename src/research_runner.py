@@ -48,6 +48,7 @@ from src.data_ready import (
     scan_klines,
     scan_ob,
 )
+from src.notify import notify_cycle_report
 
 logger = logging.getLogger("research_runner")
 
@@ -593,8 +594,11 @@ def run_cycle(limit: int | None = LIMIT_DEFAULT,
                                       category=category, once=once)
 
         if result.get("finished"):
+            cycle_id = _frozen_cycle_id(frozen)
+            state = _read_state()
             _phase_finish(frozen)
             _runner_state_clear()
+            notify_cycle_report(_cycle_experiments(cycle_id), state)
         return result
     finally:
         lock.release()

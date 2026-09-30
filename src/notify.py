@@ -7,10 +7,34 @@ from __future__ import annotations
 import json
 import logging
 import urllib.request
+from collections import Counter
 
 from config.settings import NTFY_TOPIC, NTFY_SERVER
 
 logger = logging.getLogger(__name__)
+
+_VERDICT_RU = {"ACCEPT": "ПРИНЯТА", "REJECT": "ОТКЛОНЕНА", "FAILED": "ОШИБКА"}
+_DIAGNOSIS_RU = {
+    "no_signal": "нет сигнала",
+    "cost_sensitive": "чувствительно к комиссиям",
+    "concentrated": "концентрация сделок",
+    "no_edge": "нет преимущества",
+    "unstable": "нестабильно",
+}
+_MODE_RU = {
+    "BASELINE": "базовая линия",
+    "REGIME_SWEEP": "обзор режимов",
+    "HORIZON_SWEEP": "обзор горизонтов",
+    "THRESHOLD_SWEEP": "обзор порогов",
+    "CONDITIONAL": "условные входы",
+    "FAMILY_SWITCH": "смена семейства",
+}
+
+
+def _ru(counts: Counter, table: dict[str, str]) -> str:
+    """'нет сигнала 8; чувствительно к комиссиям 3' — с переводом и fallback."""
+    parts = [f"{table.get(k, k)} {v}" for k, v in counts.most_common()]
+    return "; ".join(parts) if parts else "—"
 
 
 def notify(title: str, message: str, tags: str = "") -> bool:
@@ -85,3 +109,38 @@ def notify_shadow_summary(trades: int, pnl: float, balance: float) -> None:
     msg = (f"Сделок в shadow: {trades}; PnL: {pnl:+.4f} USDT; "
            f"баланс: {balance:.2f} USDT")
     notify("СВОДКА ПО SHADOW", msg, tags="bar_chart")
+
+
+def notify_cycle_report(experiments: list[dict], state: dict) -> None:
+    """Итог прогона контроллера — батч экспериментов на frozen boundary.
+
+    experiments: сырые записи журнала цикла (RUNNING+DONE дублируются по
+    experiment_id, здесь дедуплицируются). state: controller_state.json.
+    """
+    done: dict[str, dict] = {}
+    for e in experiments:
+        if e.get("status") == "DONE":
+            done[e["experiment_id"]] = e
+    if not done:
+        notify("ИТОГ ЦИКЛА: ЭКСПЕРИМЕНТЫ", "Завершённых экспериментов нет",
+               tags="grey_question")
+        return
+
+    budget = int(state.get("budget_used", 0) or 0)
+    tests = int(state.get("n_tests_cumulative", 0) or 0)
+    lines = [
+        f"Цикл: {state.get('cycle_id', '—')}",
+        f"Экспериментов завершено: {len(done)}"
+        + (f" (бюджет {budget})" if budget else ""),
+        f"Гипотез оценено за цикл нарастающим итогом: {tests}"
+        if tests else "Гипотез оценено: —",
+        f"Вердикты: {_ru(Counter(e.get('final_verdict') for e in done.values()), _VERDICT_RU)}",
+        f"Диагнозы: {_ru(Counter(e.get('diagnosis') for e in done.values()), _DIAGNOSIS_RU)}",
+        f"Режимы: {_ru(Counter(e.get('mode') for e in done.values()), _MODE_RU)}",
+    ]
+    accepted = sum(1 for e in done.values()
+                   if e.get("final_verdict") == "ACCEPT")
+    lines.append("Итог: " + ("есть принятые кандидаты" if accepted
+                              else "новых кандидатов нет"))
+    notify("ИТОГ ЦИКЛА: ЭКСПЕРИМЕНТЫ", "\n".join(lines),
+           tags="tada" if accepted else "bar_chart")
