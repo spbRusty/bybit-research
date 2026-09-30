@@ -124,12 +124,12 @@ class TestMarketDataRecords(unittest.TestCase):
 
 
 class TestSystemStatusLogs(unittest.TestCase):
-    """Fix 4: system status must watch research_timer.log, not pipeline.log."""
+    """Fix 4: system status must watch research_cycle.log, not pipeline.log."""
 
     def setUp(self):
         import tempfile
         self._tmp = Path(tempfile.mkdtemp())
-        log = self._tmp / "research_timer.log"
+        log = self._tmp / "research_cycle.log"
         log.write_text("Gated run SKIP (cooldown until 2099-01-01 00:00 UTC)\n")
         _set_mtime(log, datetime.now(timezone.utc))
 
@@ -292,6 +292,9 @@ class TestResearchGateRoute(unittest.TestCase):
 class TestObGapMetric(unittest.TestCase):
     """OB gaps metric: counts current per-symbol state, delisted symbols -> missing."""
 
+    def setUp(self):
+        collectors._cache.clear()
+
     def _write_metrics(self, tmp: Path, lines: list[dict]) -> Path:
         path = tmp / "orderbook" / "reconstructed" / "_metrics.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,8 +350,8 @@ class TestStatusBlocks(unittest.TestCase):
 
     def test_research_progress_block_present(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
-        for hid in ("rp-flow", "rp-gate", "rp-state", "rp-reason"):
-            self.assertIn(f'id="{hid}"', html)
+        self.assertIn('id="rp-state"', html)
+        self.assertIn("setIf('rp-state', html)", html)
 
     def test_live_data_block_present(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
@@ -356,7 +359,11 @@ class TestStatusBlocks(unittest.TestCase):
 
     def test_render_functions_registered_in_refresh_all(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
-        self.assertIn("renderSysStatus(), renderResearchProgress(), renderResearchCycle(), renderLiveData()", html)
+        self.assertIn(
+            "renderSysStatus(), renderResearchProgress(), renderResearchController(), "
+            "renderResearchCycle(), renderLiveData()",
+            html,
+        )
 
     def test_research_cycle_block_present(self):
         html = INDEX_HTML.read_text(encoding="utf-8")

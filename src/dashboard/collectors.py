@@ -877,8 +877,11 @@ def get_data_quality() -> dict:
                 size = metrics_path.stat().st_size
                 tail_bytes = 2 * 1024 * 1024
                 with open(metrics_path) as f:
-                    f.seek(max(0, size - tail_bytes))
-                    f.readline()  # отбросить неполную первую строку
+                    # guards обязателен: readline() отбрасывает запись только
+                    # после seek в середину файла, иначе съест валидную.
+                    if size > tail_bytes:
+                        f.seek(size - tail_bytes)
+                        f.readline()  # отбросить неполную первую строку
                     for line in deque(f, maxlen=20000):
                         line = line.strip()
                         if not line:
