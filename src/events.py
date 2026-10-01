@@ -7,6 +7,7 @@ T (close свечи). Будущие доходности считаются о�
 """
 from __future__ import annotations
 
+import numpy as np
 import polars as pl
 from config.settings import EVENTS_DIR
 from config.settings import load_toml
@@ -25,26 +26,86 @@ def suspicious_candles(df: pl.DataFrame,
                      (pl.col("relative_range") > rrange))
 
 
+def _sparse_extreme(vals: np.ndarray, take_max: bool) -> list[np.ndarray]:
+    """Sparse table (двоичные подъёмы) для запросов max/min на произвольном отрезке."""
+    n = vals.shape[0]
+    levels = [vals.astype(np.float64, copy=False)]
+    step = 1
+    while (step << 1) <= n:
+        prev = levels[-1]
+        m = n - (step << 1) + 1
+        cur = (np.maximum if take_max else np.minimum)(prev[:m], prev[step:step + m])
+        levels.append(cur)
+        step <<= 1
+    return levels
+
+
+def _range_extreme(levels: list[np.ndarray], starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """Экстремум на включительном отрезке [starts[i], ends[i]]; NaN где отрезок пуст."""
+    out = np.full(len(starts), np.nan)
+    ok = (ends >= starts) & (ends < len(levels[0])) & (starts >= 0)
+    if not ok.any():
+        return out
+    s, e = starts[ok], ends[ok]
+    k = np.floor(np.log2((e - s + 1).astype(np.float64))).astype(np.int64)
+    # два перекрывающихся блока длины 2^k покрывают весь отрезок
+    res = np.empty(len(k))
+    for lvl in np.unique(k):
+        m = k == lvl
+        tbl = levels[int(lvl)]
+        res[m] = np.maximum(tbl[s[m]], tbl[e[m] - (1 << int(lvl)) + 1])
+    out[ok] = res
+    return out
+
+
 def _future_metrics(df: pl.DataFrame) -> pl.DataFrame:
     """Будущие доходности и MFE/MAE для каждой свечи (строго вперёд от open(T+1)).
 
-    return_{h}m = close(T+h) / open(T+1) - 1
-    mfe_{h}m = max(high[T+1..T+h]) / open(T+1) - 1
-    mae_{h}m = min(low[T+1..T+h]) / open(T+1) - 1
-    Перекрытие окна с пропуском данных -> null (оценивается len окна).
+    Горизонт задаётся В МИНУТАХ, а не в строках: выход = первая свеча с
+    open_time >= T + h минут. Раньше был shift(-h) по строкам, а сетка баров
+    нерегулярна (медиана gap ~2 мин, максимум 174 мин) — реальный горизонт
+    плавал в разы и таргеты были подписаны неверно.
+
+    return_{h}m = close(T+h мин) / open(T+1) - 1
+    mfe_{h}m   = max(high[T+1..T+h мин]) / open(T+1) - 1
+    mae_{h}m   = min(low[T+1..T+h мин]) / open(T+1) - 1
+    Окно с пропуском данных (фактический горизонт > 1.5*h) -> null: h минут
+    не покрыты свечами, заявлять такой таргет нельзя.
     """
+    if df.height == 0:
+        return df
+    df = df.sort("open_time")
+    n = df.height
     out = df.with_columns(pl.col("open").shift(-1).alias("entry_price"))
+
+    t_ms = df["open_time"].dt.epoch("ms").to_numpy().astype(np.int64)
+    rows = np.arange(n, dtype=np.int64)
+    entry_idx = rows + 1
+    entry_price = np.full(n, np.nan)
+    entry_price[:-1] = df["open"].to_numpy()[1:].astype(np.float64)
+    close = df["close"].to_numpy().astype(np.float64)
+    hi = df["high"].to_numpy().astype(np.float64)
+    lo = df["low"].to_numpy().astype(np.float64)
+    hi_tbl = _sparse_extreme(hi, take_max=True)
+    lo_tbl = _sparse_extreme(lo, take_max=False)
+
     for h in _FEAT["future_horizons_min"]:
-        # будущее окно [T+1..T+h]: reverse -> rolling(назад) -> reverse (forward rolling)
-        mfe = (pl.col("high").shift(-1).reverse()
-               .rolling_max(h, min_samples=h).reverse())
-        mae = (pl.col("low").shift(-1).reverse()
-               .rolling_min(h, min_samples=h).reverse())
+        exit_idx = np.searchsorted(t_ms, t_ms + int(h) * 60_000, side="left")
+        # фактическое покрытие окна: не более 1.5*h минут, иначе h минут нет данных
+        span = np.full(n, np.inf)
+        has_exit = exit_idx < n
+        span[has_exit] = t_ms[exit_idx[has_exit]] - t_ms[has_exit]
+        ok = has_exit & (span <= int(h) * 60_000 * 3 // 2)
+        end_c = np.clip(exit_idx, 0, n - 1)
+        mfe = _range_extreme(hi_tbl, entry_idx, end_c)
+        mae = _range_extreme(lo_tbl, entry_idx, end_c)
+        ret = np.full(n, np.nan)
+        np.divide(close[end_c], entry_price, out=ret, where=entry_price > 0)
+        ret -= 1.0
         out = out.with_columns([
-            (pl.col("close").shift(-h) / pl.col("entry_price") - 1)
-            .alias(f"return_{h}m"),
-            (mfe / pl.col("entry_price") - 1).alias(f"mfe_{h}m"),
-            (mae / pl.col("entry_price") - 1).alias(f"mae_{h}m"),
+            pl.Series(f"return_{h}m", np.where(ok, ret, np.nan)),
+            pl.Series(f"mfe_{h}m", np.where(ok, mfe / entry_price - 1.0, np.nan)),
+            pl.Series(f"mae_{h}m", np.where(ok, mae / entry_price - 1.0, np.nan)),
         ])
     return out
 
@@ -53,8 +114,8 @@ def build_events(df: pl.DataFrame, symbol: str, category: str) -> pl.DataFrame:
     """Полный контур: признаки -> будущие доходности -> предфильтр -> события.
 
     Будущие доходности (return_{h}m / mfe / mae) считаются на ПОЛНОМ временном
-    ряду ДО фильтра, иначе shift(-h) сдвигался бы на h строк прореженного df —
-    и return был бы до h-й следующей подозрительной свечи, а не через h минут.
+    ряду ДО фильтра, иначе окно считалось бы по прореженному df — и таргет
+    сдвинулся бы на h строк подозрительных свечей вместо h минут.
     Предфильтр применяется ПОСЛЕ, чтобы выбрать, какие строки становятся событиями.
     """
     full = _future_metrics(df)

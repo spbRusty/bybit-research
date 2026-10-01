@@ -77,6 +77,97 @@ def test_future_return_is_forward_only():
         assert abs(r[t] - expect) < 1e-9
 
 
+def _grid_df(steps_min: list[int]) -> pl.DataFrame:
+    """Свечи на нерегулярной сетке: цена линейно растёт со временем.
+
+    close(T) = 100 + минуты(T), open = close - 1 -> арифметика таргетов
+    проверяется в уме, без шума.
+    """
+    base = dt.datetime(2026, 3, 1, tzinfo=dt.timezone.utc)
+    close = np.array([100.0 + m for m in steps_min])
+    open_ = close - 1.0
+    v = np.full(len(steps_min), 1000.0)
+    return pl.DataFrame({
+        "open_time": [base + dt.timedelta(minutes=m) for m in steps_min],
+        "open": open_, "high": close + 0.5, "low": close - 0.5, "close": close,
+        "volume": v, "turnover": v * close, "is_green": close >= open_,
+    })
+
+
+def test_horizon_is_minutes_not_rows():
+    """Горизонт задан в МИНУТАХ: на 2-минутной сетке return_5m выходит на T+6мин,
+    а не на 5-ю строку вперёд (T+10мин). Это ловит возврат к shift(-h)."""
+    df = _grid_df(list(range(0, 60, 2)))
+    r = ev_mod._future_metrics(df)["return_5m"].to_numpy()
+    # T=0мин: entry=open(T+2)=101, exit=первая свеча >= 5мин -> T+6мин, close=106
+    assert abs(r[0] - (106.0 / 101.0 - 1)) < 1e-9, r[0]
+    # shift(-5) по строкам дал бы close(T+10мин)=110
+    assert abs(r[0] - (110.0 / 101.0 - 1)) > 1e-3
+
+
+def test_gap_wider_than_window_is_null():
+    """Пропуск шире 1.5*h минут ВНУТРИ окна -> null, а не таргет через дыру в данных."""
+    df = _grid_df([0, 2, 4, 6, 8, 30, 32, 34, 36, 38])
+    r = ev_mod._future_metrics(df)["return_5m"].to_numpy()
+    # T=6мин: окно до 11мин, а следующая свеча только на 30мин -> span 24 > 7.5 -> null
+    assert not np.isfinite(r[3])
+    # T=0мин: окно 2/4/6мин покрыто, выход на T+6мин -> таргет валиден
+    assert np.isfinite(r[0])
+    assert abs(r[0] - (106.0 / 101.0 - 1)) < 1e-9
+
+
+def test_mfe_mae_cover_time_window():
+    """MFE/MAE берут экстремумы до T+h МИНУТ, а не по h строкам."""
+    steps = list(range(0, 60, 2))
+    df = _grid_df(steps)
+    spike = np.full(len(steps), 0.5)
+    spike[2] = 200.0 - (100.0 + steps[2])   # пик на T+4мин
+    df = df.with_columns(pl.Series("high", df["close"].to_numpy() + spike))
+    out = ev_mod._future_metrics(df)
+    # T=0мин: окно = T+2,T+4,T+6 -> пик 200 попадает, entry=101
+    assert abs(out["mfe_5m"].to_numpy()[0] - (200.0 / 101.0 - 1)) < 1e-9
+
+
+def test_features_unchanged_when_future_perturbed():
+    """Главный тест на утечку: признаки на T не меняются, если испортить все
+    бары строго ПОСЛЕ T. Ломается на любом look-ahead в признаках."""
+    base = dt.datetime(2026, 3, 1, tzinfo=dt.timezone.utc)
+    n = 300
+    ts = [base + dt.timedelta(minutes=i) for i in range(n)]
+    rng = np.random.default_rng(11)
+    c = 100 * np.exp(np.cumsum(rng.normal(0, 0.001, n)))
+    o = c / np.exp(rng.normal(0, 0.001, n))
+    df = pl.DataFrame({
+        "open_time": ts, "open": o, "high": np.maximum(o, c) * 1.001,
+        "low": np.minimum(o, c) * 0.999, "close": c,
+        "volume": rng.integers(100, 5000, n).astype(float),
+        "turnover": rng.integers(100, 5000, n).astype(float) * c,
+        "is_green": c >= o,
+    })
+
+    cut = 200
+    scale = [1.0] * (cut + 1) + [1.5] * (n - cut - 1)
+    perturbed = df.with_columns([
+        (pl.col("open") * pl.Series(scale)).alias("open"),
+        (pl.col("high") * pl.Series(scale)).alias("high"),
+        (pl.col("low") * pl.Series(scale)).alias("low"),
+        (pl.col("close") * pl.Series(scale)).alias("close"),
+    ])
+
+    a = F.add_features(df)
+    b = F.add_features(perturbed)
+    numeric = {pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int16, pl.UInt32}
+    for col in a.columns:
+        if col == "open_time" or a.schema[col] not in numeric:
+            continue
+        lhs = a[col].to_numpy()[:cut + 1].astype(float)
+        rhs = b[col].to_numpy()[:cut + 1].astype(float)
+        m = np.isfinite(lhs) & np.isfinite(rhs)
+        if m.sum() == 0:
+            continue
+        np.testing.assert_allclose(lhs[m], rhs[m], rtol=1e-9, err_msg=col)
+
+
 def test_events_no_future_in_features():
     """Событие: признаки на close T; будущие доходности отдельно — нет колонки
     return_* на входе в условие."""
