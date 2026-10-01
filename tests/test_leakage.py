@@ -219,3 +219,36 @@ def test_generator_thresholds_use_discovery_only():
     # discovery ~1.28 (90pct N(0,1)); весь df (со смесью +100) >> discovery
     assert 0.0 < thr_disc < 3.0, thr_disc
     assert thr_disc < thr_all - 10, (thr_disc, thr_all)
+
+
+def test_range_extreme_respects_min_vs_max_table():
+    """Регрессия: min-таблица собиралась np.maximum, из-за чего MAE был неверным."""
+    vals = np.random.default_rng(3).normal(size=257)
+    lo_tbl = ev_mod._sparse_extreme(vals, take_max=False)
+    hi_tbl = ev_mod._sparse_extreme(vals, take_max=True)
+    starts = np.array([0, 5, 100, 3, 250])
+    ends = np.array([0, 40, 256, 7, 256])
+    got_min = ev_mod._range_extreme(lo_tbl, starts, ends, take_max=False)
+    got_max = ev_mod._range_extreme(hi_tbl, starts, ends, take_max=True)
+    for s, e, gm, gx in zip(starts, ends, got_min, got_max):
+        assert np.isclose(gm, vals[s:e + 1].min()), (s, e, gm)
+        assert np.isclose(gx, vals[s:e + 1].max()), (s, e, gx)
+    assert not np.allclose(got_min, got_max)
+
+
+def test_mae_equals_brute_force_min_over_window():
+    df = _synth_df(n=300, seed=11)
+    out = ev_mod._future_metrics(df)
+    op = df["open"].to_numpy().astype(float)
+    lo = df["low"].to_numpy().astype(float)
+    ts = df["open_time"].dt.epoch("ms").to_numpy().astype(np.int64)
+    mae = out["mae_5m"].to_numpy()
+    checked = 0
+    for i in range(len(ts) - 6):
+        e = int(np.searchsorted(ts, ts[i] + 5 * 60_000, side="left"))
+        if e >= len(ts) or (ts[e] - ts[i]) > 5 * 60_000 * 3 // 2:
+            continue
+        want = lo[i + 1:e + 1].min() / op[i + 1] - 1.0
+        assert np.isclose(mae[i], want, atol=1e-12), (i, mae[i], want)
+        checked += 1
+    assert checked > 100, checked

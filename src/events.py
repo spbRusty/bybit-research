@@ -40,7 +40,8 @@ def _sparse_extreme(vals: np.ndarray, take_max: bool) -> list[np.ndarray]:
     return levels
 
 
-def _range_extreme(levels: list[np.ndarray], starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+def _range_extreme(levels: list[np.ndarray], starts: np.ndarray, ends: np.ndarray,
+                   take_max: bool = True) -> np.ndarray:
     """Экстремум на включительном отрезке [starts[i], ends[i]]; NaN где отрезок пуст."""
     out = np.full(len(starts), np.nan)
     ok = (ends >= starts) & (ends < len(levels[0])) & (starts >= 0)
@@ -48,12 +49,13 @@ def _range_extreme(levels: list[np.ndarray], starts: np.ndarray, ends: np.ndarra
         return out
     s, e = starts[ok], ends[ok]
     k = np.floor(np.log2((e - s + 1).astype(np.float64))).astype(np.int64)
+    pick = np.maximum if take_max else np.minimum
     # два перекрывающихся блока длины 2^k покрывают весь отрезок
     res = np.empty(len(k))
     for lvl in np.unique(k):
         m = k == lvl
         tbl = levels[int(lvl)]
-        res[m] = np.maximum(tbl[s[m]], tbl[e[m] - (1 << int(lvl)) + 1])
+        res[m] = pick(tbl[s[m]], tbl[e[m] - (1 << int(lvl)) + 1])
     out[ok] = res
     return out
 
@@ -97,8 +99,8 @@ def _future_metrics(df: pl.DataFrame) -> pl.DataFrame:
         span[has_exit] = t_ms[exit_idx[has_exit]] - t_ms[has_exit]
         ok = has_exit & (span <= int(h) * 60_000 * 3 // 2)
         end_c = np.clip(exit_idx, 0, n - 1)
-        mfe = _range_extreme(hi_tbl, entry_idx, end_c)
-        mae = _range_extreme(lo_tbl, entry_idx, end_c)
+        mfe = _range_extreme(hi_tbl, entry_idx, end_c, take_max=True)
+        mae = _range_extreme(lo_tbl, entry_idx, end_c, take_max=False)
         ret = np.full(n, np.nan)
         np.divide(close[end_c], entry_price, out=ret, where=entry_price > 0)
         ret -= 1.0
