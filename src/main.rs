@@ -6,7 +6,7 @@
 //! буфер в памяти, сброс в файлы раз в 30 секунд. Перезапуск безопасен: курсор всегда
 //! берётся из последней свечи файла, дубли схлопываются по open_time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,16 +14,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arrow::array::{BooleanArray, Float64Array, TimestampMillisecondArray};
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Instant};
 use tokio_tungstenite::tungstenite::Message;
@@ -31,11 +31,31 @@ use tokio_tungstenite::tungstenite::Message;
 const ROOT: &str = "data/klines";
 const API: &str = "https://api.bybit.com";
 /// Глобальный темп запросов к REST: 115 мс/запрос ≈ 8.7 req/s (лимит Bybit 600/мин).
-const PACE_MS: u64 = 115;
-/// Защита от бесконечного цикла (2000 страниц ≈ 5.5 лет 1m-свечей).
-const MAX_PAGES: usize = 2000;
+const PACE_MS: u64 = 60;
+/// Защита от бесконечного цикла (4000 страниц ≈ 7.6 лет 1m-свечей, покрывает любой листинг Bybit).
+const MAX_PAGES: usize = 4000;
 /// Сброс реалтайм-буфера в файлы, сек.
 const FLUSH_SEC: u64 = 30;
+
+const L2_ROOT: &str = "data/orderbook";
+const L2_LEVELS: usize = 10;
+const L2_FLUSH_SEC: u64 = 10;
+
+#[derive(Debug, Clone, Default)]
+struct OrderbookState {
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
+    ts: i64,
+}
+
+#[derive(Debug, Clone)]
+struct OrderbookUpdate {
+    symbol: String,
+    is_snapshot: bool,
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
+    ts: i64,
+}
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -179,18 +199,22 @@ fn f(a: &[Value], i: usize) -> Result<f64> {
     Ok(a.get(i).and_then(|v| v.as_str()).unwrap_or("0").parse()?)
 }
 
-/// Дофилл одного символа от последней свечи файла до текущего момента.
-async fn backfill_one(st: &FileState, client: &Client, tokens: Arc<Mutex<mpsc::Receiver<()>>>) -> Result<Vec<Candle>> {
-    let last_ts = if st.path.exists() {
-        read_parquet(&st.path)?.last().map(|c| c.start)
-    } else {
-        None
-    };
-    let mut cursor = last_ts.map(|t| t + 60_000).unwrap_or_else(|| Utc::now().timestamp_millis() - 2 * 86_400_000);
-    let end = Utc::now().timestamp_millis();
+/// Дофилл одного символа в диапазоне [start, end].
+///
+/// Bybit kline при диапазоне шире limit=1000 возвращает **новейшие** 1000 свечей
+/// (проверено живьём), поэтому курсор двигается НАЗАД: каждая страница = 1000 последних
+/// минут до текущей верхней границы, граница опускается до самой старой свечи страницы.
+async fn backfill_range(
+    st: &FileState,
+    start: i64,
+    end: i64,
+    client: &Client,
+    tokens: Arc<Mutex<mpsc::Receiver<()>>>,
+) -> Result<Vec<Candle>> {
+    let mut cursor = end;
     let mut out: Vec<Candle> = Vec::new();
     for _ in 0..MAX_PAGES {
-        if cursor >= end - 60_000 {
+        if cursor <= start {
             break;
         }
         {
@@ -200,17 +224,29 @@ async fn backfill_one(st: &FileState, client: &Client, tokens: Arc<Mutex<mpsc::R
             }
         }
         let url = format!(
-            "{API}/v5/market/kline?category={}&symbol={}&interval=1&start={cursor}&end={end}&limit=1000",
+            "{API}/v5/market/kline?category={}&symbol={}&interval=1&start={start}&end={cursor}&limit=1000",
             st.category, st.symbol
         );
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+        // retCode=10006 (rate limit) — повторяем страницу с паузой, а не теряем её
+        let resp = {
+            let mut attempts = 0;
+            loop {
+                let resp = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .with_context(|| format!("GET {url}"))?
+                    .error_for_status()?
+                    .json::<Value>()
+                    .await?;
+                if resp["retCode"].as_i64() == Some(10006) && attempts < 10 {
+                    attempts += 1;
+                    sleep(Duration::from_millis(2000 * attempts)).await;
+                    continue;
+                }
+                break resp;
+            }
+        };
         if resp["retCode"].as_i64() != Some(0) {
             eprintln!("[{}] retCode={}: {}", st.symbol, resp["retCode"], resp["retMsg"]);
             break; // делистинг/невалидный символ — файл оставляем как есть
@@ -219,16 +255,16 @@ async fn backfill_one(st: &FileState, client: &Client, tokens: Arc<Mutex<mpsc::R
         if list.is_empty() {
             break;
         }
-        let mut page_max = 0i64;
+        let mut page_min = i64::MAX;
         for row in list.iter().rev() {
             let a = row.as_array().with_context(|| "row not array")?;
-            let start: i64 = a.first().and_then(|v| v.as_str()).unwrap_or("0").parse()?;
-            page_max = page_max.max(start);
-            if start < cursor {
+            let s: i64 = a.first().and_then(|v| v.as_str()).unwrap_or("0").parse()?;
+            page_min = page_min.min(s);
+            if s < start {
                 continue;
             }
             out.push(Candle {
-                start,
+                start: s,
                 open: f(a, 1)?,
                 high: f(a, 2)?,
                 low: f(a, 3)?,
@@ -237,21 +273,189 @@ async fn backfill_one(st: &FileState, client: &Client, tokens: Arc<Mutex<mpsc::R
                 turnover: f(a, 6)?,
             });
         }
-        let next_cursor = page_max + 60_000;
-        if next_cursor <= cursor || list.len() < 1000 {
-            break;
+        if list.len() < 1000 {
+            break; // дошли до начала истории
         }
-        cursor = next_cursor;
+        cursor = page_min - 60_000;
     }
     Ok(out)
 }
 
+/// Дыра > 3 минут считается пропуском данных.
+const GAP_MIN: i64 = 3 * 60_000;
+/// Ремонтируем файл, если в нём есть дыра >= 1 часа (меньше — естественные паузы неликвидных пар).
+const GAP_TRIGGER: i64 = 60 * 60_000;
+
+/// Ремонт одного файла: чинит голову (сломанный refresh — файл начинается позже листинга),
+/// внутреннюю дыру >= 1 часа, отставший хвост. Чистые файлы пропускаются без запросов.
+/// Дубли (уже имеющиеся свечи в перекачанном диапазоне) схлопнутся в append_rows.
+async fn repair_one(
+    st: &FileState,
+    listed: Option<i64>,
+    client: &Client,
+    tokens: Arc<Mutex<mpsc::Receiver<()>>>,
+) -> Result<Vec<Candle>> {
+    let now = Utc::now().timestamp_millis();
+    let candles = if st.path.exists() { read_parquet(&st.path)? } else { vec![] };
+    if candles.is_empty() {
+        // файла нет — качаем от листинга (или последних 2 дней, если листинг неизвестен)
+        let start = listed.unwrap_or_else(|| now - 2 * 86_400_000);
+        return backfill_range(st, start, now, client, tokens).await;
+    }
+    let first = candles[0].start;
+    let last = candles[candles.len() - 1].start;
+    // 1) голова: файл создан недавно (< 7 дней) — вероятно, сломанный refresh
+    //    (тогда в файле только хвост 1000 свечей, а не история от листинга).
+    //    Для linear листинг известен (launchTime); для spot — проба на 180 дней.
+    if now - first < 7 * 86_400_000 {
+        let start = match listed {
+            Some(l) if first > l + 120_000 => l,
+            Some(_) => return Ok(vec![]), // файл начинается с листинга — голова цела
+            None => now - 180 * 86_400_000,
+        };
+        return backfill_range(st, start, now, client, tokens).await;
+    }
+    // 2) внутренняя дыра >= 1 часа: качаем от начала первой дыры до now,
+    //    уже имеющиеся свечи схлопнутся в append_rows
+    let max_gap = candles.windows(2).map(|w| w[1].start - w[0].start).max().unwrap_or(0);
+    if max_gap >= GAP_TRIGGER {
+        let gap_start = candles.windows(2)
+            .find(|w| w[1].start - w[0].start > GAP_MIN)
+            .map(|w| w[0].start + 60_000)
+            .unwrap_or(first);
+        return backfill_range(st, gap_start, now, client, tokens).await;
+    }
+    // 3) отстал хвост (сервис долго не работал) — докачиваем с последней свечи
+    if last < now - 300_000 {
+        return backfill_range(st, last + 60_000, now, client, tokens).await;
+    }
+    Ok(vec![]) // файл в порядке
+}
+
 // ------------------------- реалтайм -------------------------
 
-async fn ws_loop(category: &str, symbols: Vec<String>, tx: mpsc::Sender<(String, Vec<Candle>)>) {
+/// Возвращает торгуемые USDT-пары категории (linear/spot): (символ, время листинга, мс).
+async fn fetch_usdt_symbols(client: &Client, category: &str, tokens: &Arc<Mutex<mpsc::Receiver<()>>>) -> Result<Vec<(String, Option<i64>)>> {
+    let mut out = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        {
+            let mut rx = tokens.lock().await;
+            if rx.recv().await.is_none() {
+                break;
+            }
+        }
+        let mut url = format!("{API}/v5/market/instruments-info?category={category}&status=Trading&limit=1000");
+        if !cursor.is_empty() {
+            url.push_str(&format!("&cursor={cursor}"));
+        }
+        let resp = client
+            .get(&url)
+            .send().await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let list = resp["result"]["list"].as_array().cloned().unwrap_or_default();
+        for it in &list {
+            let Some(sym) = it["symbol"].as_str() else { continue };
+            if sym.ends_with("USDT") {
+                // linear: launchTime; spot: поля листинга нет вовсе — вернётся None
+                let listed = it["launchTime"].as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| it["listedTime"].as_str().and_then(|s| s.parse::<i64>().ok()));
+                out.push((sym.to_string(), listed));
+            }
+        }
+        match resp["result"]["nextPageCursor"].as_str() {
+            Some(c) if !c.is_empty() && list.len() >= 1000 => cursor = c.to_string(),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Раз в сутки: обновляет список символов для дозаписи — добавляет новые USDT-пары
+/// с биржи, дофиливает их от времени листинга и регистрирует в realtime-подписке.
+async fn refresh_loop(
+    client: Arc<Client>,
+    tokens: Arc<Mutex<mpsc::Receiver<()>>>,
+    registry: Arc<RwLock<HashMap<String, Vec<String>>>>,
+) {
+    loop {
+        for category in ["linear", "spot"] {
+            let syms = match fetch_usdt_symbols(&client, category, &tokens).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[refresh {category}] список не получен: {e:#}");
+                    continue;
+                }
+            };
+            let known: HashSet<String> = registry
+                .read().await
+                .get(category)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let total = syms.len();
+            let new: Vec<(String, Option<i64>)> = syms
+                .into_iter()
+                .filter(|(s, _)| !known.contains(s))
+                .collect();
+            if new.is_empty() {
+                println!("[refresh {category}] новых пар нет (из {total} USDT на бирже)");
+                continue;
+            }
+            let mut added = Vec::new();
+            let mut tasks = JoinSet::new();
+            for (sym, listed) in &new {
+                let st = FileState {
+                    path: Path::new(ROOT).join(category).join(format!("{sym}_{category}_1m.parquet")),
+                    category: category.to_string(),
+                    symbol: sym.clone(),
+                };
+                let tokens = tokens.clone();
+                let client = client.clone();
+                let listed = *listed;
+                tasks.spawn(async move {
+                    let start = listed.unwrap_or_else(|| Utc::now().timestamp_millis() - 2 * 86_400_000);
+                    let res = backfill_range(&st, start, Utc::now().timestamp_millis(), &client, tokens).await;
+                    (st, res)
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                let Ok((st, res)) = joined else {
+                    eprintln!("[refresh {category}] задача join упала");
+                    continue;
+                };
+                match res {
+                    Ok(rows) => {
+                        if let Err(e) = append_rows(&st.path, &rows) {
+                            eprintln!("[refresh {}] запись: {e:#}", st.symbol);
+                        } else if !rows.is_empty() {
+                            println!("[refresh {}] новая пара, +{} свечек ({})", st.symbol, rows.len(), st.category);
+                            added.push(st.symbol.clone());
+                        }
+                    }
+                    Err(e) => eprintln!("[refresh {}] дофилл не удался: {e:#}", st.symbol),
+                }
+            }
+            if !added.is_empty() {
+                let n = added.len();
+                registry.write().await.get_mut(category).expect("cat").extend(added);
+                println!("[refresh {category}] новых пар добавлено: {n} (из {total} USDT на бирже)");
+            } else {
+                println!("[refresh {category}] новых пар добавлено: 0 (из {total} USDT на бирже)");
+            }
+        }
+        sleep(Duration::from_secs(86_400)).await;
+    }
+}
+
+async fn ws_loop(category: &str, registry: Arc<RwLock<HashMap<String, Vec<String>>>>, tx: mpsc::Sender<(String, Vec<Candle>)>, l2_tx: mpsc::Sender<OrderbookUpdate>) {
     loop {
         let url = format!("wss://stream.bybit.com/v5/public/{category}");
-        match ws_run(&url, &symbols, &tx).await {
+        match ws_run(&url, category, &registry, &tx, &l2_tx).await {
             Ok(_) => {}
             Err(e) => eprintln!("[ws {category}] {e:#}; переподключение через 3с"),
         }
@@ -259,41 +463,94 @@ async fn ws_loop(category: &str, symbols: Vec<String>, tx: mpsc::Sender<(String,
     }
 }
 
-async fn ws_run(url: &str, symbols: &[String], tx: &mpsc::Sender<(String, Vec<Candle>)>) -> Result<()> {
+async fn ws_run(
+    url: &str,
+    category: &str,
+    registry: &Arc<RwLock<HashMap<String, Vec<String>>>>,
+    tx: &mpsc::Sender<(String, Vec<Candle>)>,
+    l2_tx: &mpsc::Sender<OrderbookUpdate>,
+) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut sink, mut stream) = ws.split();
-    for chunk in symbols.chunks(10) {
-        let args: Vec<String> = chunk.iter().map(|s| format!("kline.1.{s}")).collect();
-        sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
-    }
-    eprintln!("[ws] {url} подписан: {} символов", symbols.len());
-    while let Some(msg) = stream.next().await {
-        let msg = msg?;
+    subscribe_all(&mut sink, registry, category).await?;
+    eprintln!("[ws] {url} подписан: {} символов", registry.read().await.get(category).map(|v| v.len()).unwrap_or(0));
+    loop {
+        let msg = tokio::select! {
+            msg = stream.next() => match msg {
+                Some(m) => m?,
+                None => break,
+            },
+            _ = sleep(Duration::from_secs(60)) => {
+                subscribe_all(&mut sink, registry, category).await?;
+                continue;
+            }
+        };
         if let Message::Text(t) = msg {
             let v: Value = serde_json::from_str(t.as_str())?;
             if v["op"].as_str() == Some("ping") {
                 sink.send(Message::Text(json!({"op": "pong"}).to_string().into())).await?;
                 continue;
             }
-            let Some(sym) = v["topic"].as_str().and_then(|t| t.strip_prefix("kline.1.")) else {
-                continue;
-            };
-            let Some(arr) = v["data"].as_array() else { continue };
-            let mut candles = Vec::with_capacity(arr.len());
-            for d in arr {
-                let Some(start) = d["start"].as_i64() else { continue };
-                let parse = |k: &str| -> Option<f64> { d[k].as_str().and_then(|s| s.parse().ok()) };
-                let (Some(open), Some(high), Some(low), Some(close), Some(volume), Some(turnover)) =
-                    (parse("open"), parse("high"), parse("low"), parse("close"), parse("volume"), parse("turnover"))
-                else {
-                    continue;
+            let topic = v["topic"].as_str().unwrap_or("");
+            if let Some(sym) = topic.strip_prefix("kline.1.") {
+                let Some(arr) = v["data"].as_array() else { continue };
+                let mut candles = Vec::with_capacity(arr.len());
+                for d in arr {
+                    let Some(start) = d["start"].as_i64() else { continue };
+                    let parse = |k: &str| -> Option<f64> { d[k].as_str().and_then(|s| s.parse().ok()) };
+                    let (Some(open), Some(high), Some(low), Some(close), Some(volume), Some(turnover)) =
+                        (parse("open"), parse("high"), parse("low"), parse("close"), parse("volume"), parse("turnover"))
+                    else {
+                        continue;
+                    };
+                    candles.push(Candle { start, open, high, low, close, volume, turnover });
+                }
+                if !candles.is_empty() {
+                    send_candles(tx, url, sym, candles).await?;
+                }
+            } else if let Some(sym) = topic.strip_prefix("orderbook.25.") {
+                let Some(data) = v["data"].as_object() else { continue };
+                let ts = v["ts"].as_i64().unwrap_or(0);
+                let is_snapshot = v["type"].as_str() == Some("snapshot");
+                let parse_levels = |key: &str| -> Vec<(f64, f64)> {
+                    data.get(key).and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter().filter_map(|row| {
+                            let a = row.as_array()?;
+                            Some((f(a, 0).ok()?, f(a, 1).ok()?))
+                        }).collect()
+                    }).unwrap_or_default()
                 };
-                candles.push(Candle { start, open, high, low, close, volume, turnover });
-            }
-            if !candles.is_empty() {
-                send_candles(tx, url, sym, candles).await?;
+                let update = OrderbookUpdate {
+                    symbol: sym.to_string(),
+                    is_snapshot,
+                    bids: parse_levels("b"),
+                    asks: parse_levels("a"),
+                    ts,
+                };
+                if l2_tx.send(update).await.is_err() {
+                    break;
+                }
             }
         }
+    }
+    Ok(())
+}
+
+/// Подписка на kline.1.* по всем символам категории из registry. Bybit идемпотентен:
+/// повторная отправка subscribe — не ошибка, поэтому ресабскриб каждые 60с безопасен.
+async fn subscribe_all<S>(sink: &mut S, registry: &Arc<RwLock<HashMap<String, Vec<String>>>>, category: &str) -> Result<()>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let syms = registry.read().await.get(category).cloned().unwrap_or_default();
+    for chunk in syms.chunks(10) {
+        let args: Vec<String> = chunk.iter().map(|s| format!("kline.1.{s}")).collect();
+        sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
+    }
+    for chunk in syms.chunks(10) {
+        let args: Vec<String> = chunk.iter().map(|s| format!("orderbook.25.{s}")).collect();
+        sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
     }
     Ok(())
 }
@@ -338,6 +595,164 @@ async fn flush_loop(mut rx: mpsc::Receiver<(String, Vec<Candle>)>) {
     }
 }
 
+fn l2_schema() -> Arc<Schema> {
+    let mut fields = vec![
+        Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new("symbol", DataType::Utf8, false),
+    ];
+    for i in 1..=L2_LEVELS {
+        fields.push(Field::new(format!("bid_price_{}", i), DataType::Float64, false));
+        fields.push(Field::new(format!("bid_size_{}", i), DataType::Float64, false));
+    }
+    for i in 1..=L2_LEVELS {
+        fields.push(Field::new(format!("ask_price_{}", i), DataType::Float64, false));
+        fields.push(Field::new(format!("ask_size_{}", i), DataType::Float64, false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+fn write_l2_parquet(path: &Path, rows: &[(String, OrderbookState)]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ts: Vec<i64> = rows.iter().map(|(_, s)| s.ts).collect();
+    let symbols: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(TimestampMillisecondArray::from(ts)),
+        Arc::new(StringArray::from(symbols)),
+    ];
+    for i in 0..L2_LEVELS {
+        let bp: Vec<f64> = rows.iter().map(|(_, s)| s.bids.get(i).map(|(p, _)| *p).unwrap_or(0.0)).collect();
+        let bs: Vec<f64> = rows.iter().map(|(_, s)| s.bids.get(i).map(|(_, sz)| *sz).unwrap_or(0.0)).collect();
+        columns.push(Arc::new(Float64Array::from(bp)));
+        columns.push(Arc::new(Float64Array::from(bs)));
+    }
+    for i in 0..L2_LEVELS {
+        let ap: Vec<f64> = rows.iter().map(|(_, s)| s.asks.get(i).map(|(p, _)| *p).unwrap_or(0.0)).collect();
+        let asz: Vec<f64> = rows.iter().map(|(_, s)| s.asks.get(i).map(|(_, sz)| *sz).unwrap_or(0.0)).collect();
+        columns.push(Arc::new(Float64Array::from(ap)));
+        columns.push(Arc::new(Float64Array::from(asz)));
+    }
+    let batch = RecordBatch::try_new(l2_schema(), columns)?;
+    let tmp = path.with_extension("parquet.tmp");
+    let file = File::create(&tmp).with_context(|| format!("create {tmp:?}"))?;
+    let mut writer = ArrowWriter::try_new(file, l2_schema(), None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    fs::rename(&tmp, path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
+    Ok(())
+}
+
+fn read_l2_parquet(path: &Path) -> Result<Vec<(String, OrderbookState)>> {
+    let file = File::open(path).with_context(|| format!("open {path:?}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+    let mut out = vec![];
+    for batch in reader {
+        let b = batch?;
+        let ts = b.column(0).as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+        let syms = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..b.num_rows() {
+            let mut bids = vec![];
+            let mut asks = vec![];
+            for j in 0..L2_LEVELS {
+                let bp = b.column(2 + j * 2).as_any().downcast_ref::<Float64Array>().unwrap();
+                let bs = b.column(2 + j * 2 + 1).as_any().downcast_ref::<Float64Array>().unwrap();
+                bids.push((bp.value(i), bs.value(i)));
+            }
+            for j in 0..L2_LEVELS {
+                let ap = b.column(2 + L2_LEVELS * 2 + j * 2).as_any().downcast_ref::<Float64Array>().unwrap();
+                let asz = b.column(2 + L2_LEVELS * 2 + j * 2 + 1).as_any().downcast_ref::<Float64Array>().unwrap();
+                asks.push((ap.value(i), asz.value(i)));
+            }
+            out.push((syms.value(i).to_string(), OrderbookState { bids, asks, ts: ts.value(i) }));
+        }
+    }
+    Ok(out)
+}
+
+fn append_l2_rows(path: &Path, new: &[(String, OrderbookState)]) -> Result<()> {
+    if new.is_empty() {
+        return Ok(());
+    }
+    let old = if path.exists() { read_l2_parquet(path)? } else { vec![] };
+    let mut map: HashMap<String, OrderbookState> = HashMap::with_capacity(old.len() + new.len());
+    for (sym, state) in old {
+        map.insert(sym, state);
+    }
+    for (sym, state) in new {
+        map.insert(sym.clone(), state.clone());
+    }
+    let rows: Vec<(String, OrderbookState)> = map.into_iter().collect();
+    write_l2_parquet(path, &rows)
+}
+
+fn apply_l2_delta(levels: &mut Vec<(f64, f64)>, updates: &[(f64, f64)]) {
+    for (price, size) in updates {
+        if *size == 0.0 {
+            levels.retain(|(p, _)| p != price);
+        } else if let Some(entry) = levels.iter_mut().find(|(p, _)| p == price) {
+            entry.1 = *size;
+        } else {
+            levels.push((*price, *size));
+        }
+    }
+}
+
+fn sort_l2_levels(state: &mut OrderbookState) {
+    state.bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    state.asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    state.bids.truncate(L2_LEVELS);
+    state.asks.truncate(L2_LEVELS);
+}
+
+async fn l2_flush_loop(mut rx: mpsc::Receiver<OrderbookUpdate>) {
+    let mut state: HashMap<String, OrderbookState> = HashMap::new();
+    let mut last_flush = Instant::now();
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(update) => {
+                    let entry = state.entry(update.symbol.clone()).or_default();
+                    if update.is_snapshot {
+                        entry.bids = update.bids;
+                        entry.asks = update.asks;
+                        entry.ts = update.ts;
+                    } else {
+                        apply_l2_delta(&mut entry.bids, &update.bids);
+                        apply_l2_delta(&mut entry.asks, &update.asks);
+                        entry.ts = update.ts;
+                    }
+                }
+                None => break,
+            },
+            _ = sleep(Duration::from_secs(L2_FLUSH_SEC)) => {}
+        }
+        if last_flush.elapsed() < Duration::from_secs(L2_FLUSH_SEC) || state.is_empty() {
+            continue;
+        }
+        let now = Utc::now();
+        let hour = now.format("%Y%m%d_%H");
+        for cat in ["linear", "spot"] {
+            let rows: Vec<(String, OrderbookState)> = state
+                .iter()
+                .filter(|(k, _)| k.starts_with(&format!("{cat}/")))
+                .map(|(k, v)| {
+                    let sym = k.split_once('/').unwrap().1.to_string();
+                    let mut s = v.clone();
+                    sort_l2_levels(&mut s);
+                    (sym, s)
+                })
+                .collect();
+            if !rows.is_empty() {
+                let path = Path::new(L2_ROOT).join(cat).join(format!("{cat}_{hour}.parquet"));
+                let _ = append_l2_rows(&path, &rows);
+            }
+        }
+        last_flush = Instant::now();
+    }
+}
+
 // ------------------------- main -------------------------
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -348,7 +763,9 @@ async fn main() -> Result<()> {
     println!("найдено паркетов: {linear} linear + {spot} spot");
 
     // Глобальный дроссель REST: канал, питаемый интервалом PACE_MS.
-    let (ptx, prx) = mpsc::channel(4096);
+    // Ёмкость малая: продюсер не успевает накопить бэклог, иначе стартовый burst
+    // 1377 задач разом выстреливает запросами и ловит 10006 (rate limit по UID).
+    let (ptx, prx) = mpsc::channel(8);
     let tokens = Arc::new(Mutex::new(prx));
     tokio::spawn(async move {
         let mut it = tokio::time::interval(Duration::from_millis(PACE_MS));
@@ -364,51 +781,101 @@ async fn main() -> Result<()> {
     let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
     let client = Arc::new(client);
 
-    // Фаза 1: дофилл.
-    let total = states.len();
-    println!("дофилл: {total} символов, темп ~8.7 req/s, ориентир: несколько часов");
-    let done = Arc::new(AtomicUsize::new(0));
-    let mut tasks = JoinSet::new();
-    for st in states.clone() {
-        let tokens = tokens.clone();
+    // Реестр символов для реалтайм-подписки: стартует с существующих файлов,
+    // пополняется refresh_loop раз в сутки.
+    let registry = Arc::new(RwLock::new(HashMap::from([
+        ("linear".to_string(), states.iter().filter(|s| s.category == "linear").map(|s| s.symbol.clone()).collect()),
+        ("spot".to_string(), states.iter().filter(|s| s.category == "spot").map(|s| s.symbol.clone()).collect()),
+    ])));
+
+    // Суточный refresh списка монет: новые USDT-пары дофиливаются от времени листинга.
+    {
         let client = client.clone();
-        let done = done.clone();
-        tasks.spawn(async move {
-            let res = backfill_one(&st, &client, tokens).await;
-            (st, res, done)
-        });
+        let tokens = tokens.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move { refresh_loop(client, tokens, registry).await });
     }
-    let mut failed = 0usize;
-    while let Some(joined) = tasks.join_next().await {
-        let (st, res, done) = joined?;
-        match res {
-            Ok(rows) => {
-                if let Err(e) = append_rows(&st.path, &rows) {
-                    eprintln!("[{}] запись: {e:#}", st.symbol);
-                    failed += 1;
-                } else if !rows.is_empty() {
-                    let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-                    if d % 50 == 0 || d == 1 {
-                        println!("дофилл: {d}/{total}...");
-                    }
+
+    // Фаза 1: ремонт (дофилл дыр/голов/хвостов).
+    let total = states.len();
+    println!("ремонт: {total} символов, темп ~{} req/s, ориентир: ~5 ч", 1000 / PACE_MS);
+    // Времена листинга для починки головы у свежесозданных файлов (сломанный refresh).
+    let mut listed_map: HashMap<String, i64> = HashMap::new();
+    for cat in ["linear", "spot"] {
+        if let Ok(syms) = fetch_usdt_symbols(&client, cat, &tokens).await {
+            for (s, l) in syms {
+                if let Some(l) = l {
+                    listed_map.insert(s, l);
                 }
-            }
-            Err(e) => {
-                eprintln!("[{}] дофилл не удался: {e:#}", st.symbol);
-                failed += 1;
             }
         }
     }
-    println!("дофилл завершён. неудач: {failed}. Переключаюсь в реалтайм.");
+    println!("времена листинга получены: {}", listed_map.len());
+
+    // Проход 1 — тяжёлый: дыры/головы/хвосты.
+    // Проход 2 — лёгкий tail-sync: файлы, отремонтированные в начале прохода 1,
+    // отстали от now на часы; повторный repair_one дочинит только хвост (1 запрос на файл).
+    let mut worst = 0usize;
+    for label in ["ремонт", "хвост-синк"] {
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut tasks = JoinSet::new();
+        // Одновременно активен лишь лимит repair_one: иначе 1377 задач крутятся в одной
+        // токен-очереди по кругу (~83 с/токен на задачу) и ремонт растягивается на дни.
+        let repair_sem = Arc::new(Semaphore::new(24));
+        for st in states.clone() {
+            let tokens = tokens.clone();
+            let client = client.clone();
+            let done = done.clone();
+            let sem = repair_sem.clone();
+            let listed = listed_map.get(&st.symbol).copied();
+            tasks.spawn(async move {
+                if sem.acquire_owned().await.is_err() {
+                    return (st, Err(anyhow::anyhow!("repair semaphore closed")), done);
+                }
+                let res = repair_one(&st, listed, &client, tokens).await;
+                (st, res, done)
+            });
+        }
+        let mut failed = 0usize;
+        while let Some(joined) = tasks.join_next().await {
+            let (st, res, done) = joined?;
+            match res {
+                Ok(rows) => {
+                    if let Err(e) = append_rows(&st.path, &rows) {
+                        eprintln!("[{}] запись: {e:#}", st.symbol);
+                        failed += 1;
+                    } else if !rows.is_empty() {
+                        let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                        if d % 50 == 0 || d == 1 {
+                            println!("{label}: {d}/{total}...");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[{}] {label} не удался: {e:#}", st.symbol);
+                    failed += 1;
+                }
+            }
+        }
+        worst = worst.max(failed);
+        println!("{label} завершён. неудач: {failed}.");
+    }
+    println!("ремонт завершён (худший проход: {worst} неудач). Переключаюсь в реалтайм.");
 
     // Фаза 2: реалтайм.
     let (wtx, wrx) = mpsc::channel(8192);
+    let (l2_tx, l2_rx) = mpsc::channel(8192);
     for cat in ["linear", "spot"] {
-        let syms: Vec<String> = states.iter().filter(|s| s.category == cat).map(|s| s.symbol.clone()).collect();
         let wtx = wtx.clone();
-        tokio::spawn(async move { ws_loop(cat, syms, wtx).await });
+        let l2_tx = l2_tx.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move { ws_loop(cat, registry, wtx, l2_tx).await });
     }
     drop(wtx);
+    drop(l2_tx);
+    fs::create_dir_all(format!("{L2_ROOT}/linear"))?;
+    fs::create_dir_all(format!("{L2_ROOT}/spot"))?;
+    tokio::spawn(async move { l2_flush_loop(l2_rx).await });
     flush_loop(wrx).await;
     Ok(())
 }
