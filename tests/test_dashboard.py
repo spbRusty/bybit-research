@@ -276,7 +276,6 @@ class TestOrderbookNaming(unittest.TestCase):
     def test_headers_renamed(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
         self.assertIn("<h2>Коллектор стакана (реконструкция)</h2>", html)
-        self.assertIn("<h2>Legacy-потоки рыночных данных</h2>", html)
         self.assertIn("<h2>Захваты стакана по событиям</h2>", html)
 
 
@@ -340,18 +339,13 @@ class TestObGapMetric(unittest.TestCase):
 
 
 class TestStatusBlocks(unittest.TestCase):
-    """Dashboard UX blocks: display-only System Status / Research Progress / Live Data."""
+    """Dashboard UX blocks: display-only System Status / Live Data."""
 
     def test_system_status_block_present(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
         self.assertIn('<div class="grid g3" id="row-sys">', html)
         for hid in ("sys-data", "sys-research", "sys-paper"):
             self.assertIn(f'id="{hid}"', html)
-
-    def test_research_progress_block_present(self):
-        html = INDEX_HTML.read_text(encoding="utf-8")
-        self.assertIn('id="rp-state"', html)
-        self.assertIn("setIf('rp-state', html)", html)
 
     def test_live_data_block_present(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
@@ -360,19 +354,9 @@ class TestStatusBlocks(unittest.TestCase):
     def test_render_functions_registered_in_refresh_all(self):
         html = INDEX_HTML.read_text(encoding="utf-8")
         self.assertIn(
-            "renderSysStatus(), renderResearchProgress(), renderResearchController(), "
-            "renderResearchCycle(), renderLiveData()",
+            "renderSysStatus(), renderResearchController(), renderLiveData()",
             html,
         )
-
-    def test_research_cycle_block_present(self):
-        html = INDEX_HTML.read_text(encoding="utf-8")
-        self.assertIn('id="rc-content"', html)
-        self.assertIn("renderResearchCycle()", html)
-
-    def test_stage_lookup_uses_api_field_name(self):
-        html = INDEX_HTML.read_text(encoding="utf-8")
-        self.assertIn("d.stages.find(s => s.stage === stage)", html)
 
 
 if __name__ == "__main__":

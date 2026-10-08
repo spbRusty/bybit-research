@@ -43,24 +43,9 @@ def api_costs():
     return JSONResponse(collectors.get_trading_costs())
 
 
-@app.get("/api/instruments")
-def api_instruments():
-    return JSONResponse(collectors.get_instrument_info())
-
-
 @app.get("/api/stakes")
 def api_stakes():
     return JSONResponse(collectors.get_stake_levels())
-
-
-@app.get("/api/winrate")
-def api_winrate():
-    return JSONResponse(collectors.get_winrate_by_stake())
-
-
-@app.get("/api/pipeline")
-def api_pipeline():
-    return JSONResponse(collectors.get_pipeline_status())
 
 
 @app.get("/api/hypotheses")
@@ -68,24 +53,9 @@ def api_hypotheses():
     return JSONResponse(collectors.get_hypotheses())
 
 
-@app.get("/api/data")
-def api_data():
-    return JSONResponse(collectors.get_data_status())
-
-
 @app.get("/api/market-data")
 def api_market_data():
     return JSONResponse(collectors.get_market_data())
-
-
-@app.get("/api/market")
-def api_market():
-    return JSONResponse(collectors.get_market_metrics())
-
-
-@app.get("/api/signals")
-def api_signals():
-    return JSONResponse(collectors.get_signals())
 
 
 @app.get("/api/captures")
@@ -113,11 +83,6 @@ def api_candle_collector():
     return JSONResponse(collectors.get_candle_collector())
 
 
-@app.get("/api/data-quality")
-def api_data_quality():
-    return JSONResponse(collectors.get_data_quality())
-
-
 @app.get("/api/research-conclusion")
 def api_research_conclusion():
     return JSONResponse(collectors.get_research_conclusion())
@@ -128,29 +93,19 @@ def api_research_gate():
     return JSONResponse(collectors.get_research_gate())
 
 
-@app.get("/api/research-cycle")
-def api_research_cycle():
-    return JSONResponse(collectors.get_research_cycle())
-
-
 @app.get("/api/research-controller")
 def api_research_controller():
     return JSONResponse(collectors.get_research_controller())
 
 
-@app.get("/api/research-progress")
-def api_research_progress():
-    return JSONResponse(collectors.get_research_progress())
+@app.get("/api/l2-screen")
+def api_l2_screen():
+    return JSONResponse(collectors.get_l2_screen())
 
 
 @app.get("/api/alerts")
 def api_alerts():
     return JSONResponse(collectors.get_alerts())
-
-
-@app.get("/api/shadow-paper")
-def api_shadow_paper():
-    return JSONResponse(collectors.get_shadow_paper())
 
 
 @app.get("/api/stream")

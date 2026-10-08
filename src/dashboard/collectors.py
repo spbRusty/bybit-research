@@ -189,26 +189,6 @@ def get_trading_costs() -> dict:
     }
 
 
-# ─── 4. Instrument Info ────────────────────────────────────────────
-
-def get_instrument_info() -> dict:
-    instruments_file = MARKET_DATA_DIR / "symbols" / "linear.txt"
-    has_symbols = instruments_file.exists()
-    n_symbols = 0
-    if has_symbols:
-        try:
-            n_symbols = len([l for l in instruments_file.read_text().splitlines() if l.strip()])
-        except Exception:
-            pass
-
-    return {
-        "available": False,
-        "reason": "Коллектор получает instruments-info от Bybit, но НЕ сохраняет спецификации по символам (minOrderQty, qtyStep, tickSize). Сохраняется только список символов.",
-        "symbols_count": n_symbols,
-        "fields_missing": ["minOrderQty", "qtyStep", "tickSize", "minNotional", "pricePrecision", "qtyPrecision"],
-    }
-
-
 # ─── 5. Stake Levels (derived from risk params) ────────────────────
 
 def get_stake_levels() -> dict:
@@ -252,42 +232,6 @@ def get_stake_levels() -> dict:
         "levels": levels,
         "note": "Размер позиции: qty = risk_usd / stop_distance, округление вниз до qty_step. Одноуровневая система (risk_per_trade_pct от текущего капитала).",
     }
-
-
-# ─── 6. Win Rate by Stake Level ────────────────────────────────────
-
-def get_winrate_by_stake() -> list[dict]:
-    trades_files = sorted(PAPER_TRADES.glob("paper_*.parquet"))
-    all_trades = []
-    for tf in trades_files:
-        try:
-            df = pl.read_parquet(tf)
-            all_trades.extend(df.to_dicts())
-        except Exception:
-            continue
-
-    if not all_trades:
-        return [{"level": 1, "trades": 0, "win_rate": None, "pnl": None, "avg_pnl": None, "note": "No trades"}]
-
-    by_level: dict[int, list] = {}
-    for t in all_trades:
-        level = 1
-        by_level.setdefault(level, []).append(t)
-
-    results = []
-    for level, trades in sorted(by_level.items()):
-        n = len(trades)
-        wins = sum(1 for t in trades if t.get("win", False))
-        pnls = [t.get("net_pnl", 0) for t in trades]
-        total_pnl = sum(pnls)
-        results.append({
-            "level": level,
-            "trades": n,
-            "win_rate": round(wins / n * 100, 1) if n else None,
-            "pnl": round(total_pnl, 4),
-            "avg_pnl": round(total_pnl / n, 4) if n else None,
-        })
-    return results
 
 
 # ─── 7. Pipeline Status ────────────────────────────────────────────
@@ -504,70 +448,6 @@ def get_market_data() -> dict:
 
         return {"streams": streams}
     return _cached("market_data", 60, _load)
-
-
-# ─── 11. Market Metrics ────────────────────────────────────────────
-
-def get_market_metrics() -> dict:
-    def _load():
-        futures_dir = MARKET_DATA_DIR / "futures" / "linear"
-        if not futures_dir.exists():
-            return {"symbols": [], "summary": {}}
-        files = sorted(futures_dir.glob("*.parquet"))
-        rows = []
-        for f in files[:50]:
-            try:
-                df = pl.read_parquet(f)
-                if df.height == 0:
-                    continue
-                last = _sanitize(df.tail(1).to_dicts()[0])
-                rows.append({
-                    "symbol": f.stem,
-                    "funding_rate": last.get("funding_rate"),
-                    "oi": last.get("oi"),
-                    "oi_value": last.get("oi_value"),
-                    "last_px": last.get("last_px"),
-                    "bid1_px": last.get("bid1_px"),
-                    "ask1_px": last.get("ask1_px"),
-                })
-            except Exception:
-                continue
-        if rows:
-            fr = [r["funding_rate"] for r in rows if r["funding_rate"] is not None]
-            oi = [r["oi_value"] for r in rows if r["oi_value"] is not None]
-            summary = {
-                "symbols_count": len(rows),
-                "avg_funding_rate": round(sum(fr) / len(fr), 6) if fr else None,
-                "total_oi_usd": round(sum(oi), 0) if oi else None,
-            }
-        else:
-            summary = {}
-        return {"symbols": rows[:20], "summary": summary}
-    return _cached("market", 60, _load)
-
-
-# ─── 12. Signals / Events ──────────────────────────────────────────
-
-def get_signals() -> dict:
-    def _load():
-        events_path = EVENTS_DIR / "all_events.parquet"
-        if not events_path.exists():
-            return {"count": 0, "symbols": []}
-        try:
-            # Lazy scan: читается только колонка symbol, а не весь файл (~6.8 GB RAM)
-            sym_counts = (pl.scan_parquet(events_path)
-                          .group_by("symbol")
-                          .agg(pl.len().alias("count"))
-                          .sort("count", descending=True)
-                          .collect())
-        except Exception:
-            return {"count": 0, "symbols": []}
-        if sym_counts.height == 0:
-            return {"count": 0, "symbols": []}
-        total = int(sym_counts["count"].sum())
-        symbols = [_sanitize(d) for d in sym_counts.to_dicts()]
-        return {"count": total, "symbols": symbols[:15]}
-    return _cached("signals", 30, _load)
 
 
 # ─── 13. Orderbook Captures ─────────────────────────────────────────
@@ -986,77 +866,6 @@ def get_research_conclusion() -> dict:
     }
 
 
-# ─── 18b. Research Cycle / Paper handoff ──────────────────────────
-
-def get_research_cycle() -> dict:
-    """Frozen-cycle progress + Research→Paper handoff + current paper binding."""
-    ctrl = {}
-    p = RESEARCH_DIR / "controller_state.json"
-    if p.exists():
-        try:
-            ctrl = json.loads(p.read_text())
-        except Exception:
-            ctrl = {}
-
-    frozen = {}
-    fp = RESEARCH_DIR / "frozen_boundary.json"
-    if fp.exists():
-        try:
-            frozen = json.loads(fp.read_text())
-        except Exception:
-            frozen = {}
-
-    experiment = None
-    eid = ctrl.get("last_experiment_id")
-    if eid:
-        ap = RESEARCH_DIR / "experiments" / f"{eid}.json"
-        if ap.exists():
-            try:
-                art = json.loads(ap.read_text())
-                experiment = {
-                    "experiment_id": art.get("experiment_id"),
-                    "mode": art.get("mode"),
-                    "config_hash": art.get("config_hash"),
-                    "status": art.get("status"),
-                    "final_verdict": art.get("final_verdict"),
-                    "diagnosis": (art.get("reject_diagnosis") or {}).get("category"),
-                    "n_hypotheses": len(art.get("hypothesis_specs") or []),
-                }
-            except Exception:
-                experiment = None
-
-    ctl_cfg = _load_toml("research_controller.toml")
-    paper = get_paper()
-    return {
-        "state": ctrl.get("state"),
-        "cycle_id": ctrl.get("cycle_id"),
-        "frozen": {
-            "config_hash": frozen.get("config_hash"),
-            "klines_max": frozen.get("klines_max"),
-            "frozen_at_utc": frozen.get("frozen_at_utc"),
-        } if frozen else None,
-        "budget_used": ctrl.get("budget_used", 0),
-        "budget_max": int(ctl_cfg.get("budget", {}).get(
-            "max_experiments_per_boundary", 12)),
-        "last_mode": ctrl.get("last_mode"),
-        "next_mode": (ctrl.get("next_selection") or {}).get("mode"),
-        "pass_pending": ctrl.get("pass_pending"),
-        "paper_handoff": ctrl.get("paper_handoff"),
-        "experiment": experiment,
-        "paper": {
-            "mode": paper.get("mode"),
-            "hypothesis_id": paper.get("hypothesis_id"),
-            "status": paper.get("status"),
-            "balance": paper.get("balance"),
-            "realized_pnl": paper.get("realized_pnl"),
-            "pnl_pct": paper.get("pnl_pct"),
-            "trade_count": paper.get("trade_count"),
-            "started_at": paper.get("started_at"),
-            "provenance": paper.get("provenance"),
-        },
-    }
-
-
 # ─── 18c. Research Controller — real state from controller files ──
 
 def _read_json_file(path: Path) -> dict:
@@ -1162,88 +971,6 @@ def get_research_controller() -> dict:
         "stop_reason": ctrl.get("stop_reason"),
         "updated_at_utc": ctrl.get("updated_at_utc"),
         "source": src,
-    }
-
-
-def get_research_progress() -> dict:
-    """Progress of the current controller cycle from experiments.jsonl + artifacts."""
-    ctrl = _read_json_file(RESEARCH_DIR / "controller_state.json")
-    ctl_cfg = _load_toml("research_controller.toml")
-    budget_max = int(ctl_cfg.get("budget", {}).get("max_experiments_per_boundary", 12))
-    budget_used = int(ctrl.get("budget_used", 0) or 0)
-    cycle_id = ctrl.get("cycle_id")
-
-    journal_path = RESEARCH_DIR / "experiments.jsonl"
-    exps: dict[str, dict] = {}
-    journal_ok = False
-    if journal_path.exists():
-        try:
-            for line in journal_path.read_text(errors="replace").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                eid = rec.get("experiment_id")
-                if not eid:
-                    continue
-                entry = exps.setdefault(eid, {})
-                entry.update(rec)  # terminal record wins (last line per experiment)
-                for k in ("mode", "parameters", "created_at_utc"):
-                    if k in rec and k not in entry:
-                        entry[k] = rec[k]
-            journal_ok = True
-        except Exception:
-            pass
-
-    in_cycle = [e for e in exps.values() if e.get("cycle_id") == cycle_id]
-
-    n_running = sum(1 for e in in_cycle if e.get("status") == "RUNNING")
-    n_pass = sum(1 for e in in_cycle if e.get("final_verdict") in ("PASS", "CANDIDATE"))
-    n_reject = sum(1 for e in in_cycle if e.get("final_verdict") == "REJECT")
-    n_failed = sum(1 for e in in_cycle if e.get("status") == "FAILED")
-
-    last_exp = None
-    if in_cycle:
-        last = max(in_cycle, key=lambda e: e.get("finished_at_utc") or e.get("created_at_utc") or "")
-        last_reject_reason = None
-        if last.get("final_verdict") == "REJECT":
-            art = _read_json_file(RESEARCH_DIR / "experiments" / f"{last['experiment_id']}.json")
-            diag = art.get("reject_diagnosis") or {}
-            reasons = diag.get("reject_reasons", [])
-            last_reject_reason = reasons[0] if reasons else None
-        last_exp = {
-            "experiment_id": last.get("experiment_id"),
-            "mode": last.get("mode"),
-            "status": last.get("status"),
-            "final_verdict": last.get("final_verdict"),
-            "finished_at_utc": last.get("finished_at_utc"),
-            "reject_reason": last_reject_reason,
-        }
-
-    state = ctrl.get("state")
-    if not ctrl:
-        status, reason = "ERROR", "Н/Д (controller_state.json)"
-    elif budget_used >= budget_max:
-        status, reason = "BUDGET_EXHAUSTED", f"бюджет {budget_used}/{budget_max} израсходован"
-    elif state == "RUNNING":
-        status, reason = "RUNNING", f"идёт эксперимент: {(last_exp or {}).get('experiment_id')}"
-    elif state == "SELECT_NEXT":
-        status, reason = "WAITING_FOR_NEW_DATA", f"выбор следующего, остаток бюджета {budget_max - budget_used}"
-    elif state == "PASS_PENDING_PAPER":
-        status, reason = "PASS_PENDING_PAPER", "ожидает валидации бумаги"
-    else:
-        status, reason = state or "UNKNOWN", "источник: controller_state.json"
-
-    return {
-        "status": status,
-        "status_reason": reason,
-        "cycle_id": cycle_id,
-        "budget_used": budget_used,
-        "budget_max": budget_max,
-        "journal_ok": journal_ok,
-        "experiments_in_cycle": len(in_cycle),
-        "counts": {"RUNNING": n_running, "PASS": n_pass, "REJECT": n_reject, "FAILED": n_failed},
-        "last_experiment": last_exp,
     }
 
 
@@ -1425,3 +1152,24 @@ def get_logs(n: int = 30) -> dict:
         "research": _tail(LOGS_DIR / "research_cycle.log"),
         "collector": _tail(ROOT / "collector" / "logs" / "marketdata.log"),
     }
+
+
+# ─── 22. L2 Screen ─────────────────────────────────────────────────
+
+def get_l2_screen() -> dict:
+    """Последний прогон L2-скрина: results/l2_screen_*.json (новейший)."""
+    files = sorted(RESULTS_DIR.glob("l2_screen_*.json"))
+    if not files:
+        return {"verdict": None, "reason": "Запусков l2_screen ещё не было", "runs": 0}
+    path = files[-1]
+    try:
+        data = _cached(f"l2:{path.name}", 30, lambda: json.loads(path.read_text()))
+    except Exception:
+        data = None
+    if not data:
+        return {"verdict": None, "reason": f"Не удалось прочитать {path.name}", "runs": len(files)}
+    out = dict(data)
+    out["file"] = path.name
+    out["age_min"] = round(_age_s(path) / 60, 1)
+    out["runs"] = len(files)
+    return out
