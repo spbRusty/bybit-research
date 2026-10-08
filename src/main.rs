@@ -508,7 +508,7 @@ async fn ws_run(
                 if !candles.is_empty() {
                     send_candles(tx, url, sym, candles).await?;
                 }
-            } else if let Some(sym) = topic.strip_prefix("orderbook.25.") {
+            } else if let Some(sym) = topic.strip_prefix("orderbook.50.") {
                 let Some(data) = v["data"].as_object() else { continue };
                 let ts = v["ts"].as_i64().unwrap_or(0);
                 let is_snapshot = v["type"].as_str() == Some("snapshot");
@@ -521,7 +521,7 @@ async fn ws_run(
                     }).unwrap_or_default()
                 };
                 let update = OrderbookUpdate {
-                    symbol: sym.to_string(),
+                    symbol: format!("{category}/{sym}"),
                     is_snapshot,
                     bids: parse_levels("b"),
                     asks: parse_levels("a"),
@@ -549,7 +549,7 @@ where
         sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
     }
     for chunk in syms.chunks(10) {
-        let args: Vec<String> = chunk.iter().map(|s| format!("orderbook.25.{s}")).collect();
+        let args: Vec<String> = chunk.iter().map(|s| format!("orderbook.50.{s}")).collect();
         sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
     }
     Ok(())
