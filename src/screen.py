@@ -53,8 +53,9 @@ def _dt(s: str) -> pl.Expr:
     return pl.datetime(y, m, d, time_unit="ms")
 
 
-def read_period(src: Path, cols: list[str], period: str) -> pl.DataFrame:
-    start, end = PERIODS[period]
+def read_period(src: Path, cols: list[str], period: str,
+                periods: dict | None = None) -> pl.DataFrame:
+    start, end = (periods or PERIODS)[period]
     return (pl.scan_parquet(src)
             .select(cols)
             .filter((pl.col("open_time") >= _dt(start)) & (pl.col("open_time") < _dt(end)))
@@ -140,11 +141,12 @@ def cheap_stats(df: pl.DataFrame, hyp: R.Hypothesis, cost: float) -> dict:
             "n_months": int(sub["open_time"].dt.strftime("%Y-%m").n_unique())}
 
 
-def meets(m: dict) -> bool:
-    return ((m.get("n") or 0) >= _R["min_events"]
-            and (m.get("n_symbols") or 0) >= _R["min_unique_symbols"]
-            and (m.get("n_months") or 0) >= _R["min_months"]
-            and (m.get("t_stat") or -9) >= _R["min_t_stat"]
+def meets(m: dict, gates: dict | None = None) -> bool:
+    g = gates or _R
+    return ((m.get("n") or 0) >= g["min_events"]
+            and (m.get("n_symbols") or 0) >= g["min_unique_symbols"]
+            and (m.get("n_months") or 0) >= g["min_months"]
+            and (m.get("t_stat") or -9) >= g["min_t_stat"]
             and (m.get("mean_net") or -9) > 0)
 
 

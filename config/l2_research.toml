@@ -1,0 +1,32 @@
+# L2 (orderbook-feature) hypothesis screening — PRE-REGISTERED 2026-10-06,
+# BEFORE any L2 screening results were seen.
+#
+# This is a SEPARATE pre-registered feature family, NOT a relaxation of the
+# frozen candle study (config/research.toml). OB capture starts 2026-09-06,
+# which sits outside the frozen candle sample periods (end 2026-09-02), so L2
+# needs its own calendar. Gates below are mirrored from research.toml with the
+# SAME values — never weakened.
+#
+# Rationale for periods: 60d discovery + 30d validation + 30d OOS. The first
+# conclusive acceptance run can only happen on/after 2027-01-04, when all three
+# periods are populated and min_months=3 can be satisfied.
+
+[periods]
+# OB capture starts 2026-09-06; 60d discovery + 30d validation + 30d OOS.
+discovery  = ["2026-09-06", "2026-11-05"]
+validation = ["2026-11-05", "2026-12-05"]
+oos        = ["2026-12-05", "2027-01-04"]
+
+[gates]
+# Mirrored from config/research.toml — identical values, not weakened.
+min_events = 100            # same as research.toml §min_events, not weakened
+min_unique_symbols = 5      # same as research.toml §min_unique_symbols, not weakened
+min_months = 3              # same as research.toml §min_months, not weakened
+bh_q = 0.05                 # same as research.toml §bh_q, not weakened
+survival_cost = 0.0020      # same as research.toml §survival_cost, not weakened
+min_t_stat = 2.0            # same as research.toml §min_t_stat (acceptance threshold used by screen.py), not weakened
+cost_grid_round_trip = [0.0010, 0.0015, 0.0020, 0.0030]  # same as research.toml §cost_grid_round_trip, not weakened
+
+[features]
+# Only ob_* columns enter L2 hypothesis generation.
+whitelist_prefix = "ob_"

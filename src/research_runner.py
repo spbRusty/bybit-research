@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import subprocess
@@ -35,7 +36,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from config.settings import LOGS_DIR, RESEARCH_DIR, load_toml
+from config.settings import EVENTS_DIR, LOGS_DIR, RESEARCH_DIR, load_toml
 from src.data_ready import (
     Lock,
     check_ready,
@@ -57,6 +58,7 @@ RUNNER_STATE = RESEARCH_DIR / "runner_state.json"
 STATE_PATH = RESEARCH_DIR / "controller_state.json"
 JOURNAL_PATH = RESEARCH_DIR / "experiments.jsonl"
 ARTIFACTS_DIR = RESEARCH_DIR / "experiments"
+EXHAUSTED_FP_PATH = RESEARCH_DIR / "exhausted_fp.json"
 
 MARKETDATA_SERVICE = "bybit_marketdata.service"
 RECONSTRUCTOR_SERVICE = "bybit_ob_reconstructor.service"
@@ -143,6 +145,44 @@ def _read_journal() -> list[dict]:
 
 def _cycle_experiments(frozen_cycle_id: str) -> list[dict]:
     return [e for e in _read_journal() if e.get("cycle_id") == frozen_cycle_id]
+
+
+# --- search-space fingerprint --------------------------------------------
+
+def _search_fp() -> str:
+    """sha256[:16] всех config/*.toml (по имени) + stat events-файла."""
+    h = hashlib.sha256()
+    cfg_dir = Path(__file__).resolve().parent.parent / "config"
+    for p in sorted(cfg_dir.glob("*.toml"), key=lambda p: p.name):
+        h.update(p.read_bytes())
+    try:
+        st = (EVENTS_DIR / "all_events.parquet").stat()
+        h.update(f"{st.st_mtime_ns}:{st.st_size}".encode())
+    except OSError:
+        h.update(b"missing")
+    return h.hexdigest()[:16]
+
+
+def _exhausted_unchanged() -> str | None:
+    st = _read_state()
+    if st.get("state") != "STOPPED":
+        return None
+    if st.get("stop_reason") != "search_space_exhausted":
+        return None
+    try:
+        sidecar = json.loads(EXHAUSTED_FP_PATH.read_text())
+    except (OSError, ValueError):
+        return None
+    fp = _search_fp()
+    return fp if sidecar.get("fp") == fp else None
+
+
+def _write_exhausted_fp() -> None:
+    try:
+        EXHAUSTED_FP_PATH.write_text(json.dumps(
+            {"fp": _search_fp(), "at": now_utc().isoformat()}))
+    except OSError as e:
+        logger.warning("failed to write exhausted fp sidecar: %s", e)
 
 
 # --- resource safety (D) -------------------------------------------------
@@ -583,6 +623,12 @@ def run_cycle(limit: int | None = LIMIT_DEFAULT,
 
         frozen = load_frozen_boundary()
         if frozen is None:
+            fp = _exhausted_unchanged()
+            if fp is not None:
+                logger.info("EXHAUSTED: search space unchanged (fp=%s), "
+                            "skipping cycle", fp)
+                return {"verdict": "EXHAUSTED",
+                        "stop_reason": "search_space_exhausted"}
             frozen, result = _phase_data_boundary()
             if frozen is None:
                 return result
@@ -597,6 +643,9 @@ def run_cycle(limit: int | None = LIMIT_DEFAULT,
             cycle_id = _frozen_cycle_id(frozen)
             experiments = _cycle_experiments(cycle_id)
             state = _read_state()
+            if (state.get("state") == "STOPPED"
+                    and state.get("stop_reason") == "search_space_exhausted"):
+                _write_exhausted_fp()
             _phase_finish(frozen)
             _runner_state_clear()
             if experiments:
