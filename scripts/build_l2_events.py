@@ -1,4 +1,5 @@
-"""Build l2_events.parquet — dense 60s-grid OB-feature events for src.l2_screen.
+"""Build the l2_events/ store — dense 60s-grid OB-feature events for src.l2_screen
+(one parquet per UTC date; freshly-built dates are swapped, older ones persist).
 
 Per symbol: read reconstructed snapshots (collector tree + protected old tree),
 minute grid per UTC date of coverage, asof-backward feature join, quality label
