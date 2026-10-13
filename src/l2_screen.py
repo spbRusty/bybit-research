@@ -7,7 +7,8 @@ are reimplemented here.
 
 Run: ``python -m src.l2_screen [--events PATH] [--out PATH] [--top N] [--full-eval K]``
 Events path override: ``--events`` or the ``L2_EVENTS`` env var (default
-``data/events/signal_events/l2_events.parquet``).
+``data/events/signal_events/l2_events/`` (one parquet per UTC date,
+accumulated over the pre-registered window).
 
 Hypothesis generation choice
 ----------------------------
@@ -198,7 +199,7 @@ def _notify_report(verdict: str, *, coverage: str = "", screening: str = "",
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="L2 orderbook-feature hypothesis screen")
     ap.add_argument("--events",
-                    default=os.environ.get("L2_EVENTS") or str(EVENTS_DIR / "l2_events.parquet"))
+                    default=os.environ.get("L2_EVENTS") or str(EVENTS_DIR / "l2_events"))
     ap.add_argument("--out", default=None)
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--full-eval", type=int, default=120,

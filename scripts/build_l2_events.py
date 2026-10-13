@@ -10,6 +10,7 @@ row cap enforced by pre-count. Reads only — never touches the protected tree.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from collections import Counter
@@ -22,7 +23,7 @@ import pyarrow.parquet as pq
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from config.settings import EVENTS_DIR, RAW_KLINES_DIR  # noqa: E402
+from config.settings import EVENTS_DIR, RAW_KLINES_DIR, load_toml  # noqa: E402
 from src.data import load_validated  # noqa: E402
 from src.events import _FEAT, _future_metrics  # noqa: E402
 from src.orderbook_features import DEPTH_LEVELS, compute_all_features  # noqa: E402
@@ -36,7 +37,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logging.getLogger("src.data").setLevel(logging.ERROR)  # gap-warning flood x882
 
 DUMP = Path("/home/vlad/Документы/bybit_rs/data/orderbook")
-OUT = EVENTS_DIR / "l2_events.parquet"
+# Accumulating store: ONE parquet per UTC date. The reconstructed source tree is a
+# rolling ~3-day window (collector cleanup), so these derived events are the only
+# durable record for the pre-registered study — old date partitions are NEVER
+# rewritten or dropped. Growth is bounded to the pre-registered calendar window.
+OUT_DIR = EVENTS_DIR / "l2_events"
+STAGE_DIR = EVENTS_DIR / "l2_events.stage"  # staging for atomic os.replace; keeps OUT_DIR *.parquet-only
+_PERIODS = load_toml("l2_research.toml")["periods"]
+WIN_LO = _PERIODS["discovery"][0]   # "2026-09-06"
+WIN_HI = _PERIODS["oos"][1]         # "2027-01-04" (exclusive)
 ROOTS = (ROOT / "collector/data/market/orderbook/reconstructed",
          ROOT / "data/market/orderbook/reconstructed")  # read-only, both trees
 HORIZONS: list[int] = list(_FEAT["future_horizons_min"])
@@ -224,25 +233,56 @@ def main() -> int:
           f"{sorted(exp_dates)}", flush=True)
 
     cnt: Counter = Counter()
-    writer: pq.ParquetWriter | None = None
-    written = 0
-    for i, s in enumerate(syms):
-        df = build_symbol(s, cats[s], cnt)
+    frames: list[pl.DataFrame] = []
+    built = 0
+    for i, s_sym in enumerate(syms):
+        df = build_symbol(s_sym, cats[s_sym], cnt)
         if df is not None:
-            tbl = df.cast(SCHEMA).to_arrow()
-            if writer is None:
-                writer = pq.ParquetWriter(str(OUT), tbl.schema)
-            assert tbl.schema == writer.schema, f"schema drift at {s}"
-            writer.write_table(tbl)
-            written += df.height
+            frames.append(df)
+            built += df.height
         if (i + 1) % 100 == 0:
-            print(f"built {i + 1}/{len(syms)} rows={written} "
+            print(f"built {i + 1}/{len(syms)} rows={built} "
                   f"({time.time() - t_start:.0f}s)", flush=True)
-    assert writer is not None and written > 0, f"nothing written: {dict(cnt)}"
-    writer.close()
+    assert frames and built > 0, f"nothing built: {dict(cnt)}"
+    assert built <= MAX_ROWS, f"fresh build {built} > MAX_ROWS {MAX_ROWS}"
 
-    # --- smoke: schema, caps, invariants, date coverage ---
-    chk = pl.read_parquet(OUT)
+    fresh = pl.concat(frames).with_columns(
+        pl.col("open_time").dt.strftime("%Y-%m-%d").alias("_date"))
+    del frames
+
+    # Accumulate: swap ONLY the partitions for the dates just (re)built from the
+    # rolling source window; every other date partition is left untouched.
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    written_dates: set[str] = set()
+    written = 0
+    for (d,), part in fresh.partition_by(["_date"], as_dict=True).items():
+        if not (WIN_LO <= d < WIN_HI):
+            cnt["out_of_window_dates"] += 1          # bound growth to the study calendar
+            continue
+        part = part.drop("_date").cast(SCHEMA)
+        tmp = STAGE_DIR / f"{d}.parquet"
+        pq.write_table(part.to_arrow(), str(tmp))
+        os.replace(tmp, OUT_DIR / f"{d}.parquet")    # atomic per-date swap
+        written_dates.add(d)
+        written += part.height
+    for stale in STAGE_DIR.glob("*.parquet"):
+        stale.unlink()
+    del fresh
+
+    store_dates = {q.stem for q in OUT_DIR.glob("*.parquet")}
+    bad = sorted(d for d in store_dates if not (WIN_LO <= d < WIN_HI))
+    assert not bad, f"out-of-window partition in store: {bad}"
+    print(f"store: {len(store_dates)} dates "
+          f"({min(store_dates)}..{max(store_dates)})", flush=True)
+
+    if not written_dates:
+        print("no in-window fresh dates; store unchanged", flush=True)
+        return 0
+
+    # --- smoke: schema, caps, invariants, date coverage (fresh partitions only) ---
+    chk = pl.read_parquet([str(OUT_DIR / f"{d}.parquet")
+                           for d in sorted(written_dates)])
     assert chk.columns == COLS, f"schema mismatch: {len(chk.columns)}"
     assert 0 < chk.height == written <= MAX_ROWS, f"rows {chk.height}"
     assert chk["entry_price"].null_count() == 0, "null entry_price"
@@ -253,16 +293,17 @@ def main() -> int:
     assert chk["ob_mid"].null_count() < chk.height, "ob_mid all null"
     assert chk["symbol"].n_unique() >= 5, "too few symbols"
     out_dates = set(chk["open_time"].dt.strftime("%Y-%m-%d").unique().to_list())
-    assert out_dates == set(exp_dates), (
-        f"date coverage {sorted(out_dates)} != expected {sorted(exp_dates)}")
+    exp_in = {d for d in exp_dates if WIN_LO <= d < WIN_HI}
+    assert out_dates == exp_in, (
+        f"date coverage {sorted(out_dates)} != expected {sorted(exp_in)}")
 
-    print(f"OK rows={chk.height} cols={len(chk.columns)} "
+    print(f"OK fresh_rows={chk.height} cols={len(chk.columns)} "
           f"symbols={chk['symbol'].n_unique()} "
-          f"dates={min(out_dates)}..{max(out_dates)} "
+          f"dates={min(out_dates)}..{max(out_dates)} store_dates={len(store_dates)} "
           f"({time.time() - t_start:.0f}s)")
     per_date = (chk.with_columns(pl.col("open_time").dt.strftime("%Y-%m-%d")
                                  .alias("_d")).group_by("_d").len().sort("_d"))
-    print("rows by date:", dict(zip(per_date["_d"], per_date["len"])))
+    print("rows by date (fresh):", dict(zip(per_date["_d"], per_date["len"])))
     print("quality (pre-drop):",
           {k: v for k, v in sorted(cnt.items()) if k.startswith("q_")})
     print("drops:", {k: v for k, v in sorted(cnt.items())

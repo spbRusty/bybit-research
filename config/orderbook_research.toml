@@ -16,7 +16,7 @@ pre_event_minutes = 10              # N: how far back for predictor features
 post_event_minutes = 20             # M: how far forward for response features
 
 # Storage
-retention_days_raw = 7              # keep raw WS messages for N days (debug)
+retention_days_raw = 2              # keep raw WS messages for N days (debug; nothing reads them, ~40GB/day)
 retention_days_reconstructed = 3    # keep reconstructed snapshots
 disk_warning_gb = 15                # warn below this much free disk space
 disk_emergency_gb = 5               # clean up and shut down below this
