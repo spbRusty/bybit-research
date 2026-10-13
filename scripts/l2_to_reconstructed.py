@@ -18,7 +18,6 @@ RECON = BASE / "collector/data/market/orderbook/reconstructed"
 PROTECTED = BASE / "data/market/orderbook/reconstructed"
 DUMP = Path("/home/vlad/Документы/bybit_rs/data/orderbook")
 PROTECTED_DATES = {"2026-09-07", "2026-09-16"}
-REF = RECON / "BTCUSDT" / "2026-10-05-10.parquet"
 
 SCALAR = [
     "timestamp_ms", "update_id", "symbol", "best_bid", "best_ask",
@@ -101,7 +100,7 @@ def main() -> int:
     )
     prot_before = prot()
 
-    ref = pl.read_parquet(REF, n_rows=1)
+    ref = pl.read_parquet(max(RECON.rglob("*.parquet"), key=lambda p: p.stat().st_mtime), n_rows=1)
     assert ref.columns == COLS, "reference schema drift"
 
     lin, spo = load_dump()

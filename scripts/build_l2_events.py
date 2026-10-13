@@ -105,8 +105,9 @@ def universe() -> tuple[list[str], dict[str, str], list[str]]:
 
 
 def snap_files(sym: str) -> list[Path]:
+    # .tmp = staging of bybit_ob_reconstructor (write-then-rename); exclude like orderbook_reader
     return [p for r in ROOTS if (d := r / sym).is_dir()
-            for p in sorted(d.glob("*.parquet*"))]
+            for p in sorted(d.glob("*.parquet*")) if not p.name.endswith(".tmp")]
 
 
 def ts_of(files: list[Path]) -> np.ndarray:
