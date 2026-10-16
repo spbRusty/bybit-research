@@ -141,11 +141,20 @@ def cheap_stats(df: pl.DataFrame, hyp: R.Hypothesis, cost: float) -> dict:
             "n_months": int(sub["open_time"].dt.strftime("%Y-%m").n_unique())}
 
 
-def meets(m: dict, gates: dict | None = None) -> bool:
+def meets(m: dict, gates: dict | None = None,
+          require_months: bool = True) -> bool:
+    """Gate check.
+
+    require_months: min_months guards regime coverage of the FITTING
+    (discovery) period. A short validation/oos window spans at most 2
+    calendar months, where n_months>=3 is geometrically impossible, so
+    callers pass require_months=False for those periods.
+    """
     g = gates or _R
     return ((m.get("n") or 0) >= g["min_events"]
             and (m.get("n_symbols") or 0) >= g["min_unique_symbols"]
-            and (m.get("n_months") or 0) >= g["min_months"]
+            and (not require_months
+                 or (m.get("n_months") or 0) >= g["min_months"])
             and (m.get("t_stat") or -9) >= g["min_t_stat"]
             and (m.get("mean_net") or -9) > 0)
 

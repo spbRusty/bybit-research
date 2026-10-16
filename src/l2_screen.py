@@ -39,10 +39,10 @@ Verdicts
 * NOT_READY    — events file missing, or present but no usable ob_* features /
                   horizons / hypotheses. Notification sent (explanatory), exit 0.
 * PENDING_DATA — events exist and were scored, but validation/oos windows are
-                 not yet populated (before 2027-01-04). Explicitly inconclusive,
-                 NOT a candidate. Notification sent, exit 0.
-* CANDIDATE / NO_CANDIDATE — full acceptance on/after 2027-01-04, mirroring
-                 ``screen.py`` semantics. Notification sent, exit 0.
+                 not yet populated (before ACCEPTANCE_DATE). Explicitly
+                 inconclusive, NOT a candidate. Notification sent, exit 0.
+* CANDIDATE / NO_CANDIDATE — full acceptance on/after ACCEPTANCE_DATE,
+                 mirroring ``screen.py`` semantics. Notification sent, exit 0.
 
 Every run dumps all scored rows (pre-finalist) to
 ``data/research/results/l2_screen_allrows_{UTCts}.parquet`` so a future combined
@@ -78,7 +78,8 @@ PERIODS: dict[str, tuple[str, str]] = {
     name: (start, end) for name, (start, end) in _L2["periods"].items()}
 GATES: dict = _L2["gates"]
 FEATURE_PREFIX: str = _L2["features"]["whitelist_prefix"]
-ACCEPTANCE_DATE = datetime(2027, 1, 4, tzinfo=timezone.utc)
+ACCEPTANCE_DATE = datetime.fromisoformat(PERIODS["oos"][1]).replace(
+    tzinfo=timezone.utc)
 NTFY_URL = "https://ntfy.sh/openagent_trade"
 
 _OB_RULES = load_toml("ob_hypothesis_rules.toml")
@@ -304,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             "combined_bh_pending": True,
             "allrows_path": str(allrows_path),
             "events_path": str(src),
-            "note": "INCONCLUSIVE: not a candidate; re-run on/after 2027-01-04",
+            "note": f"INCONCLUSIVE: not a candidate; re-run on/after {ACCEPTANCE_DATE:%Y-%m-%d}",
         }
         best = max(r["gross_mean"] for r in rows)
         covers = "покрывает" if best >= cost else "НЕ покрывает"
@@ -324,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
                       f"не раньше {ACCEPTANCE_DATE:%Y-%m-%d}")
         return _emit(out, ts)
 
-    # --- Full acceptance (all periods populated, on/after 2027-01-04) ---
+    # --- Full acceptance (all periods populated, on/after oos close) ---
     surv = sorted((r for r in rows if r["bh"] and r["mean_net"] > 0
                    and r["t_stat"] >= GATES["min_t_stat"]),
                   key=lambda r: -r["t_stat"])
@@ -353,7 +354,8 @@ def main(argv: list[str] | None = None) -> int:
         ok = ok[:args.full_eval]
     cheap_v = {hid: S.cheap_stats(ev["validation"], by_id[hid], cost) for hid in ok}
     cheap_o = {hid: S.cheap_stats(ev["oos"], by_id[hid], cost) for hid in ok}
-    finalists = [hid for hid in ok if S.meets(cheap_v[hid], gates=GATES)]
+    finalists = [hid for hid in ok
+                 if S.meets(cheap_v[hid], gates=GATES, require_months=False)]
     logger.info("acceptance=%d validation=%d", len(ok), len(finalists))
 
     stress: dict[str, dict] = {

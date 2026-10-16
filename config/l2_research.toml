@@ -7,15 +7,25 @@
 # needs its own calendar. Gates below are mirrored from research.toml with the
 # SAME values — never weakened.
 #
-# Rationale for periods: 60d discovery + 30d validation + 30d OOS. The first
-# conclusive acceptance run can only happen on/after 2027-01-04, when all three
-# periods are populated and min_months=3 can be satisfied.
+# CORRECTION 2026-10-16 (pre-acceptance: no acceptance run has ever executed,
+# no validation/oos data exists): the previous 30d validation/oos windows were
+# gated by min_months=3, which is geometrically unsatisfiable — a window of at
+# most 2 calendar months can never contain 3 distinct months — so `finalists`
+# was always empty and the study could never yield a candidate. min_months is a
+# DISCOVERY-only gate (regime coverage of the fitting period); validation/oos
+# now confirm on {min_events, min_unique_symbols, min_t_stat, mean_net>0} only,
+# via meets(..., require_months=False). Validation/oos shortened 30d->14d to
+# reach the first verdict sooner. Gate VALUES are unchanged (not weakened);
+# only their SCOPE was corrected.
+#
+# Rationale for periods: 60d discovery + 14d validation + 14d OOS. The first
+# conclusive acceptance run can happen on/after 2026-12-03 (oos close).
 
 [periods]
-# OB capture starts 2026-09-06; 60d discovery + 30d validation + 30d OOS.
+# OB capture starts 2026-09-06; 60d discovery + 14d validation + 14d OOS.
 discovery  = ["2026-09-06", "2026-11-05"]
-validation = ["2026-11-05", "2026-12-05"]
-oos        = ["2026-12-05", "2027-01-04"]
+validation = ["2026-11-05", "2026-11-19"]
+oos        = ["2026-11-19", "2026-12-03"]
 
 [gates]
 # Mirrored from config/research.toml — identical values, not weakened.
