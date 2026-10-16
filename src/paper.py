@@ -157,7 +157,8 @@ def _position_size(entry: float, stop: float, equity: float,
         return 0.0
     if qty > max_lot:
         qty = _round_qty(max_lot, qty_step)
-    return float(qty)
+    max_qty = _round_qty(_RISK["max_position_size_usd"] / entry, qty_step)
+    return float(min(qty, max_qty))
 
 
 def _calculate_fills(entry: float, exit_px: float, side: float,
@@ -452,6 +453,13 @@ def shadow_run(events: pl.DataFrame,
     trades_by_hyp: dict[str, int] = {}
     pnl_by_hyp: dict[str, float] = {}
 
+    # ponytail: фиксированный референс для sizing. state["balance"] общий на все
+    # гипотезы: первая (1775 сделок) роняла его с 1000 до 0.55, после чего
+    # notional=balance*5=2.77 < min_notional=5 и остальные гипотезы получали 0 сделок.
+    # Шэдоу (MODE B) наблюдает кандидатов независимо, sizing берётся от баланса
+    # на старте прогона. Апгрейд: отдельный виртуальный счёт на гипотезу.
+    ref_equity = state["balance"]
+
     for hyp in hypotheses:
         hyp_id = hyp.hypothesis_id
         trades_by_hyp[hyp_id] = 0
@@ -468,7 +476,9 @@ def shadow_run(events: pl.DataFrame,
 
         sub = events.filter(cond).filter(
             pl.col(target_col).is_not_null() &
-            pl.col("entry_price").is_not_null()
+            pl.col(target_col).is_finite() &
+            pl.col("entry_price").is_not_null() &
+            pl.col("entry_price").is_finite()
         )
 
         for row in sub.iter_rows(named=True):
@@ -487,7 +497,7 @@ def shadow_run(events: pl.DataFrame,
 
             symbol = row.get("symbol", "UNKNOWN")
             inst = instruments.get(symbol)
-            qty = _position_size(entry, stop, state["balance"], inst)
+            qty = _position_size(entry, stop, ref_equity, inst)
             if qty == 0:
                 continue
 
@@ -498,8 +508,11 @@ def shadow_run(events: pl.DataFrame,
             h_low = entry * (1 + (row.get(mae_col, 0) or 0))
             raw_ret = row.get(target_col, 0) or 0
 
-            reason, raw_exit = _determine_exit(entry, side, stop, take, h_high, h_low,
-                                               entry * (1 + raw_ret))
+            if vol > 0:
+                reason, raw_exit = _determine_exit(entry, side, stop, take, h_high, h_low,
+                                                   entry * (1 + raw_ret))
+            else:
+                reason, raw_exit = "horizon", entry * (1 + raw_ret)
             exit_px = raw_exit
 
             fill_entry, fill_exit, slippage = _calculate_fills(entry, exit_px, side, slip_bps)
@@ -568,12 +581,13 @@ def get_shadow_summary(state: dict | None = None) -> dict:
     """Summary of shadow paper activity (MODE B, read-only for dashboard)."""
     if state is None:
         state = load_shadow_state()
-    shadow_trades = [t for t in state.get("trades", []) if t.get("mode") == "SHADOW"]
+    # Scalar counters are authoritative: the per-trade detail log is rotated
+    # out to parquet by scripts/l2_paper.py, so summing `trades` would only
+    # ever cover the retained tail.
     return {
-        "shadow_trade_count": len(shadow_trades),
-        "shadow_pnl": sum(t.get("net_pnl", 0) for t in shadow_trades),
-        "shadow_win_rate": (sum(1 for t in shadow_trades if t.get("net_pnl", 0) > 0) / len(shadow_trades)
-                           if shadow_trades else 0.0),
+        "shadow_trade_count": state["trade_count"],
+        "shadow_pnl": state["realized_pnl"],
+        "shadow_win_rate": state["win_rate"],
         "balance": state["balance"],
         "realized_pnl": state["realized_pnl"],
     }

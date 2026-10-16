@@ -43,7 +43,7 @@ CHUNK = 32
 NUMERIC = (pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64,
            pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
 SKIP_EXACT = {"entry_price", "open_time", "symbol", "category", "event_id",
-              "ob_data_quality"}
+               "ob_data_quality", "ob_ts_min_ms", "ob_ts_max_ms"}
 SKIP_PREFIX = ("return_", "mfe_", "mae_", "ob_post_", "post_signal")
 PERIODS = {name: (start, end) for name, start, end in _R["sample_periods"]}
 
