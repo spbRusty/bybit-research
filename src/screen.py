@@ -238,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cheap_v = {hid: cheap_stats(ev["validation"], by_id[hid], cost) for hid in ok}
     cheap_o = {hid: cheap_stats(ev["oos"], by_id[hid], cost) for hid in ok}
-    finalists = [hid for hid in ok if meets(cheap_v[hid])]
+    finalists = [hid for hid in ok if meets(cheap_v[hid], require_months=False)]
     logger.info("прошли validation: %d", len(finalists))
 
     stress: dict[str, dict] = {
@@ -260,7 +260,8 @@ def main(argv: list[str] | None = None) -> int:
 
     surv_key = f"{cost:.4f}"
     winners = [hid for hid in finalists
-               if (stress[surv_key].get(hid) or -9) > 0
+               if meets(cheap_o[hid], require_months=False)
+               and (stress[surv_key].get(hid) or -9) > 0
                and (oos[hid].get("t_stat") or -9) > 0]
     winners.sort(key=lambda hid: -(oos[hid].get("t_stat") or -9))
 

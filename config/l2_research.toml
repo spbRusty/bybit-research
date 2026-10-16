@@ -2,7 +2,7 @@
 # BEFORE any L2 screening results were seen.
 #
 # This is a SEPARATE pre-registered feature family, NOT a relaxation of the
-# frozen candle study (config/research.toml). OB capture starts 2026-09-06,
+# frozen candle study (config/research.toml). OB capture starts 2026-09-07,
 # which sits outside the frozen candle sample periods (end 2026-09-02), so L2
 # needs its own calendar. Gates below are mirrored from research.toml with the
 # SAME values — never weakened.
@@ -18,14 +18,20 @@
 # reach the first verdict sooner. Gate VALUES are unchanged (not weakened);
 # only their SCOPE was corrected.
 #
-# Rationale for periods: 60d discovery + 14d validation + 14d OOS. The first
-# conclusive acceptance run can happen on/after 2026-12-03 (oos close).
+# Rationale for periods: ~67d discovery + 14d validation + 14d OOS. Discovery
+# must reach into November because min_months=3 needs Sep+Oct+Nov; ending it
+# 2026-11-05 would leave the third month dependent on a 4-day window that a
+# capture gap could erase — hence the 2026-11-12 end (slack). ACCEPTANCE_DATE is
+# derived as oos close + 1 day (the last day's partition/returns finalize after
+# the window closes); the first conclusive acceptance run can happen on/after
+# 2026-12-11. A holdout is only "complete" once it carries >=10 distinct
+# captured days (see MIN_PERIOD_DAYS), so a near-empty window cannot pass.
 
 [periods]
-# OB capture starts 2026-09-06; 60d discovery + 14d validation + 14d OOS.
-discovery  = ["2026-09-06", "2026-11-05"]
-validation = ["2026-11-05", "2026-11-19"]
-oos        = ["2026-11-19", "2026-12-03"]
+# First event 2026-09-07; discovery must span 3 calendar months (Sep/Oct/Nov).
+discovery  = ["2026-09-06", "2026-11-12"]
+validation = ["2026-11-12", "2026-11-26"]
+oos        = ["2026-11-26", "2026-12-10"]
 
 [gates]
 # Mirrored from config/research.toml — identical values, not weakened.

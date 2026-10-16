@@ -58,7 +58,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -79,7 +79,8 @@ PERIODS: dict[str, tuple[str, str]] = {
 GATES: dict = _L2["gates"]
 FEATURE_PREFIX: str = _L2["features"]["whitelist_prefix"]
 ACCEPTANCE_DATE = datetime.fromisoformat(PERIODS["oos"][1]).replace(
-    tzinfo=timezone.utc)
+    tzinfo=timezone.utc) + timedelta(days=1)
+MIN_PERIOD_DAYS = 10
 NTFY_URL = "https://ntfy.sh/openagent_trade"
 
 _OB_RULES = load_toml("ob_hypothesis_rules.toml")
@@ -281,12 +282,18 @@ def main(argv: list[str] | None = None) -> int:
 
     ot = pl.read_parquet(src, columns=["open_time", "symbol"])
     dates_covered = [str(ot["open_time"].min())[:10], str(ot["open_time"].max())[:10]]
-    counts = {name: ot.filter((pl.col("open_time") >= S._dt(start))
-                              & (pl.col("open_time") < S._dt(end))).height
-              for name, (start, end) in PERIODS.items()}
+    counts: dict[str, int] = {}
+    days: dict[str, int] = {}
+    for name, (start, end) in PERIODS.items():
+        win = ot.filter((pl.col("open_time") >= S._dt(start))
+                        & (pl.col("open_time") < S._dt(end)))
+        counts[name] = win.height
+        days[name] = win.select(pl.col("open_time").dt.date().n_unique()).item()
     now = datetime.now(tz=timezone.utc)
-    periods_complete = now >= ACCEPTANCE_DATE and all(counts.values())
-    logger.info("periods=%s complete=%s dates=%s", counts, periods_complete, dates_covered)
+    periods_complete = (now >= ACCEPTANCE_DATE
+                        and all(d >= MIN_PERIOD_DAYS for d in days.values()))
+    logger.info("periods=%s days=%s complete=%s dates=%s",
+                counts, days, periods_complete, dates_covered)
 
     if not periods_complete:
         out = {
@@ -377,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
 
     surv_key = f"{cost:.4f}"
     winners = [hid for hid in finalists
-               if (stress[surv_key].get(hid) or -9) > 0
+               if S.meets(cheap_o[hid], gates=GATES, require_months=False)
+               and (stress[surv_key].get(hid) or -9) > 0
                and (oos[hid].get("t_stat") or -9) > 0]
     winners.sort(key=lambda hid: -(oos[hid].get("t_stat") or -9))
 
