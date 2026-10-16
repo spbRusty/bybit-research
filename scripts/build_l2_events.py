@@ -252,40 +252,44 @@ def main() -> int:
     del frames
 
     # Accumulate: swap ONLY the partitions for the dates just (re)built from the
-    # rolling source window; every other date partition is left untouched.
+    # rolling source window; every other date partition is left untouched. Guard:
+    # NEVER shrink a partition. Aged-out dates get re-materialized from the coarse
+    # hourly bybit_rs dumps (l2_to_reconstructed gap-fill), which yields far fewer
+    # rows than the dense live-derived snapshot; keeping the larger version stops
+    # that silent downgrade. ponytail: row-count heuristic — replace with an
+    # explicit "source is live" marker if dump/live densities ever converge.
     STAGE_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    written_dates: set[str] = set()
-    written = 0
+    swapped: set[str] = set()
     for (d,), part in fresh.partition_by(["_date"], as_dict=True).items():
         if not (WIN_LO <= d < WIN_HI):
             cnt["out_of_window_dates"] += 1          # bound growth to the study calendar
             continue
+        dest = OUT_DIR / f"{d}.parquet"
+        if dest.exists() and pq.read_metadata(dest).num_rows >= part.height:
+            cnt["kept_larger_partition"] += 1
+            continue
         part = part.drop("_date").cast(SCHEMA)
         tmp = STAGE_DIR / f"{d}.parquet"
         pq.write_table(part.to_arrow(), str(tmp))
-        os.replace(tmp, OUT_DIR / f"{d}.parquet")    # atomic per-date swap
-        written_dates.add(d)
-        written += part.height
+        os.replace(tmp, dest)                        # atomic per-date swap
+        swapped.add(d)
     for stale in STAGE_DIR.glob("*.parquet"):
         stale.unlink()
-    del fresh
 
     store_dates = {q.stem for q in OUT_DIR.glob("*.parquet")}
     bad = sorted(d for d in store_dates if not (WIN_LO <= d < WIN_HI))
     assert not bad, f"out-of-window partition in store: {bad}"
+    exp_in = {d for d in exp_dates if WIN_LO <= d < WIN_HI}
+    assert exp_in <= store_dates, f"store missing dates: {sorted(exp_in - store_dates)}"
     print(f"store: {len(store_dates)} dates "
-          f"({min(store_dates)}..{max(store_dates)})", flush=True)
+          f"({min(store_dates)}..{max(store_dates)}); swapped={len(swapped)} "
+          f"kept={cnt['kept_larger_partition']}", flush=True)
 
-    if not written_dates:
-        print("no in-window fresh dates; store unchanged", flush=True)
-        return 0
-
-    # --- smoke: schema, caps, invariants, date coverage (fresh partitions only) ---
-    chk = pl.read_parquet([str(OUT_DIR / f"{d}.parquet")
-                           for d in sorted(written_dates)])
+    # --- smoke: schema, caps, invariants, date coverage (the fresh build) ---
+    chk = fresh.drop("_date")
     assert chk.columns == COLS, f"schema mismatch: {len(chk.columns)}"
-    assert 0 < chk.height == written <= MAX_ROWS, f"rows {chk.height}"
+    assert 0 < chk.height == built <= MAX_ROWS, f"rows {chk.height}"
     assert chk["entry_price"].null_count() == 0, "null entry_price"
     assert (chk["open_time"].cast(pl.Int64) % 60_000 == 0).all(), "off-minute"
     assert chk["event_id"].str.contains(r"^\d{8}T\d{6}Z$").all(), "bad event_id"
@@ -294,9 +298,9 @@ def main() -> int:
     assert chk["ob_mid"].null_count() < chk.height, "ob_mid all null"
     assert chk["symbol"].n_unique() >= 5, "too few symbols"
     out_dates = set(chk["open_time"].dt.strftime("%Y-%m-%d").unique().to_list())
-    exp_in = {d for d in exp_dates if WIN_LO <= d < WIN_HI}
     assert out_dates == exp_in, (
         f"date coverage {sorted(out_dates)} != expected {sorted(exp_in)}")
+    del fresh
 
     print(f"OK fresh_rows={chk.height} cols={len(chk.columns)} "
           f"symbols={chk['symbol'].n_unique()} "
