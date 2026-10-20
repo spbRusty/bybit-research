@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import time
 from datetime import datetime, timezone
@@ -101,11 +102,19 @@ def sweep(feat: str, x: np.ndarray, ys: dict[int, np.ndarray], cost: float) -> l
                 sign = 1.0 if side == "long" else -1.0
                 gross = sign * mean
                 t = sign * mean / np.sqrt(var / nn)
+                # Минутная сетка + горизонт h минут => наблюдения перекрываются
+                # ~h раз. Наивный t завышен в sqrt(h); это грубая, но
+                # консервативная поправка для ранжирования (финалисты затем
+                # проходят HAC/block bootstrap в research.test_hypothesis).
+                overlap = max(1.0, float(h))
+                t_eff = t / math.sqrt(overlap)
                 out.append({
                     "feature": feat, "op": "gt" if side == "long" else "lt",
                     "threshold": float(thr), "side": side, "horizon_min": h,
                     "n": int(nn), "t_stat": float(t),
+                    "t_eff": float(t_eff),
                     "p_value": float(2 * stats.t.sf(abs(t), nn - 1)),
+                    "p_eff": float(2 * stats.t.sf(abs(t_eff), nn - 1)),
                     "gross_mean": float(gross),
                     "mean_net": float(gross - cost),
                 })
@@ -136,9 +145,24 @@ def cheap_stats(df: pl.DataFrame, hyp: R.Hypothesis, cost: float) -> dict:
     sign = 1.0 if hyp.entry_side == "long" else -1.0
     ret = sub[hyp.target_column].to_numpy() * sign - cost
     t, _ = stats.ttest_1samp(ret, 0.0)
-    return {"n": int(n), "t_stat": float(t), "mean_net": float(ret.mean()),
+    t_eff = float(t) / math.sqrt(max(1, int(hyp.horizon_min)))
+    return {"n": int(n), "t_stat": t_eff, "t_naive": float(t),
+            "mean_net": float(ret.mean()),
             "n_symbols": int(sub["symbol"].n_unique()),
             "n_months": int(sub["open_time"].dt.strftime("%Y-%m").n_unique())}
+
+
+def robust_meets(m: dict, gates: dict | None = None) -> bool:
+    """Финальная проверка: HAC t + block-bootstrap CI (а не наивный t).
+
+    Используется только на acceptance/winners, где test_hypothesis уже вернул
+    t_hac и block_bootstrap_ci. Для prefilter остаётся meets().
+    """
+    g = gates or _R
+    ci = m.get("block_bootstrap_ci") or [0.0, 0.0]
+    return ((m.get("t_hac") or -9) >= g["min_t_stat"]
+            and float(ci[0] or 0.0) > 0.0
+            and (m.get("mean_net") or -9) > 0)
 
 
 def meets(m: dict, gates: dict | None = None,
@@ -193,15 +217,15 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("нет кандидатов")
         return 1
 
-    sig = R.benjamini_hochberg(np.nan_to_num([r["p_value"] for r in rows], nan=1.0), q_bh)
+    sig = R.benjamini_hochberg(np.nan_to_num([r.get("p_eff", r["p_value"]) for r in rows], nan=1.0), q_bh)
     for r, s in zip(rows, sig):
         r["bh"] = bool(s)
     logger.info("кандидатов=%d, BH-значимых=%d (%.0fs)",
                 len(rows), int(sig.sum()), time.time() - t0)
 
     surv = sorted((r for r in rows if r["bh"] and r["mean_net"] > 0
-                   and r["t_stat"] >= _R["min_t_stat"]),
-                  key=lambda r: -r["t_stat"])
+                   and r.get("t_eff", r["t_stat"]) >= _R["min_t_stat"]),
+                  key=lambda r: -r.get("t_eff", r["t_stat"]))
     if len(surv) > args.full_eval:
         logger.warning("выживших %d > --full-eval %d: беру топ по discovery t "
                        "(БХ уже применён ко всем %d кандидатам)",
@@ -261,8 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     surv_key = f"{cost:.4f}"
     winners = [hid for hid in finalists
                if meets(cheap_o[hid], require_months=False)
-               and (stress[surv_key].get(hid) or -9) > 0
-               and (oos[hid].get("t_stat") or -9) > 0]
+               and robust_meets(oos[hid])
+               and (stress[surv_key].get(hid) or -9) > 0]
     winners.sort(key=lambda hid: -(oos[hid].get("t_stat") or -9))
 
     out = {
@@ -279,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         "best_gross_mean_discovery": float(max(r["gross_mean"] for r in rows)),
         "sweep_top_by_gross": [
             {k: r[k] for k in ("feature", "op", "threshold", "side", "horizon_min",
-                               "n", "t_stat", "gross_mean", "mean_net", "bh")}
+                               "n", "t_stat", "t_eff", "gross_mean", "mean_net", "bh")}
             for r in sorted(rows, key=lambda r: -r["gross_mean"])[:50]],
         "finalist": None, "verdict": "NO_CANDIDATE",
     }

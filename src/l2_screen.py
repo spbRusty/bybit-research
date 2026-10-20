@@ -52,6 +52,7 @@ BH across candle+L2 families can be recomputed from raw p-values
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -119,7 +120,33 @@ def _save(out: dict, ts: str) -> Path:
     return path
 
 
+_PROV: dict = {}
+
+
+def _provenance(src: Path) -> dict:
+    root = Path(__file__).resolve().parents[1]
+    try:
+        git = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root,
+                                      text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        git = "unknown"
+    h = hashlib.sha256()
+    for p in sorted((root / "config").glob("*.toml")):
+        h.update(p.read_bytes())
+    files = (sorted(src.glob("*.parquet")) if src.is_dir()
+             else ([src] if src.exists() else []))
+    mtimes = [p.stat().st_mtime_ns for p in files]
+    return {
+        "git_commit": git,
+        "config_sha256": h.hexdigest()[:16],
+        "events_path": str(src),
+        "events_files": len(files),
+        "events_mtime_max": max(mtimes) if mtimes else 0,
+    }
+
+
 def _emit(out: dict, ts: str) -> int:
+    out = {**out, "provenance": _PROV}
     path = _save(out, ts)
     print(json.dumps(out, ensure_ascii=False, default=str))
     logger.info("saved %s", path)
@@ -133,13 +160,15 @@ def _remap_sides(rows: list[dict], cost: float) -> None:
         if want and want != r["side"]:
             r["side"] = want
             r["t_stat"] = -r["t_stat"]
+            if "t_eff" in r:
+                r["t_eff"] = -r["t_eff"]
             r["gross_mean"] = -r["gross_mean"]
             r["mean_net"] = r["gross_mean"] - cost
 
 
 def _top_by_gross(rows: list[dict], n: int) -> list[dict]:
     keys = ("feature", "op", "threshold", "side", "horizon_min",
-            "n", "t_stat", "gross_mean", "mean_net", "bh")
+            "n", "t_stat", "t_eff", "gross_mean", "mean_net", "bh")
     return [{k: r[k] for k in keys}
             for r in sorted(rows, key=lambda r: -r["gross_mean"])[:n]]
 
@@ -206,6 +235,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--full-eval", type=int, default=120,
                     help="максимум кандидатов на полный test_hypothesis")
+    ap.add_argument("--force", action="store_true",
+                    help="запустить, даже если l2_events не менялись с прошлого скрина")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -219,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", e)
         return 1
 
+    _PROV.clear()
+    _PROV.update(_provenance(src))
+
     if not src.exists():
         out = {"created_at": datetime.now(tz=timezone.utc).isoformat(),
                "verdict": "NOT_READY",
@@ -227,12 +261,22 @@ def main(argv: list[str] | None = None) -> int:
         _notify_report("NOT_READY", coverage=f"файл событий не найден: {src}")
         return _emit(out, ts)
 
+    store_files = sorted(src.glob("*.parquet")) if src.is_dir() else [src]
+    latest = max(RESULTS_DIR.glob("l2_screen_*.json"),
+                 key=lambda p: p.stat().st_mtime, default=None)
+    if (latest is not None and not args.force
+            and max(p.stat().st_mtime for p in store_files) <= latest.stat().st_mtime):
+        logger.info("no new l2_events since %s — skip", latest.name)
+        return 0
+
     cost = float(GATES["survival_cost"])
     q_bh = float(GATES["bh_q"])
     schema = dict(pl.scan_parquet(src).collect_schema())
     feats = [n for n in S.numeric_features(schema) if n.startswith(FEATURE_PREFIX)]
     horizons = [h for h in S.HORIZONS if f"return_{h}m" in schema]
     targets = [f"return_{h}m" for h in horizons]
+    _PROV["features_sha256"] = hashlib.sha256(
+        "\n".join(sorted(feats)).encode()).hexdigest()[:16]
     logger.info("features=%d horizons=%s cost=%.4f", len(feats), horizons, cost)
 
     if not feats or not horizons:
@@ -248,8 +292,10 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[dict] = []
     for i in range(0, len(feats), S.CHUNK):
         chunk = feats[i:i + S.CHUNK]
-        part = S.read_period(src, ["open_time", *chunk, *targets], "discovery",
-                             periods=PERIODS)
+        part = S.read_period(src, ["open_time", "ob_data_quality", "category",
+                                   *chunk, *targets], "discovery", periods=PERIODS)
+        part = part.filter((pl.col("ob_data_quality") == "ok")
+                           & (pl.col("category") == "linear"))
         ys = {h: part[f"return_{h}m"].to_numpy().astype(np.float64) for h in horizons}
         for f in chunk:
             x = part[f].to_numpy().astype(np.float64)
@@ -271,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _remap_sides(rows, cost)
 
-    sig = R.benjamini_hochberg(np.nan_to_num([r["p_value"] for r in rows], nan=1.0), q_bh)
+    sig = R.benjamini_hochberg(np.nan_to_num([r.get("p_eff", r["p_value"]) for r in rows], nan=1.0), q_bh)
     for r, s in zip(rows, sig):
         r["bh"] = bool(s)
     logger.info("candidates=%d, BH-significant=%d (%.0fs)",
@@ -280,8 +326,13 @@ def main(argv: list[str] | None = None) -> int:
     allrows_path = RESULTS_DIR / f"l2_screen_allrows_{ts}.parquet"
     pl.DataFrame(rows).write_parquet(allrows_path)
 
-    ot = pl.read_parquet(src, columns=["open_time", "symbol"])
+    ot = pl.read_parquet(src, columns=["open_time", "symbol", "ob_data_quality",
+                                       "category"]).filter(pl.col("category") == "linear")
     dates_covered = [str(ot["open_time"].min())[:10], str(ot["open_time"].max())[:10]]
+    disc_ot = ot.filter((pl.col("open_time") >= S._dt(PERIODS["discovery"][0]))
+                        & (pl.col("open_time") < S._dt(PERIODS["discovery"][1])))
+    coverage_ok_share = (disc_ot.filter(pl.col("ob_data_quality") == "ok").height
+                         / max(1, disc_ot.height))
     counts: dict[str, int] = {}
     days: dict[str, int] = {}
     for name, (start, end) in PERIODS.items():
@@ -291,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         days[name] = win.select(pl.col("open_time").dt.date().n_unique()).item()
     now = datetime.now(tz=timezone.utc)
     periods_complete = (now >= ACCEPTANCE_DATE
+                        and coverage_ok_share >= 0.5
                         and all(d >= MIN_PERIOD_DAYS for d in days.values()))
     logger.info("periods=%s days=%s complete=%s dates=%s",
                 counts, days, periods_complete, dates_covered)
@@ -306,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
             "dates_covered": dates_covered,
             "n_events": counts,
             "periods_complete": False,
+            "coverage_ok_share": round(coverage_ok_share, 4),
             "n_bh_significant": int(sig.sum()),
             "bh_significant_count": int(sig.sum()),
             "top_10_by_gross": _top_by_gross(rows, 10),
@@ -334,8 +387,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Full acceptance (all periods populated, on/after oos close) ---
     surv = sorted((r for r in rows if r["bh"] and r["mean_net"] > 0
-                   and r["t_stat"] >= GATES["min_t_stat"]),
-                  key=lambda r: -r["t_stat"])
+                   and r.get("t_eff", r["t_stat"]) >= GATES["min_t_stat"]),
+                  key=lambda r: -r.get("t_eff", r["t_stat"]))
     if len(surv) > args.full_eval:
         logger.warning("выживших %d > --full-eval %d: беру топ по discovery t",
                        len(surv), args.full_eval)
@@ -348,8 +401,11 @@ def main(argv: list[str] | None = None) -> int:
                          r["side"], r["horizon_min"])
             for i, r in enumerate(surv)]
     need = sorted({h.condition.split("'")[1] for h in hyps})
-    ev = {p: S.read_period(src, ["open_time", "symbol", "entry_price", *targets, *need],
-                           p, periods=PERIODS)
+    ev = {p: S.read_period(src, ["open_time", "symbol", "entry_price",
+                                 "ob_data_quality", "category", *targets, *need],
+                           p, periods=PERIODS).filter(
+                               (pl.col("ob_data_quality") == "ok")
+                               & (pl.col("category") == "linear"))
           for p in ("discovery", "validation", "oos")}
     logger.info("события: " + ", ".join(f"{k}={v.height}" for k, v in ev.items()))
     by_id = {h.hypothesis_id: h for h in hyps}
@@ -385,9 +441,9 @@ def main(argv: list[str] | None = None) -> int:
     surv_key = f"{cost:.4f}"
     winners = [hid for hid in finalists
                if S.meets(cheap_o[hid], gates=GATES, require_months=False)
-               and (stress[surv_key].get(hid) or -9) > 0
-               and (oos[hid].get("t_stat") or -9) > 0]
-    winners.sort(key=lambda hid: -(oos[hid].get("t_stat") or -9))
+               and S.robust_meets(oos[hid], gates=GATES)
+               and (stress[surv_key].get(hid) or -9) > 0]
+    winners.sort(key=lambda hid: -(oos[hid].get("t_hac") or -9))
 
     out = {
         "created_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -407,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         "allrows_path": str(allrows_path),
         "events_path": str(src),
         "periods_complete": True,
+        "coverage_ok_share": round(coverage_ok_share, 4),
     }
     if winners:
         hid = winners[0]

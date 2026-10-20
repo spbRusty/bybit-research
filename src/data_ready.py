@@ -134,10 +134,10 @@ def scan_klines(since: datetime | None = None) -> dict:
         mtime = f.stat().st_mtime
         if mtime < min_mtime:
             if mtime < (now - timedelta(days=STALE_DAYS)).timestamp():
-                stale_symbols.add(f.stem.split("_")[0])
+                stale_symbols.add(f.parent.name if f.parent.parent.name in ("linear", "spot") else f.stem.split("_")[0])
             continue
         n_files += 1
-        sym = f.stem.split("_")[0]
+        sym = f.parent.name if f.parent.parent.name in ("linear", "spot") else f.stem.split("_")[0]
         try:
             lf = pl.scan_parquet(f).select(pl.col("open_time"))
             mx = lf.select(pl.col("open_time").max()).collect().item()

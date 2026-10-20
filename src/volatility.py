@@ -54,6 +54,8 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from pathlib import Path
     from src.data import read_raw
-    df = read_raw(Path.home() / "Документы/bybit_rs/data/klines/linear/BTCUSDT_linear_1m.parquet")
+    from config.settings import RAW_KLINES_DIR
+    parts = sorted((RAW_KLINES_DIR / "linear" / "BTCUSDT").glob("*.parquet"))
+    df = read_raw(parts[-1])
     print(garman_klass_daily(df).tail(3))
     print(rolling_gk(df, 30).tail(3))

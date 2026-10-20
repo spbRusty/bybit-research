@@ -100,6 +100,8 @@ def _initial_state() -> dict:
         "trade_count": 0,
         "win_count": 0,
         "loss_count": 0,
+        "win_pnl_sum": 0.0,
+        "loss_pnl_sum": 0.0,
         "win_rate": 0.0,
         "avg_win": 0.0,
         "avg_loss": 0.0,
@@ -453,12 +455,13 @@ def shadow_run(events: pl.DataFrame,
     trades_by_hyp: dict[str, int] = {}
     pnl_by_hyp: dict[str, float] = {}
 
-    # ponytail: фиксированный референс для sizing. state["balance"] общий на все
-    # гипотезы: первая (1775 сделок) роняла его с 1000 до 0.55, после чего
-    # notional=balance*5=2.77 < min_notional=5 и остальные гипотезы получали 0 сделок.
-    # Шэдоу (MODE B) наблюдает кандидатов независимо, sizing берётся от баланса
-    # на старте прогона. Апгрейд: отдельный виртуальный счёт на гипотезу.
-    ref_equity = state["balance"]
+    # Одна позиция на (гипотеза, символ) на горизонт: без этого минутные
+    # события превращаются в 100k+ перекрывающихся «сделок», а PnL — в
+    # ресериализацию сырых возвратов.
+    last_entry: dict[tuple[str, str], int] = {}
+    active_exits: list[int] = []
+    MAX_OPEN = 20
+    events = events.sort("open_time")
 
     for hyp in hypotheses:
         hyp_id = hyp.hypothesis_id
@@ -480,11 +483,25 @@ def shadow_run(events: pl.DataFrame,
             pl.col("entry_price").is_not_null() &
             pl.col("entry_price").is_finite()
         )
+        horizon_ms = int(hyp.horizon_min) * 60_000
 
         for row in sub.iter_rows(named=True):
             entry = row.get("entry_price")
             if entry is None or entry <= 0:
                 continue
+
+            ot = row.get("open_time")
+            ts_ms = int(ot.timestamp() * 1000) if hasattr(ot, "timestamp") else 0
+            symbol_key = row.get("symbol", "UNKNOWN")
+            key = (hyp_id, symbol_key)
+            if ts_ms - last_entry.get(key, -10**18) < horizon_ms:
+                continue
+            active_exits = [x for x in active_exits if x > ts_ms]
+            if len(active_exits) >= MAX_OPEN:
+                continue
+            ref_equity = state["balance"]
+            if ref_equity <= 0:
+                break
 
             vol = row.get("vol_gk_30d", 0.0) or 0.0
             stop_dist = _RISK["stop_k_vol"] * vol * entry if vol > 0 else entry * 0.002
@@ -531,6 +548,18 @@ def shadow_run(events: pl.DataFrame,
             else:
                 state["loss_count"] += 1
             state["win_rate"] = state["win_count"] / state["trade_count"]
+            if net_pnl > 0:
+                state["win_pnl_sum"] = state.get("win_pnl_sum", 0.0) + net_pnl
+            else:
+                state["loss_pnl_sum"] = state.get("loss_pnl_sum", 0.0) + net_pnl
+            state["avg_win"] = (state["win_pnl_sum"] / state["win_count"]
+                                if state["win_count"] else 0.0)
+            state["avg_loss"] = (state["loss_pnl_sum"] / state["loss_count"]
+                                 if state["loss_count"] else 0.0)
+            if state["loss_pnl_sum"] < 0:
+                state["profit_factor"] = state["win_pnl_sum"] / abs(state["loss_pnl_sum"])
+            else:
+                state["profit_factor"] = float("inf") if state["win_pnl_sum"] > 0 else 0.0
             state["equity"] = state["balance"]
             state["peak_equity"] = max(state["peak_equity"], state["equity"])
             dd = (state["equity"] - state["peak_equity"]) / state["peak_equity"] if state["peak_equity"] > 0 else 0.0
@@ -558,6 +587,8 @@ def shadow_run(events: pl.DataFrame,
                 reason=reason,
                 balance_after=round(state["balance"], 2),
             )
+            last_entry[key] = ts_ms
+            active_exits.append(ts_ms + horizon_ms)
             state["trades"].append(trade.to_dict())
             trades_executed += 1
             trades_by_hyp[hyp_id] += 1

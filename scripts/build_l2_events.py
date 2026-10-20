@@ -10,6 +10,7 @@ row cap enforced by pre-count. Reads only — never touches the protected tree.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -44,6 +45,7 @@ DUMP = Path("/home/vlad/Документы/bybit_rs/data/orderbook")
 # rewritten or dropped. Growth is bounded to the pre-registered calendar window.
 OUT_DIR = EVENTS_DIR / "l2_events"
 STAGE_DIR = EVENTS_DIR / "l2_events.stage"  # staging for atomic os.replace; keeps OUT_DIR *.parquet-only
+MANIFEST = EVENTS_DIR / "l2_events_manifest.json"  # date -> max source mtime
 _PERIODS = load_toml("l2_research.toml")["periods"]
 WIN_LO = _PERIODS["discovery"][0]   # "2026-09-06"
 WIN_HI = _PERIODS["oos"][1]         # "2027-01-04" (exclusive)
@@ -71,14 +73,20 @@ OB_RD = (["timestamp_ms", "gap_detected", "best_bid", "best_ask",
             for q in ("bid", "ask") for k in ("px", "sz")])
 
 
-def minute_grid(ts: np.ndarray) -> np.ndarray:
-    """60s grid, floor(min)..floor(max) PER UTC date of snapshot coverage."""
+def minute_grid(ts: np.ndarray, dates: set[str] | None = None) -> np.ndarray:
+    """60s grid, floor(min)..floor(max) PER UTC date; только запрошенные даты."""
     buck = ts // 60_000 * 60_000
     days = buck // 86_400_000
-    return np.concatenate([
-        np.arange(buck[days == d].min(), buck[days == d].max() + 1,
-                  60_000, dtype=np.int64)
-        for d in np.unique(days)])
+    grids = []
+    for d in np.unique(days):
+        ds = str(np.datetime64(int(d), "D"))
+        if dates is not None and ds not in dates:
+            continue
+        sel = buck[days == d]
+        if sel.size == 0:
+            continue
+        grids.append(np.arange(sel.min(), sel.max() + 1, 60_000, dtype=np.int64))
+    return np.concatenate(grids) if grids else np.empty(0, dtype=np.int64)
 
 
 def universe() -> tuple[list[str], dict[str, str], list[str]]:
@@ -111,13 +119,48 @@ def universe() -> tuple[list[str], dict[str, str], list[str]]:
                 skipped.append(s)
             else:
                 cats[s] = cat
-    return [s for s in dirs if s in cats], cats, skipped
+    # L2-поток теперь собирается только по linear (ob_reconstructor). Spot
+    # оставался с покрытием ~2% и лишь загрязнял выборку — исключаем его.
+    return [s for s in dirs if s in cats and cats[s] == "linear"], cats, skipped
 
 
-def snap_files(sym: str) -> list[Path]:
+def snap_files(sym: str, dates: set[str] | None = None) -> list[Path]:
     # .tmp = staging of bybit_ob_reconstructor (write-then-rename); exclude like orderbook_reader
-    return [p for r in ROOTS if (d := r / sym).is_dir()
-            for p in sorted(d.glob("*.parquet*")) if not p.name.endswith(".tmp")]
+    fs = [p for r in ROOTS if (d := r / sym).is_dir()
+          for p in sorted(d.glob("*.parquet*")) if not p.name.endswith(".tmp")]
+    if dates is None:
+        return fs
+    return [p for p in fs if p.name[:10] in dates]
+
+
+def source_mtimes() -> dict[str, int]:
+    """max mtime исходных файлов по UTC-дате (имя YYYY-MM-DD-HH.parquet)."""
+    out: dict[str, int] = {}
+    for root in ROOTS:
+        if not root.is_dir():
+            continue
+        for p in root.glob("*/*.parquet"):
+            d = p.name[:10]
+            if len(d) != 10 or d[4] != "-" or d[7] != "-":
+                continue
+            m = p.stat().st_mtime_ns
+            if m > out.get(d, 0):
+                out[d] = m
+    return out
+
+
+def load_manifest() -> dict[str, int]:
+    try:
+        raw = json.loads(MANIFEST.read_text())
+        return {str(k): int(v) for k, v in raw.items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_manifest(m: dict[str, int]) -> None:
+    tmp = MANIFEST.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(m, sort_keys=True))
+    os.replace(tmp, MANIFEST)
 
 
 def ts_of(files: list[Path]) -> np.ndarray:
@@ -126,19 +169,19 @@ def ts_of(files: list[Path]) -> np.ndarray:
     return (ts["timestamp_ms"].unique().sort().to_numpy().astype(np.int64))
 
 
-def pre_count(syms: list[str]) -> tuple[int, dict[str, int]]:
+def pre_count(syms: list[str], dirty: set[str]) -> tuple[int, dict[str, int]]:
     """Upper bound = grid minutes with a snapshot within MISSING threshold.
     Also returns expected rows-per-date (cov600 > 0 dates). Asserts the cap."""
     total = 0
     dates: dict[str, int] = {}
     for i, s in enumerate(syms):
-        fs = snap_files(s)
+        fs = snap_files(s, dirty)
         if not fs:
             continue
         ts = ts_of(fs)
         if ts.size == 0:
             continue
-        grid = minute_grid(ts)
+        grid = minute_grid(ts, dirty)
         idx = np.searchsorted(ts, grid, side="right") - 1
         hit = (idx >= 0) & (grid - ts[np.clip(idx, 0, ts.size - 1)]
                             <= MISSING_THRESHOLD_SEC * 1000)
@@ -153,8 +196,8 @@ def pre_count(syms: list[str]) -> tuple[int, dict[str, int]]:
     return total, dates
 
 
-def build_symbol(sym: str, cat: str, cnt: Counter) -> pl.DataFrame | None:
-    fs = snap_files(sym)
+def build_symbol(sym: str, cat: str, cnt: Counter, dirty: set[str]) -> pl.DataFrame | None:
+    fs = snap_files(sym, dirty)
     if not fs:
         cnt["no_files"] += 1
         return None
@@ -165,7 +208,7 @@ def build_symbol(sym: str, cat: str, cnt: Counter) -> pl.DataFrame | None:
         return None
     ts = ob["timestamp_ms"].to_numpy().astype(np.int64)
     t0, t1 = int(ts.min()), int(ts.max())
-    grid = pl.DataFrame({"_ms": minute_grid(ts)})
+    grid = pl.DataFrame({"_ms": minute_grid(ts, dirty)})
     feat = compute_all_features(ob).select(
         ["timestamp_ms", "gap_detected", *OB_COLS]).sort("timestamp_ms")
     j = grid.join_asof(feat, left_on="_ms", right_on="timestamp_ms",
@@ -225,11 +268,26 @@ def build_symbol(sym: str, cat: str, cnt: Counter) -> pl.DataFrame | None:
 
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--full", action="store_true", help="rebuild all source dates")
+    args = ap.parse_args()
+
     t_start = time.time()
     syms, cats, skipped = universe()
     print(f"universe: {len(syms)} symbols; skipped no-klines: "
           f"{len(skipped)} {skipped}", flush=True)
-    pre, exp_dates = pre_count(syms)
+
+    src_mtimes = source_mtimes()
+    prev = {} if args.full else load_manifest()
+    dirty = {d for d, m in src_mtimes.items()
+             if prev.get(d) != m and WIN_LO <= d < WIN_HI}
+    if not dirty:
+        print("no dirty dates: source partitions unchanged", flush=True)
+        return 0
+    print(f"dirty dates: {sorted(dirty)}", flush=True)
+
+    pre, exp_dates = pre_count(syms, dirty)
     print(f"pre-count: {pre} rows (cap {MAX_ROWS}); expected dates: "
           f"{sorted(exp_dates)}", flush=True)
 
@@ -237,7 +295,7 @@ def main() -> int:
     frames: list[pl.DataFrame] = []
     built = 0
     for i, s_sym in enumerate(syms):
-        df = build_symbol(s_sym, cats[s_sym], cnt)
+        df = build_symbol(s_sym, cats[s_sym], cnt, dirty)
         if df is not None:
             frames.append(df)
             built += df.height
@@ -261,6 +319,7 @@ def main() -> int:
     STAGE_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     swapped: set[str] = set()
+    kept_dates: set[str] = set()
     for (d,), part in fresh.partition_by(["_date"], as_dict=True).items():
         if not (WIN_LO <= d < WIN_HI):
             cnt["out_of_window_dates"] += 1          # bound growth to the study calendar
@@ -268,12 +327,17 @@ def main() -> int:
         dest = OUT_DIR / f"{d}.parquet"
         if dest.exists() and pq.read_metadata(dest).num_rows >= part.height:
             cnt["kept_larger_partition"] += 1
+            kept_dates.add(d)
             continue
         part = part.drop("_date").cast(SCHEMA)
         tmp = STAGE_DIR / f"{d}.parquet"
-        pq.write_table(part.to_arrow(), str(tmp))
+        pq.write_table(part.to_arrow(), str(tmp), compression="zstd", row_group_size=128_000)
         os.replace(tmp, dest)                        # atomic per-date swap
         swapped.add(d)
+    for d in dirty:
+        if d in src_mtimes:
+            prev[d] = src_mtimes[d]
+    save_manifest(prev)
     for stale in STAGE_DIR.glob("*.parquet"):
         stale.unlink()
 
@@ -298,8 +362,12 @@ def main() -> int:
     assert chk["ob_mid"].null_count() < chk.height, "ob_mid all null"
     assert chk["symbol"].n_unique() >= 5, "too few symbols"
     out_dates = set(chk["open_time"].dt.strftime("%Y-%m-%d").unique().to_list())
-    assert out_dates == exp_in, (
-        f"date coverage {sorted(out_dates)} != expected {sorted(exp_in)}")
+    # Дата может отсутствовать в fresh (источник уже вычищен), но её партиция
+    # сохранена как «kept larger» — это не потеря покрытия.
+    assert out_dates <= exp_in, (
+        f"unexpected dates {sorted(out_dates - exp_in)}")
+    assert exp_in <= (out_dates | kept_dates), (
+        f"missing dates {sorted(exp_in - out_dates - kept_dates)}")
     del fresh
 
     print(f"OK fresh_rows={chk.height} cols={len(chk.columns)} "

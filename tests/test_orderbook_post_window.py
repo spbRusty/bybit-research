@@ -125,7 +125,7 @@ class TestPostWindowOk(unittest.TestCase):
             self.assertEqual(ds["ob_data_quality_post"][0], "ok")
             # Фичи из последнего снапшота окна: bid = 100.0 + 2*0.1
             self.assertAlmostEqual(ds["ob_post_best_bid"][0], 100.2, places=2)
-            self.assertIn("ob_post_imbalance_20", ds.columns)
+            self.assertIn("ob_post_imbalance_10", ds.columns)
         finally:
             shutil.rmtree(tmp)
 
@@ -269,7 +269,7 @@ class TestPostColumnNaming(unittest.TestCase):
 
         self.assertEqual(_post_col_name("ob_best_bid"), "ob_post_best_bid")
         cols = _get_post_ob_columns()
-        self.assertIn("ob_post_imbalance_20", cols)
+        self.assertIn("ob_post_imbalance_10", cols)
         self.assertNotIn("ob_imbalance_20", cols)
         self.assertTrue(all(c.startswith("ob_post_") for c in cols))
 

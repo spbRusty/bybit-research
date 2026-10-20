@@ -36,7 +36,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from config.settings import EVENTS_DIR, LOGS_DIR, RESEARCH_DIR, load_toml
+from config.settings import EVENTS_DIR, LOGS_DIR, RAW_KLINES_DIR, RESEARCH_DIR, load_toml
 from src.data_ready import (
     Lock,
     check_ready,
@@ -160,6 +160,19 @@ def _search_fp() -> str:
         h.update(f"{st.st_mtime_ns}:{st.st_size}".encode())
     except OSError:
         h.update(b"missing")
+    # Новые рыночные данные должны разблокировать EXHAUSTED-цикл.
+    try:
+        newest = max((p.stat().st_mtime_ns for p in
+                      (RAW_KLINES_DIR / "linear").glob("*/*.parquet")), default=0)
+        h.update(f"klines:{newest}".encode())
+    except OSError:
+        h.update(b"klines-missing")
+    try:
+        newest_l2 = max((p.stat().st_mtime_ns for p in
+                         (EVENTS_DIR / "l2_events").glob("*.parquet")), default=0)
+        h.update(f"l2:{newest_l2}".encode())
+    except OSError:
+        h.update(b"l2-missing")
     return h.hexdigest()[:16]
 
 

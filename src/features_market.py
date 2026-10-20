@@ -1,7 +1,7 @@
 """Рыночные тиковые признаки (ТЗ §12-§15): стакан, order flow, фьючерсные funding/OI.
 
 Тиковые потоки собирает Rust-сервис marketdata в
-MARKET_DATA_DIR/{trades,orderbook,futures,liquidation,ratio}/linear/{sym}.parquet
+MARKET_DATA_DIR/{trades,orderbook,futures,liquidation,ratio}/linear/{sym}/{YYYY-MM-DD}.parquet
 (формат: ts = Int64 миллисекунды, не datetime).
 
 build_market_features агрегирует тики к минутным бакетам и возвращает
@@ -61,8 +61,15 @@ def _bucket_ms(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _read(kind: str, sym: str) -> pl.DataFrame | None:
-    p = MARKET_DATA_DIR / kind / "linear" / f"{sym}.parquet"
-    return pl.read_parquet(p) if p.exists() else None
+    """Все дневные партиции символа + legacy-файл на время миграции."""
+    d = MARKET_DATA_DIR / kind / "linear" / sym
+    parts = sorted(d.glob("*.parquet")) if d.is_dir() else []
+    legacy = MARKET_DATA_DIR / kind / "linear" / f"{sym}.parquet"
+    if legacy.exists():
+        parts.append(legacy)
+    if not parts:
+        return None
+    return pl.concat([pl.read_parquet(p) for p in parts])
 
 
 def _join_min(out: pl.DataFrame, f: pl.DataFrame) -> pl.DataFrame:

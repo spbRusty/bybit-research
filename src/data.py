@@ -1,7 +1,7 @@
 """Данные (ТЗ §6-8, §45-46): загрузка сырых свечей, проверка качества, фильтр ликвидности.
 
 Сырые свечи уже скачаны Rust-загрузчиком bybit_rs в parquet
-(data/klines/{linear,spot}/*_1m.parquet). Этот модуль их читает, проверяет
+(data/klines/{linear,spot}/{SYMBOL}/{YYYY-MM}.parquet). Этот модуль их читает, проверяет
 и строит юниверс по фильтру ликвидности.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ def find_files() -> list[Path]:
     for cat in _MKT["categories"]:
         d = RAW_KLINES_DIR / cat
         if d.exists():
-            out += sorted(d.glob("*_1m.parquet"))
+            out += sorted(d.glob("*/*.parquet"))
     return out
 
 
@@ -80,11 +80,15 @@ def validate_candles(df: pl.DataFrame, symbol: str) -> tuple[list[str], list[str
 
 
 def load_validated(symbol: str, category: str) -> pl.DataFrame | None:
-    """Файл -> проверенный DataFrame (None только при фатальных проблемах)."""
-    path = RAW_KLINES_DIR / category / f"{symbol}_{category}_1m.parquet"
-    if not path.exists():
+    """Все месячные партиции символа -> проверенный DataFrame."""
+    parts = sorted((RAW_KLINES_DIR / category / symbol).glob("*.parquet"))
+    if not parts:
+        # обратная совместимость на время миграции
+        legacy = RAW_KLINES_DIR / category / f"{symbol}_{category}_1m.parquet"
+        parts = [legacy] if legacy.exists() else []
+    if not parts:
         return None
-    df = read_raw(path)
+    df = pl.concat([read_raw(p) for p in parts]).sort("open_time")
     fatal, warnings = validate_candles(df, f"{symbol}_{category}")
     for w in warnings:
         logger.warning(w)
@@ -114,6 +118,9 @@ def turnover_by_day() -> pl.DataFrame:
 
 
 def _symbol_category(path: Path) -> tuple[str, str]:
+    """Поддерживает обе раскладки: {cat}/{sym}/{month}.parquet и {cat}/{sym}_{cat}_1m.parquet."""
+    if path.parent.parent.name in _MKT["categories"]:
+        return path.parent.name, path.parent.parent.name
     name = path.name
     for cat in _MKT["categories"]:
         suffix = f"_{cat}_1m.parquet"

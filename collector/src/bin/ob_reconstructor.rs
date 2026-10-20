@@ -27,7 +27,7 @@ const METRICS_RETENTION_DAYS: u64 = 2;
 const UNIVERSE_REFRESH_INTERVAL: u64 = 86400;
 const WRITER_QUEUE_CAP: usize = 4096;
 const N_SHARDS: usize = 8;
-const CHECKPOINT_SECS: u64 = 60;
+const CHECKPOINT_SECS: u64 = 300;
 const RAW_FLUSH_SECS: u64 = 3;
 const RAW_FLUSH_BYTES: usize = 65536;
 static WQUEUE_FULL: AtomicU64 = AtomicU64::new(0);
@@ -81,12 +81,17 @@ fn table_to_batch(t: &Table) -> Result<(arrow::datatypes::SchemaRef, arrow::reco
 /// Пишет свежий часовой parquet из памяти: temp + fs::rename, без read-modify-write.
 fn write_parquet_new(path: &Path, snaps: &[ReconstructedSnapshot]) -> Result<()> {
     use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
 
     let (schema, batch) = table_to_batch(&snapshots_to_table(snaps))?;
     let tmp = path.with_extension("parquet.tmp");
     if let Some(parent) = tmp.parent() { fs::create_dir_all(parent)?; }
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
     let file = fs::File::create(&tmp)?;
-    let mut w = ArrowWriter::try_new(file, schema, None)?;
+    let mut w = ArrowWriter::try_new(file, schema, Some(props))?;
     w.write(&batch)?;
     w.close()?;
     fs::rename(&tmp, path)?;

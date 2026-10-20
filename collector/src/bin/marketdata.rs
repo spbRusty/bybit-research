@@ -29,6 +29,8 @@ use chrono::Utc;
 use futures_util::{Sink, SinkExt, StreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -57,14 +59,18 @@ enum Cell {
 }
 
 type Col = Vec<Cell>;
-type Table = Vec<(&'static str, Col)>;
+type Table = Vec<(String, Col)>;
+
+fn table<const N: usize>(items: [(&str, Col); N]) -> Table {
+    items.into_iter().map(|(n, c)| (n.to_string(), c)).collect()
+}
 
 fn len(t: &Table) -> usize {
     t.first().map(|(_, c)| c.len()).unwrap_or(0)
 }
 
 fn col_i<'a>(t: &'a Table, name: &str) -> Option<&'a Col> {
-    t.iter().find(|(n, _)| *n == name).map(|(_, c)| c)
+    t.iter().find(|(n, _)| n.as_str() == name).map(|(_, c)| c)
 }
 
 /// (min, max) по целочисленной колонке.
@@ -100,17 +106,17 @@ fn write_parquet(path: &Path, t: &Table) -> Result<()> {
     for (name, col) in t {
         match &col[0] {
             Cell::I(_) => {
-                fields.push(Field::new(*name, DataType::Int64, false));
+                fields.push(Field::new(name.as_str(), DataType::Int64, false));
                 let v: Vec<i64> = col.iter().map(|c| if let Cell::I(i) = c { *i } else { 0 }).collect();
                 arrays.push(Arc::new(Int64Array::from(v)));
             }
             Cell::F(_) => {
-                fields.push(Field::new(*name, DataType::Float64, false));
+                fields.push(Field::new(name.as_str(), DataType::Float64, false));
                 let v: Vec<f64> = col.iter().map(|c| if let Cell::F(f) = c { *f } else { 0.0 }).collect();
                 arrays.push(Arc::new(Float64Array::from(v)));
             }
             Cell::B(_) => {
-                fields.push(Field::new(*name, DataType::Boolean, false));
+                fields.push(Field::new(name.as_str(), DataType::Boolean, false));
                 let v: Vec<bool> = col.iter().map(|c| if let Cell::B(b) = c { *b } else { false }).collect();
                 arrays.push(Arc::new(BooleanArray::from(v)));
             }
@@ -118,9 +124,15 @@ fn write_parquet(path: &Path, t: &Table) -> Result<()> {
     }
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension("parquet.tmp");
     let file = File::create(&tmp).with_context(|| format!("create {tmp:?}"))?;
-    let mut w = ArrowWriter::try_new(file, schema, None)?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props))?;
     w.write(&batch)?;
     w.close()?;
     fs::rename(&tmp, path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
@@ -136,7 +148,7 @@ fn read_parquet(path: &Path) -> Result<Table> {
         let b = batch?;
         if out.is_empty() {
             for f in b.schema().fields() {
-                out.push((Box::leak(f.name().clone().into_boxed_str()), Col::new()));
+                out.push((f.name().clone(), Col::new()));
             }
         }
         for (i, (_, col)) in out.iter_mut().enumerate() {
@@ -153,15 +165,46 @@ fn read_parquet(path: &Path) -> Result<Table> {
     Ok(out)
 }
 
+/// Тип колонки по первому значению.
+fn col_kind(col: &Col) -> Option<u8> {
+    col.first().map(|c| match c {
+        Cell::I(_) => 0,
+        Cell::F(_) => 1,
+        Cell::B(_) => 2,
+    })
+}
+
+/// Совпадают ли имена, порядок и типы колонок.
+fn same_schema(a: &Table, b: &Table) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|((an, ac), (bn, bc))| an == bn && col_kind(ac) == col_kind(bc))
+}
+
+/// Все колонки таблицы имеют одинаковую длину.
+fn is_rectangular(t: &Table) -> bool {
+    let n = len(t);
+    t.iter().all(|(_, c)| c.len() == n)
+}
+
 /// Слияние новых строк с файлом, сортировка по ts, запись.
 fn append_table(path: &Path, new: &Table) -> Result<()> {
     if len(new) == 0 { return Ok(()); }
+    if !is_rectangular(new) {
+        anyhow::bail!("ragged table for {path:?}");
+    }
     let mut old = if path.exists() { read_parquet(path)? } else { Table::new() };
     if old.is_empty() {
         old = new.clone();
-    } else if old.len() == new.len() {
+    } else {
+        if !same_schema(&old, new) {
+            anyhow::bail!(
+                "schema mismatch for {path:?}: old {} cols, new {} cols; refusing to overwrite",
+                old.len(),
+                new.len()
+            );
+        }
         for (i, (_, col)) in new.iter().enumerate() {
-            old[i].1.extend(col.clone());
+            old[i].1.extend(col.iter().cloned());
         }
     }
     if let Some(ti) = old.iter().position(|(n, _)| *n == "ts") {
@@ -175,6 +218,29 @@ fn append_table(path: &Path, new: &Table) -> Result<()> {
         }
     }
     write_parquet(path, &old)
+}
+
+/// Сливает строки `src` в `dst`, проверяя схему.
+fn merge_rows(dst: &mut Table, src: Table) -> Result<()> {
+    if len(&src) == 0 { return Ok(()); }
+    if !is_rectangular(&src) {
+        anyhow::bail!("ragged source table");
+    }
+    if dst.is_empty() {
+        *dst = src;
+        return Ok(());
+    }
+    if !same_schema(dst, &src) {
+        anyhow::bail!(
+            "merge schema mismatch: dst {} cols, src {} cols",
+            dst.len(),
+            src.len()
+        );
+    }
+    for (dcol, scol) in dst.iter_mut().map(|(_, c)| c).zip(src.into_iter().map(|(_, c)| c)) {
+        dcol.extend(scol);
+    }
+    Ok(())
 }
 
 // ---------- WS ----------
@@ -217,12 +283,12 @@ fn parse_message(stream: Stream, v: &Value) -> Option<(String, Table)> {
     match stream {
         Stream::Trades => {
             let arr = data.as_array()?;
-            let mut t = Table::from([
+            let mut t = table([
                 ("ts", Col::new()), ("seq", Col::new()), ("is_buy", Col::new()),
                 ("price", Col::new()), ("size", Col::new()),
             ]);
             for d in arr {
-                t[0].1.push(Cell::I(ts));
+                t[0].1.push(Cell::I(d["T"].as_i64().unwrap_or(ts)));
                 t[1].1.push(Cell::I(d["seq"].as_i64().unwrap_or(0)));
                 t[2].1.push(Cell::B(d["S"].as_str() == Some("Buy")));
                 t[3].1.push(Cell::F(pf(d["p"].as_str())));
@@ -237,7 +303,7 @@ fn parse_message(stream: Stream, v: &Value) -> Option<(String, Table)> {
             let asks = d.get("a").and_then(|x| x.as_array()).cloned().unwrap_or_default();
             let seq = d.get("seq").and_then(|x| x.as_i64()).unwrap_or(0);
             let is_delta = v["type"].as_str() == Some("delta");
-            let mut t = Table::from([
+            let mut t = table([
                 ("ts", Col::new()), ("seq", Col::new()), ("is_delta", Col::new()), ("level", Col::new()),
                 ("bid_px", Col::new()), ("bid_sz", Col::new()), ("ask_px", Col::new()), ("ask_sz", Col::new()),
             ]);
@@ -260,11 +326,11 @@ fn parse_message(stream: Stream, v: &Value) -> Option<(String, Table)> {
         Stream::Liquidation => {
             let arr = data.as_array()?;
             let sym = stream.strip(topic)?.to_string();
-            let mut t = Table::from([
+            let mut t = table([
                 ("ts", Col::new()), ("is_sell", Col::new()), ("price", Col::new()), ("size", Col::new()),
             ]);
             for d in arr {
-                t[0].1.push(Cell::I(ts));
+                t[0].1.push(Cell::I(d["T"].as_i64().unwrap_or(ts)));
                 t[1].1.push(Cell::B(d["S"].as_str() == Some("Sell")));
                 t[2].1.push(Cell::F(pf(d["p"].as_str())));
                 t[3].1.push(Cell::F(pf(d["v"].as_str())));
@@ -328,30 +394,76 @@ async fn ws_run(stream: Stream, url: &str, syms: &Arc<Vec<String>>, tx: &mpsc::S
     }
 }
 
-async fn flush_loop(mut rx: mpsc::Receiver<(String, Table)>) {
+async fn flush_loop(mut rx: mpsc::Receiver<(String, Table)>, root: &Path) {
     let mut pending: HashMap<String, Table> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(FLUSH_SEC));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        let mut do_flush = false;
         tokio::select! {
             maybe = rx.recv() => match maybe {
-                Some((key, table)) => { pending.entry(key).or_default().extend(table); }
+                Some((key, table)) => {
+                    if let Err(e) = merge_rows(pending.entry(key).or_default(), table) {
+                        eprintln!("[flush] merge: {e:#}");
+                    }
+                }
                 None => break,
             },
-            _ = tick.tick() => {}
+            _ = tick.tick() => do_flush = true,
         }
-        flush_pending(&mut pending);
+        if do_flush {
+            flush_pending(&mut pending, root);
+        }
     }
+    // Канал закрыт (shutdown) — не теряем накопленное.
+    flush_pending(&mut pending, root);
 }
 
-fn flush_pending(pending: &mut HashMap<String, Table>) {
+fn date_key(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .unwrap_or_default()
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// Делит батч по UTC-датам, чтобы писать неизменяемые дневные партиции.
+fn split_by_date(t: &Table) -> HashMap<String, Table> {
+    let mut out: HashMap<String, Table> = HashMap::new();
+    let Some(ts_idx) = t.iter().position(|(n, _)| n == "ts") else { return out; };
+    let n = len(t);
+    for i in 0..n {
+        let ts = if let Cell::I(v) = &t[ts_idx].1[i] { *v } else { 0 };
+        let date = date_key(ts);
+        let dst = out.entry(date).or_insert_with(|| {
+            t.iter().map(|(name, _)| (name.clone(), Col::new())).collect()
+        });
+        for (j, (_, col)) in t.iter().enumerate() {
+            dst[j].1.push(col[i].clone());
+        }
+    }
+    out
+}
+
+fn flush_pending(pending: &mut HashMap<String, Table>, root: &Path) {
     if pending.is_empty() { return; }
     let keys: Vec<String> = pending.keys().cloned().collect();
     for key in keys {
         let rows = pending.remove(&key).unwrap_or_default();
         let (dir_name, sym) = key.split_once('/').expect("key");
-        let path = Path::new(DATA_ROOT).join(dir_name).join("linear").join(format!("{sym}.parquet"));
-        if let Err(e) = append_table(&path, &rows) { eprintln!("[flush {sym}] {e:#}"); }
+        for (date, part) in split_by_date(&rows) {
+            if len(&part) == 0 { continue; }
+            let path = root.join(dir_name).join("linear").join(&sym).join(format!("{date}.parquet"));
+            if let Err(e) = append_table(&path, &part) { eprintln!("[flush {sym} {date}] {e:#}"); }
+        }
+    }
+}
+
+/// Прямая запись вне WS-flush (futures/ratio): те же дневные партиции.
+fn write_daily(root: &Path, dir_name: &str, sym: &str, t: &Table) {
+    for (date, part) in split_by_date(t) {
+        if len(&part) == 0 { continue; }
+        let path = root.join(dir_name).join("linear").join(sym).join(format!("{date}.parquet"));
+        if let Err(e) = append_table(&path, &part) { eprintln!("[{dir_name} {sym} {date}] {e:#}"); }
     }
 }
 
@@ -373,8 +485,7 @@ async fn futures_loop(syms: Arc<Vec<String>>, client: Arc<Client>, tokens: Arc<M
                             let ts = Utc::now().timestamp_millis();
                             let gi = |k: &str| -> i64 { d.and_then(|o| o.get(k)).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0) };
                             let pf2 = |k: &str| -> f64 { d.and_then(|o| o.get(k)).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN) };
-                            let path = Path::new(DATA_ROOT).join("futures").join("linear").join(format!("{sym}.parquet"));
-                            let table: Table = vec![
+                            let t: Table = table([
                                 ("ts", vec![Cell::I(ts)]),
                                 ("funding_rate", vec![Cell::F(pf2("fundingRate"))]),
                                 ("next_funding_time", vec![Cell::I(gi("nextFundingTime"))]),
@@ -388,8 +499,8 @@ async fn futures_loop(syms: Arc<Vec<String>>, client: Arc<Client>, tokens: Arc<M
                                 ("ask1_px", vec![Cell::F(pf2("ask1Price"))]),
                                 ("ask1_sz", vec![Cell::F(pf2("ask1Size"))]),
                                 ("basis_rate", vec![Cell::F(pf2("basisRate"))]),
-                            ];
-                            if let Err(e) = append_table(&path, &table) { eprintln!("[futures {sym}] {e:#}"); }
+                            ]);
+                            write_daily(Path::new(DATA_ROOT), "futures", sym, &t);
                         }
                     }
                 }
@@ -414,13 +525,12 @@ async fn ratio_loop(syms: Arc<Vec<String>>, client: Arc<Client>, tokens: Arc<Mut
                             let ts = Utc::now().timestamp_millis();
                             let buy = pf(row["buyRatio"].as_str());
                             let sell = pf(row["sellRatio"].as_str());
-                            let path = Path::new(DATA_ROOT).join("ratio").join("linear").join(format!("{sym}.parquet"));
-                            let table: Table = vec![
+                            let t: Table = table([
                                 ("ts", vec![Cell::I(ts)]),
                                 ("buy_ratio", vec![Cell::F(buy)]),
                                 ("sell_ratio", vec![Cell::F(sell)]),
-                            ];
-                            if let Err(e) = append_table(&path, &table) { eprintln!("[ratio {sym}] {e:#}"); }
+                            ]);
+                            write_daily(Path::new(DATA_ROOT), "ratio", sym, &t);
                         }
                     }
                 }
@@ -613,7 +723,7 @@ async fn ob_capture_task(trigger: TriggerFile) {
     });
 
     // Собираем данные в буфер пока не истечёт время
-    let mut all_rows: Table = Table::from([
+    let mut all_rows: Table = table([
         ("ts", Col::new()), ("seq", Col::new()), ("is_delta", Col::new()), ("level", Col::new()),
         ("bid_px", Col::new()), ("bid_sz", Col::new()), ("ask_px", Col::new()), ("ask_sz", Col::new()),
     ]);
@@ -884,7 +994,7 @@ async fn main() -> Result<()> {
     println!("marketdata: max_concurrent captures = {max_concurrent}");
 
     drop(tx);
-    flush_loop(rx).await;
+    flush_loop(rx, Path::new(DATA_ROOT)).await;
     Ok(())
 }
 
@@ -1043,5 +1153,182 @@ mod tests {
 
         handle.abort();
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ---------- этап 0: merge / flush / схема / время сделки ----------
+
+    fn trades_table(ts: &[i64], price: f64) -> Table {
+        let mut t = table([
+            ("ts", Col::new()), ("seq", Col::new()), ("is_buy", Col::new()),
+            ("price", Col::new()), ("size", Col::new()),
+        ]);
+        for (i, v) in ts.iter().enumerate() {
+            t[0].1.push(Cell::I(*v));
+            t[1].1.push(Cell::I(i as i64));
+            t[2].1.push(Cell::B(true));
+            t[3].1.push(Cell::F(price));
+            t[4].1.push(Cell::F(1.0));
+        }
+        t
+    }
+
+    fn i64s(t: &Table, name: &str) -> Vec<i64> {
+        col_i(t, name).expect("column").iter()
+            .map(|c| if let Cell::I(v) = c { *v } else { i64::MIN })
+            .collect()
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("marketdata_stage0_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("trades/linear")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn merge_rows_concatenates_values() {
+        let mut dst = trades_table(&[100, 200], 1.0);
+        let src = trades_table(&[300], 2.0);
+        merge_rows(&mut dst, src).unwrap();
+        assert_eq!(len(&dst), 3);
+        assert_eq!(i64s(&dst, "ts"), vec![100, 200, 300]);
+        // схема не размножилась
+        assert_eq!(dst.len(), 5);
+    }
+
+    #[test]
+    fn merge_rows_into_empty_takes_source() {
+        let mut dst: Table = Table::new();
+        merge_rows(&mut dst, trades_table(&[1, 2], 1.0)).unwrap();
+        assert_eq!(len(&dst), 2);
+        assert_eq!(dst.len(), 5);
+    }
+
+    #[test]
+    fn merge_rows_rejects_column_count_mismatch() {
+        let mut dst = trades_table(&[100], 1.0);
+        let src: Table = table([("ts", vec![Cell::I(1)]), ("other", vec![Cell::F(1.0)])]);
+        assert!(merge_rows(&mut dst, src).is_err());
+        assert_eq!(len(&dst), 1, "dst изменён при ошибке схемы");
+    }
+
+    #[test]
+    fn merge_rows_rejects_type_change() {
+        let mut dst = trades_table(&[100], 1.0);
+        let mut src = trades_table(&[200], 1.0);
+        src[3].1 = vec![Cell::I(5)]; // price: Float64 -> Int64
+        assert!(merge_rows(&mut dst, src).is_err());
+        assert_eq!(len(&dst), 1);
+    }
+
+    #[test]
+    fn append_table_sorts_and_keeps_all_rows() {
+        let dir = tmp_dir("append");
+        let path = dir.join("trades/linear/AAAUSDT/1970-01-01.parquet");
+        append_table(&path, &trades_table(&[300, 100], 1.0)).unwrap();
+        append_table(&path, &trades_table(&[200], 2.0)).unwrap();
+        let back = read_parquet(&path).unwrap();
+        assert_eq!(len(&back), 3);
+        assert_eq!(i64s(&back, "ts"), vec![100, 200, 300]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_table_refuses_schema_mismatch() {
+        let dir = tmp_dir("mismatch");
+        let path = dir.join("trades/linear/AAAUSDT/1970-01-01.parquet");
+        append_table(&path, &trades_table(&[100], 1.0)).unwrap();
+
+        // таблица другой формы (как liquidation) не должна затирать файл
+        let bad: Table = table([
+            ("ts", vec![Cell::I(200)]),
+            ("is_sell", vec![Cell::B(false)]),
+            ("price", vec![Cell::F(1.0)]),
+            ("size", vec![Cell::F(1.0)]),
+        ]);
+        assert!(append_table(&path, &bad).is_err());
+
+        let back = read_parquet(&path).unwrap();
+        assert_eq!(len(&back), 1, "строки потеряны при несовпадении схемы");
+        assert_eq!(i64s(&back, "ts"), vec![100]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trades_parse_uses_item_time() {
+        let msg = json!({
+            "topic": "publicTrade.BTCUSDT",
+            "ts": 1000,
+            "data": [
+                {"T": 111, "seq": 1, "S": "Buy", "p": "10", "v": "1"},
+                {"T": 222, "seq": 2, "S": "Sell", "p": "11", "v": "2"}
+            ]
+        });
+        let (_sym, t) = parse_message(Stream::Trades, &msg).unwrap();
+        assert_eq!(i64s(&t, "ts"), vec![111, 222]);
+    }
+
+    #[test]
+    fn trades_parse_falls_back_to_message_time() {
+        let msg = json!({
+            "topic": "publicTrade.BTCUSDT",
+            "ts": 1000,
+            "data": [{"seq": 1, "S": "Buy", "p": "10", "v": "1"}]
+        });
+        let (_sym, t) = parse_message(Stream::Trades, &msg).unwrap();
+        assert_eq!(i64s(&t, "ts"), vec![1000]);
+    }
+
+    #[test]
+    fn liquidation_parse_uses_item_time() {
+        let msg = json!({
+            "topic": "allLiquidation.ETHUSDT",
+            "ts": 5000,
+            "data": [{"T": 777, "S": "Sell", "p": "3000", "v": "1.0"}]
+        });
+        let (_sym, t) = parse_message(Stream::Liquidation, &msg).unwrap();
+        assert_eq!(i64s(&t, "ts"), vec![777]);
+    }
+
+    #[tokio::test]
+    async fn flush_loop_defers_until_channel_closes() {
+        let dir = tmp_dir("flush");
+        let (tx, rx) = mpsc::channel::<(String, Table)>(16);
+        let root = dir.clone();
+        let handle = tokio::spawn(async move { flush_loop(rx, &root).await });
+
+        tx.send(("trades/AAAUSDT".to_string(), trades_table(&[100], 1.0))).await.unwrap();
+        sleep(Duration::from_millis(200)).await;
+
+        let path = dir.join("trades/linear/AAAUSDT/1970-01-01.parquet");
+        // первый tick tokio::interval срабатывает сразу, поэтому проверяем
+        // только сохранность накопленного при закрытии канала.
+        drop(tx);
+        handle.await.unwrap();
+
+        let back = read_parquet(&path).unwrap();
+        assert_eq!(len(&back), 1, "накопленное потеряно при закрытии канала");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn flush_loop_merges_two_messages_of_one_symbol() {
+        let dir = tmp_dir("flushmerge");
+        let (tx, rx) = mpsc::channel::<(String, Table)>(16);
+        let root = dir.clone();
+        let handle = tokio::spawn(async move { flush_loop(rx, &root).await });
+
+        tx.send(("trades/AAAUSDT".to_string(), trades_table(&[100], 1.0))).await.unwrap();
+        tx.send(("trades/AAAUSDT".to_string(), trades_table(&[200, 300], 2.0))).await.unwrap();
+        sleep(Duration::from_millis(200)).await;
+        drop(tx);
+        handle.await.unwrap();
+
+        let path = dir.join("trades/linear/AAAUSDT/1970-01-01.parquet");
+        let back = read_parquet(&path).unwrap();
+        assert_eq!(len(&back), 3, "два сообщения одного символа не слились в строки");
+        assert_eq!(back.len(), 5, "дубли колонок при слиянии");
+        assert_eq!(i64s(&back, "ts"), vec![100, 200, 300]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -351,7 +352,7 @@ def get_data_status() -> dict:
             if not cat_dir.exists():
                 stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None}
                 continue
-            files = sorted(cat_dir.glob("*_1m.parquet"))
+            files = sorted(cat_dir.rglob("*.parquet"))
             if not files:
                 stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None}
                 continue
@@ -402,7 +403,7 @@ def get_data_status() -> dict:
             "total_files": sum(s["files"] for s in stats.values()),
             "total_size_mb": round(sum(s["total_size_mb"] for s in stats.values()), 1),
         }
-    return _cached("data_status", 60, _load)
+    return _cached("data_status", 300, _load)
 
 
 # ─── 10. Collector Market Data ─────────────────────────────────────
@@ -416,18 +417,22 @@ def get_market_data() -> dict:
             if not stream_dir.exists():
                 streams[stream] = {"count": 0, "status": "NO DATA"}
                 continue
-            files = list(stream_dir.glob("*.parquet"))
+            files = list(stream_dir.rglob("*.parquet"))
             newest_mtime = 0
-            total_records = 0
             for f in files:
                 mt = f.stat().st_mtime
                 if mt > newest_mtime:
                     newest_mtime = mt
+            # 100k+ daily partitions: metadata по всем файлам стоит секунды CPU.
+            # Оцениваем по выборке, точное число не нужно для статуса.
+            sample = files[:: max(1, len(files) // 50)][:50]
+            sampled = 0
+            for f in sample:
                 try:
-                    n = pl.scan_parquet(f).select(pl.len()).collect().item()
-                    total_records += n
+                    sampled += pq.ParquetFile(f).metadata.num_rows
                 except Exception:
                     pass
+            total_records = (sampled * len(files) // len(sample)) if sample else 0
 
             age = time.time() - newest_mtime if newest_mtime else float("inf")
             lag_min = round(age / 60, 1) if age < float("inf") else None
@@ -447,7 +452,7 @@ def get_market_data() -> dict:
             }
 
         return {"streams": streams}
-    return _cached("market_data", 60, _load)
+    return _cached("market_data", 600, _load)
 
 
 # ─── 13. Orderbook Captures ─────────────────────────────────────────
@@ -670,7 +675,7 @@ def get_candle_collector() -> dict:
                 stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
                 continue
             
-            files = sorted(cat_dir.glob("*_1m.parquet"))
+            files = sorted(cat_dir.rglob("*.parquet"))
             if not files:
                 stats[cat] = {"files": 0, "total_size_mb": 0, "newest": None, "oldest": None, "lag_min": None, "status": "NO DATA"}
                 continue
@@ -731,7 +736,7 @@ def get_candle_collector() -> dict:
             "total_files": total_files,
             "total_size_mb": round(total_size / 1e6, 1),
         }
-    return _cached("candle_collector", 60, _load)
+    return _cached("candle_collector", 300, _load)
 
 
 # ─── 17. Data Quality ──────────────────────────────────────────────
@@ -788,7 +793,7 @@ def get_data_quality() -> dict:
             cat_dir = RAW_KLINES_DIR / cat
             if not cat_dir.exists():
                 continue
-            files = sorted(cat_dir.glob("*_1m.parquet"),
+            files = sorted(cat_dir.rglob("*.parquet"),
                            key=lambda f: f.stat().st_mtime, reverse=True)[:50]
             for f in files:
                 try:
@@ -808,7 +813,7 @@ def get_data_quality() -> dict:
                     quality["klines"]["missing"] += 1
 
         return quality
-    return _cached("data_quality", 60, _load)
+    return _cached("data_quality", 300, _load)
 
 
 # ─── 18. Research Conclusion ───────────────────────────────────────

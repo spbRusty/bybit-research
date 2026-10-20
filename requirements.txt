@@ -3,3 +3,4 @@ numpy>=2.0
 scipy>=1.16
 fastapi>=0.110
 uvicorn>=0.30
+pyarrow>=15
