@@ -273,7 +273,7 @@ fn append_candles(category: &str, symbol: &str, new: &[Candle]) -> Result<()> {
     for c in new {
         by_month.entry(month_key(c.start)).or_default().push(c.clone());
     }
-    for (month, rows) in by_month {
+    for rows in by_month.into_values() {
         let path = part_path(category, symbol, rows[0].start);
         append_rows(&path, &rows)?;
     }
