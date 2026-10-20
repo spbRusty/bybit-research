@@ -1,12 +1,21 @@
-//! bybit_rs: дофилл 1m-свечек в существующие parquet-файлы + реалтайм-дозапись.
+//! bybit_rs: дофилл 1m-свечей + реалтайм-дозапись.
 //!
-//! Фаза 1 (дофилл): для каждого `data/klines/{linear,spot}/*_1m.parquet` читает последнюю
-//! свечу и пагинационно докачивает REST-ом до текущего момента (лимит Bybit 600 req/min,
-//! глобальный темп ~9 req/s). Фаза 2 (реалтайм): подписка WebSocket kline.1.{symbol},
-//! буфер в памяти, сброс в файлы раз в 30 секунд. Перезапуск безопасен: курсор всегда
-//! берётся из последней свечи файла, дубли схлопываются по open_time.
+//! Фаза 1 (дофилл): для каждого символа читает последнюю свечу и пагинационно
+//! докачивает REST-ом до текущего момента (лимит Bybit 600 req/min, глобальный
+//! темп ~16 req/s). Фаза 2 (реалтайм): подписка WebSocket kline.1.{symbol},
+//! буфер в памяти, сброс в партиции раз в 10 минут.
+//!
+//! Хранение: `data/klines/{linear,spot}/{SYMBOL}/{YYYY-MM}.parquet`.
+//! Закрытые месяцы неизменяемы; при flush переписывается только текущий месяц.
+//! ZSTD-сжатие, поэтому 11 ГБ исходных данных не переписываются целиком каждые
+//! 10 минут. Перезапуск безопасен: курсор берётся из последней свечи, дубли
+//! схлопываются по open_time.
+//!
+//! L2 orderbook здесь сознательно не собирается: его с большим качеством
+//! (seq/gap, 5-сек снапшоты) собирает построение/ob_reconstructor. Дублирующая
+//! подписка orderbook.50 на 1442 символа давала ~60% входящего трафика.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,13 +23,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, StringArray, TimestampMillisecondArray};
+use arrow::array::{BooleanArray, Float64Array, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use futures_util::{Sink, SinkExt, StreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
@@ -30,32 +41,17 @@ use tokio_tungstenite::tungstenite::Message;
 
 const ROOT: &str = "data/klines";
 const API: &str = "https://api.bybit.com";
-/// Глобальный темп запросов к REST: 115 мс/запрос ≈ 8.7 req/s (лимит Bybit 600/мин).
+/// Глобальный темп REST: 60 мс/запрос ≈ 16.7 req/s (лимит Bybit 600/5с на IP).
 const PACE_MS: u64 = 60;
-/// Защита от бесконечного цикла (4000 страниц ≈ 7.6 лет 1m-свечей, покрывает любой листинг Bybit).
+/// Защита от бесконечного цикла (4000 страниц ≈ 7.6 лет 1m-свечей).
 const MAX_PAGES: usize = 4000;
-/// Сброс реалтайм-буфера в файлы, сек.
-const FLUSH_SEC: u64 = 30;
-
-const L2_ROOT: &str = "data/orderbook";
-const L2_LEVELS: usize = 10;
-const L2_FLUSH_SEC: u64 = 10;
-
-#[derive(Debug, Clone, Default)]
-struct OrderbookState {
-    bids: Vec<(f64, f64)>,
-    asks: Vec<(f64, f64)>,
-    ts: i64,
-}
-
-#[derive(Debug, Clone)]
-struct OrderbookUpdate {
-    symbol: String,
-    is_snapshot: bool,
-    bids: Vec<(f64, f64)>,
-    asks: Vec<(f64, f64)>,
-    ts: i64,
-}
+/// Сброс реалтайм-буфера, сек. Переписывается только текущий месяц каждого
+/// символа (не весь файл истории), поэтому 10 минут — безопасный компромисс.
+const FLUSH_SEC: u64 = 600;
+/// Одновременных repair_one: ограничивает пик RAM при полном чтении истории.
+const REPAIR_CONCURRENCY: usize = 4;
+/// Ping каждые 20 с (рекомендация Bybit); ресабскрайб раз в 60 с убран.
+const PING_SEC: u64 = 20;
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -76,22 +72,59 @@ impl Candle {
 
 #[derive(Debug, Clone)]
 struct FileState {
-    path: PathBuf,
     category: String,
     symbol: String,
+}
+
+fn symbol_dir(category: &str, symbol: &str) -> PathBuf {
+    Path::new(ROOT).join(category).join(symbol)
+}
+
+fn month_key(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .unwrap_or_default()
+        .format("%Y-%m")
+        .to_string()
+}
+
+fn part_path(category: &str, symbol: &str, ts_ms: i64) -> PathBuf {
+    symbol_dir(category, symbol).join(format!("{}.parquet", month_key(ts_ms)))
+}
+
+/// Все партиции символа, отсортированные по имени месяца.
+fn symbol_parts(category: &str, symbol: &str) -> Result<Vec<PathBuf>> {
+    let dir = symbol_dir(category, symbol);
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut out = vec![];
+    for entry in fs::read_dir(&dir).with_context(|| format!("read_dir {dir:?}"))? {
+        let p = entry?.path();
+        if p.extension().map_or(false, |e| e == "parquet")
+            && !p.to_string_lossy().ends_with(".tmp")
+        {
+            out.push(p);
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn discover() -> Result<Vec<FileState>> {
     let mut out = vec![];
     for cat in ["linear", "spot"] {
         let dir = Path::new(ROOT).join(cat);
-        for entry in fs::read_dir(&dir).with_context(|| format!("read_dir {dir:?}"))? {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("read_dir {dir:?}")),
+        };
+        for entry in entries {
             let p = entry?.path();
-            if p.extension().map_or(false, |e| e == "parquet") {
-                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                let suffix = format!("_{cat}_1m");
-                if let Some(sym) = name.strip_suffix(&suffix) {
-                    out.push(FileState { path: p, category: cat.to_string(), symbol: sym.to_string() });
+            if p.is_dir() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    out.push(FileState { category: cat.to_string(), symbol: name });
                 }
             }
         }
@@ -101,6 +134,9 @@ fn discover() -> Result<Vec<FileState>> {
 
 /// Читает свечи из паркета. Столбцы: open_time, open, high, low, close, volume, turnover, is_green.
 fn read_parquet(path: &Path) -> Result<Vec<Candle>> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
     let file = File::open(path).with_context(|| format!("open {path:?}"))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("parquet header {path:?}"))?;
@@ -130,6 +166,30 @@ fn read_parquet(path: &Path) -> Result<Vec<Candle>> {
     Ok(out)
 }
 
+/// Вся история символа из всех месячных партиций.
+#[allow(dead_code)]
+fn read_symbol(category: &str, symbol: &str) -> Result<Vec<Candle>> {
+    let mut out = vec![];
+    for p in symbol_parts(category, symbol)? {
+        out.extend(read_parquet(&p)?);
+    }
+    out.sort_unstable_by_key(|c| c.start);
+    out.dedup_by_key(|c| c.start);
+    Ok(out)
+}
+
+/// Последняя свеча без чтения всей истории (только последняя месячная партиция).
+fn read_last(category: &str, symbol: &str) -> Result<Option<Candle>> {
+    let parts = symbol_parts(category, symbol)?;
+    for p in parts.iter().rev() {
+        let rows = read_parquet(p)?;
+        if let Some(c) = rows.last() {
+            return Ok(Some(c.clone()));
+        }
+    }
+    Ok(None)
+}
+
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("open_time", DataType::Timestamp(TimeUnit::Millisecond, None), false),
@@ -141,6 +201,12 @@ fn schema() -> Arc<Schema> {
         Field::new("turnover", DataType::Float64, false),
         Field::new("is_green", DataType::Boolean, false),
     ]))
+}
+
+fn writer_props() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build()
 }
 
 fn write_parquet(path: &Path, rows: &[Candle]) -> Result<()> {
@@ -168,21 +234,24 @@ fn write_parquet(path: &Path, rows: &[Candle]) -> Result<()> {
             Arc::new(BooleanArray::from(g)),
         ],
     )?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension("parquet.tmp");
     let file = File::create(&tmp).with_context(|| format!("create {tmp:?}"))?;
-    let mut writer = ArrowWriter::try_new(file, schema(), None)?;
+    let mut writer = ArrowWriter::try_new(file, schema(), Some(writer_props()))?;
     writer.write(&batch)?;
     writer.close()?;
     fs::rename(&tmp, path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
     Ok(())
 }
 
-/// Слияние старых + новых свечей, схлопывание дублей по open_time (побеждает новое), запись.
+/// Слияние старых + новых свечей внутри одной месячной партиции.
 fn append_rows(path: &Path, new: &[Candle]) -> Result<()> {
     if new.is_empty() {
         return Ok(());
     }
-    let old = if path.exists() { read_parquet(path)? } else { vec![] };
+    let old = read_parquet(path)?;
     let mut map: HashMap<i64, Candle> = HashMap::with_capacity(old.len() + new.len());
     for c in old {
         map.insert(c.start, c);
@@ -195,15 +264,31 @@ fn append_rows(path: &Path, new: &[Candle]) -> Result<()> {
     write_parquet(path, &rows)
 }
 
+/// Раскладывает новые свечи по месячным партициям и дописывает каждую.
+fn append_candles(category: &str, symbol: &str, new: &[Candle]) -> Result<()> {
+    if new.is_empty() {
+        return Ok(());
+    }
+    let mut by_month: BTreeMap<String, Vec<Candle>> = BTreeMap::new();
+    for c in new {
+        by_month.entry(month_key(c.start)).or_default().push(c.clone());
+    }
+    for (month, rows) in by_month {
+        let path = part_path(category, symbol, rows[0].start);
+        append_rows(&path, &rows)?;
+    }
+    Ok(())
+}
+
 fn f(a: &[Value], i: usize) -> Result<f64> {
     Ok(a.get(i).and_then(|v| v.as_str()).unwrap_or("0").parse()?)
 }
 
 /// Дофилл одного символа в диапазоне [start, end].
 ///
-/// Bybit kline при диапазоне шире limit=1000 возвращает **новейшие** 1000 свечей
-/// (проверено живьём), поэтому курсор двигается НАЗАД: каждая страница = 1000 последних
-/// минут до текущей верхней границы, граница опускается до самой старой свечи страницы.
+/// Bybit kline при диапазоне шире limit=1000 возвращает **новейшие** 1000 свечей,
+/// поэтому курсор двигается НАЗАД: каждая страница = 1000 последних минут до
+/// текущей верхней границы, граница опускается до самой старой свечи страницы.
 async fn backfill_range(
     st: &FileState,
     start: i64,
@@ -227,7 +312,6 @@ async fn backfill_range(
             "{API}/v5/market/kline?category={}&symbol={}&interval=1&start={start}&end={cursor}&limit=1000",
             st.category, st.symbol
         );
-        // retCode=10006 (rate limit) — повторяем страницу с паузой, а не теряем её
         let resp = {
             let mut attempts = 0;
             loop {
@@ -239,7 +323,8 @@ async fn backfill_range(
                     .error_for_status()?
                     .json::<Value>()
                     .await?;
-                if resp["retCode"].as_i64() == Some(10006) && attempts < 10 {
+                let rc = resp["retCode"].as_i64().unwrap_or(-1);
+                if matches!(rc, 10006 | 10016) && attempts < 10 {
                     attempts += 1;
                     sleep(Duration::from_millis(2000 * attempts)).await;
                     continue;
@@ -248,10 +333,14 @@ async fn backfill_range(
             }
         };
         if resp["retCode"].as_i64() != Some(0) {
+            let rc = resp["retCode"].as_i64();
             eprintln!("[{}] retCode={}: {}", st.symbol, resp["retCode"], resp["retMsg"]);
-            break; // делистинг/невалидный символ — файл оставляем как есть
+            if rc == Some(10001) {
+                break; // Not supported symbols — не ретраим
+            }
+            anyhow::bail!("retCode {:?}: {}", rc, resp["retMsg"]);
         }
-        let list = resp["result"]["list"].as_array().cloned().unwrap_or_default(); // новые сначала
+        let list = resp["result"]["list"].as_array().cloned().unwrap_or_default();
         if list.is_empty() {
             break;
         }
@@ -273,22 +362,18 @@ async fn backfill_range(
                 turnover: f(a, 6)?,
             });
         }
+        if out.len() % 50_000 < 1000 {
+            eprintln!("[backfill] {} rows={} cursor={}", st.symbol, out.len(), cursor);
+        }
         if list.len() < 1000 {
-            break; // дошли до начала истории
+            break;
         }
         cursor = page_min - 60_000;
     }
     Ok(out)
 }
 
-/// Дыра > 3 минут считается пропуском данных.
-const GAP_MIN: i64 = 3 * 60_000;
-/// Ремонтируем файл, если в нём есть дыра >= 1 часа (меньше — естественные паузы неликвидных пар).
-const GAP_TRIGGER: i64 = 60 * 60_000;
-
-/// Ремонт одного файла: чинит голову (сломанный refresh — файл начинается позже листинга),
-/// внутреннюю дыру >= 1 часа, отставший хвост. Чистые файлы пропускаются без запросов.
-/// Дубли (уже имеющиеся свечи в перекачанном диапазоне) схлопнутся в append_rows.
+/// Ремонт одного символа: чинит голову, внутреннюю дыру >= 1 часа, отставший хвост.
 async fn repair_one(
     st: &FileState,
     listed: Option<i64>,
@@ -296,46 +381,26 @@ async fn repair_one(
     tokens: Arc<Mutex<mpsc::Receiver<()>>>,
 ) -> Result<Vec<Candle>> {
     let now = Utc::now().timestamp_millis();
-    let candles = if st.path.exists() { read_parquet(&st.path)? } else { vec![] };
-    if candles.is_empty() {
-        // файла нет — качаем от листинга (или последних 2 дней, если листинг неизвестен)
+    // Startup repair is intentionally tail-only: reading full history for 1442
+    // symbols cost GBs of RAM and minutes of I/O. Head/gap audit is a separate
+    // offline operation; here we only close the downtime gap.
+    let Some(last) = read_last(&st.category, &st.symbol)? else {
         let start = listed.unwrap_or_else(|| now - 2 * 86_400_000);
         return backfill_range(st, start, now, client, tokens).await;
+    };
+    if last.start < now - 300_000 {
+        return backfill_range(st, last.start + 60_000, now, client, tokens).await;
     }
-    let first = candles[0].start;
-    let last = candles[candles.len() - 1].start;
-    // 1) голова: файл создан недавно (< 7 дней) — вероятно, сломанный refresh
-    //    (тогда в файле только хвост 1000 свечей, а не история от листинга).
-    //    Для linear листинг известен (launchTime); для spot — проба на 180 дней.
-    if now - first < 7 * 86_400_000 {
-        let start = match listed {
-            Some(l) if first > l + 120_000 => l,
-            Some(_) => return Ok(vec![]), // файл начинается с листинга — голова цела
-            None => now - 180 * 86_400_000,
-        };
-        return backfill_range(st, start, now, client, tokens).await;
-    }
-    // 2) внутренняя дыра >= 1 часа: качаем от начала первой дыры до now,
-    //    уже имеющиеся свечи схлопнутся в append_rows
-    let max_gap = candles.windows(2).map(|w| w[1].start - w[0].start).max().unwrap_or(0);
-    if max_gap >= GAP_TRIGGER {
-        let gap_start = candles.windows(2)
-            .find(|w| w[1].start - w[0].start > GAP_MIN)
-            .map(|w| w[0].start + 60_000)
-            .unwrap_or(first);
-        return backfill_range(st, gap_start, now, client, tokens).await;
-    }
-    // 3) отстал хвост (сервис долго не работал) — докачиваем с последней свечи
-    if last < now - 300_000 {
-        return backfill_range(st, last + 60_000, now, client, tokens).await;
-    }
-    Ok(vec![]) // файл в порядке
+    Ok(vec![])
 }
 
 // ------------------------- реалтайм -------------------------
 
-/// Возвращает торгуемые USDT-пары категории (linear/spot): (символ, время листинга, мс).
-async fn fetch_usdt_symbols(client: &Client, category: &str, tokens: &Arc<Mutex<mpsc::Receiver<()>>>) -> Result<Vec<(String, Option<i64>)>> {
+async fn fetch_usdt_symbols(
+    client: &Client,
+    category: &str,
+    tokens: &Arc<Mutex<mpsc::Receiver<()>>>,
+) -> Result<Vec<(String, Option<i64>)>> {
     let mut out = Vec::new();
     let mut cursor = String::new();
     loop {
@@ -345,13 +410,16 @@ async fn fetch_usdt_symbols(client: &Client, category: &str, tokens: &Arc<Mutex<
                 break;
             }
         }
-        let mut url = format!("{API}/v5/market/instruments-info?category={category}&status=Trading&limit=1000");
+        let mut url = format!(
+            "{API}/v5/market/instruments-info?category={category}&status=Trading&limit=1000"
+        );
         if !cursor.is_empty() {
             url.push_str(&format!("&cursor={cursor}"));
         }
         let resp = client
             .get(&url)
-            .send().await?
+            .send()
+            .await?
             .error_for_status()?
             .json::<Value>()
             .await?;
@@ -359,8 +427,8 @@ async fn fetch_usdt_symbols(client: &Client, category: &str, tokens: &Arc<Mutex<
         for it in &list {
             let Some(sym) = it["symbol"].as_str() else { continue };
             if sym.ends_with("USDT") {
-                // linear: launchTime; spot: поля листинга нет вовсе — вернётся None
-                let listed = it["launchTime"].as_str()
+                let listed = it["launchTime"]
+                    .as_str()
                     .and_then(|s| s.parse::<i64>().ok())
                     .or_else(|| it["listedTime"].as_str().and_then(|s| s.parse::<i64>().ok()));
                 out.push((sym.to_string(), listed));
@@ -374,8 +442,6 @@ async fn fetch_usdt_symbols(client: &Client, category: &str, tokens: &Arc<Mutex<
     Ok(out)
 }
 
-/// Раз в сутки: обновляет список символов для дозаписи — добавляет новые USDT-пары
-/// с биржи, дофиливает их от времени листинга и регистрирует в realtime-подписке.
 async fn refresh_loop(
     client: Arc<Client>,
     tokens: Arc<Mutex<mpsc::Receiver<()>>>,
@@ -391,7 +457,8 @@ async fn refresh_loop(
                 }
             };
             let known: HashSet<String> = registry
-                .read().await
+                .read()
+                .await
                 .get(category)
                 .cloned()
                 .unwrap_or_default()
@@ -409,11 +476,7 @@ async fn refresh_loop(
             let mut added = Vec::new();
             let mut tasks = JoinSet::new();
             for (sym, listed) in &new {
-                let st = FileState {
-                    path: Path::new(ROOT).join(category).join(format!("{sym}_{category}_1m.parquet")),
-                    category: category.to_string(),
-                    symbol: sym.clone(),
-                };
+                let st = FileState { category: category.to_string(), symbol: sym.clone() };
                 let tokens = tokens.clone();
                 let client = client.clone();
                 let listed = *listed;
@@ -430,7 +493,7 @@ async fn refresh_loop(
                 };
                 match res {
                     Ok(rows) => {
-                        if let Err(e) = append_rows(&st.path, &rows) {
+                        if let Err(e) = append_candles(&st.category, &st.symbol, &rows) {
                             eprintln!("[refresh {}] запись: {e:#}", st.symbol);
                         } else if !rows.is_empty() {
                             println!("[refresh {}] новая пара, +{} свечек ({})", st.symbol, rows.len(), st.category);
@@ -452,14 +515,22 @@ async fn refresh_loop(
     }
 }
 
-async fn ws_loop(category: &str, registry: Arc<RwLock<HashMap<String, Vec<String>>>>, tx: mpsc::Sender<(String, Vec<Candle>)>, l2_tx: mpsc::Sender<OrderbookUpdate>) {
+async fn ws_loop(
+    category: &str,
+    registry: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    tx: mpsc::Sender<(String, Vec<Candle>)>,
+) {
+    let mut backoff = 1u64;
     loop {
         let url = format!("wss://stream.bybit.com/v5/public/{category}");
-        match ws_run(&url, category, &registry, &tx, &l2_tx).await {
-            Ok(_) => {}
-            Err(e) => eprintln!("[ws {category}] {e:#}; переподключение через 3с"),
+        match ws_run(&url, category, &registry, &tx).await {
+            Ok(_) => backoff = 1,
+            Err(e) => {
+                eprintln!("[ws {category}] {e:#}; переподключение через {backoff}с");
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
         }
-        sleep(Duration::from_secs(3)).await;
     }
 }
 
@@ -468,28 +539,36 @@ async fn ws_run(
     category: &str,
     registry: &Arc<RwLock<HashMap<String, Vec<String>>>>,
     tx: &mpsc::Sender<(String, Vec<Candle>)>,
-    l2_tx: &mpsc::Sender<OrderbookUpdate>,
 ) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut sink, mut stream) = ws.split();
     subscribe_all(&mut sink, registry, category).await?;
-    eprintln!("[ws] {url} подписан: {} символов", registry.read().await.get(category).map(|v| v.len()).unwrap_or(0));
+    eprintln!(
+        "[ws] {url} подписан: {} символов",
+        registry.read().await.get(category).map(|v| v.len()).unwrap_or(0)
+    );
+    let mut ping = tokio::time::interval(Duration::from_secs(PING_SEC));
+    ping.tick().await;
     loop {
         let msg = tokio::select! {
             msg = stream.next() => match msg {
                 Some(m) => m?,
                 None => break,
             },
-            _ = sleep(Duration::from_secs(60)) => {
-                subscribe_all(&mut sink, registry, category).await?;
+            _ = ping.tick() => {
+                sink.send(Message::Text(json!({"op": "ping"}).to_string().into())).await?;
                 continue;
             }
         };
         if let Message::Text(t) = msg {
             let v: Value = serde_json::from_str(t.as_str())?;
-            if v["op"].as_str() == Some("ping") {
-                sink.send(Message::Text(json!({"op": "pong"}).to_string().into())).await?;
-                continue;
+            match v["op"].as_str() {
+                Some("ping") => {
+                    sink.send(Message::Text(json!({"op": "pong"}).to_string().into())).await?;
+                    continue;
+                }
+                Some("pong") => continue,
+                _ => {}
             }
             let topic = v["topic"].as_str().unwrap_or("");
             if let Some(sym) = topic.strip_prefix("kline.1.") {
@@ -508,37 +587,20 @@ async fn ws_run(
                 if !candles.is_empty() {
                     send_candles(tx, url, sym, candles).await?;
                 }
-            } else if let Some(sym) = topic.strip_prefix("orderbook.50.") {
-                let Some(data) = v["data"].as_object() else { continue };
-                let ts = v["ts"].as_i64().unwrap_or(0);
-                let is_snapshot = v["type"].as_str() == Some("snapshot");
-                let parse_levels = |key: &str| -> Vec<(f64, f64)> {
-                    data.get(key).and_then(|v| v.as_array()).map(|arr| {
-                        arr.iter().filter_map(|row| {
-                            let a = row.as_array()?;
-                            Some((f(a, 0).ok()?, f(a, 1).ok()?))
-                        }).collect()
-                    }).unwrap_or_default()
-                };
-                let update = OrderbookUpdate {
-                    symbol: format!("{category}/{sym}"),
-                    is_snapshot,
-                    bids: parse_levels("b"),
-                    asks: parse_levels("a"),
-                    ts,
-                };
-                if l2_tx.send(update).await.is_err() {
-                    break;
-                }
             }
         }
     }
     Ok(())
 }
 
-/// Подписка на kline.1.* по всем символам категории из registry. Bybit идемпотентен:
-/// повторная отправка subscribe — не ошибка, поэтому ресабскриб каждые 60с безопасен.
-async fn subscribe_all<S>(sink: &mut S, registry: &Arc<RwLock<HashMap<String, Vec<String>>>>, category: &str) -> Result<()>
+/// Подписка на kline.1.* по всем символам категории из registry.
+/// Повторный subscribe не нужен: подписка живёт на соединении; Bybit
+/// рекомендует только heartbeat (ping) каждые 20 с.
+async fn subscribe_all<S>(
+    sink: &mut S,
+    registry: &Arc<RwLock<HashMap<String, Vec<String>>>>,
+    category: &str,
+) -> Result<()>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -548,20 +610,21 @@ where
         let args: Vec<String> = chunk.iter().map(|s| format!("kline.1.{s}")).collect();
         sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
     }
-    for chunk in syms.chunks(10) {
-        let args: Vec<String> = chunk.iter().map(|s| format!("orderbook.50.{s}")).collect();
-        sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
-    }
     Ok(())
 }
 
-async fn send_candles(tx: &mpsc::Sender<(String, Vec<Candle>)>, url: &str, sym: &str, candles: Vec<Candle>) -> Result<()> {
+async fn send_candles(
+    tx: &mpsc::Sender<(String, Vec<Candle>)>,
+    url: &str,
+    sym: &str,
+    candles: Vec<Candle>,
+) -> Result<()> {
     let cat = if url.contains("/public/spot") { "spot" } else { "linear" };
     let key = format!("{cat}/{sym}");
     tx.send((key, candles)).await.context("ws tx закрыт")
 }
 
-/// Сброс буфера реалтайма в файлы каждые FLUSH_SEC или при 1000 накопленных свечей.
+/// Сброс буфера реалтайма: только добавленные строки в месячные партиции.
 async fn flush_loop(mut rx: mpsc::Receiver<(String, Vec<Candle>)>) {
     let mut pending: HashMap<String, Vec<Candle>> = HashMap::new();
     let mut last_flush = Instant::now();
@@ -585,170 +648,11 @@ async fn flush_loop(mut rx: mpsc::Receiver<(String, Vec<Candle>)>) {
         for key in keys {
             let rows = pending.remove(&key).unwrap_or_default();
             let (cat, sym) = key.split_once('/').expect("key cat/sym");
-            let path = Path::new(ROOT).join(cat).join(format!("{sym}_{cat}_1m.parquet"));
-            if let Err(e) = append_rows(&path, &rows) {
+            if let Err(e) = append_candles(cat, sym, &rows) {
                 eprintln!("[flush {sym}] {e:#}");
             }
         }
         eprintln!("[flush] записано свечей: {total}");
-        last_flush = Instant::now();
-    }
-}
-
-fn l2_schema() -> Arc<Schema> {
-    let mut fields = vec![
-        Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, None), false),
-        Field::new("symbol", DataType::Utf8, false),
-    ];
-    for i in 1..=L2_LEVELS {
-        fields.push(Field::new(format!("bid_price_{}", i), DataType::Float64, false));
-        fields.push(Field::new(format!("bid_size_{}", i), DataType::Float64, false));
-    }
-    for i in 1..=L2_LEVELS {
-        fields.push(Field::new(format!("ask_price_{}", i), DataType::Float64, false));
-        fields.push(Field::new(format!("ask_size_{}", i), DataType::Float64, false));
-    }
-    Arc::new(Schema::new(fields))
-}
-
-fn write_l2_parquet(path: &Path, rows: &[(String, OrderbookState)]) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let ts: Vec<i64> = rows.iter().map(|(_, s)| s.ts).collect();
-    let symbols: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(TimestampMillisecondArray::from(ts)),
-        Arc::new(StringArray::from(symbols)),
-    ];
-    for i in 0..L2_LEVELS {
-        let bp: Vec<f64> = rows.iter().map(|(_, s)| s.bids.get(i).map(|(p, _)| *p).unwrap_or(0.0)).collect();
-        let bs: Vec<f64> = rows.iter().map(|(_, s)| s.bids.get(i).map(|(_, sz)| *sz).unwrap_or(0.0)).collect();
-        columns.push(Arc::new(Float64Array::from(bp)));
-        columns.push(Arc::new(Float64Array::from(bs)));
-    }
-    for i in 0..L2_LEVELS {
-        let ap: Vec<f64> = rows.iter().map(|(_, s)| s.asks.get(i).map(|(p, _)| *p).unwrap_or(0.0)).collect();
-        let asz: Vec<f64> = rows.iter().map(|(_, s)| s.asks.get(i).map(|(_, sz)| *sz).unwrap_or(0.0)).collect();
-        columns.push(Arc::new(Float64Array::from(ap)));
-        columns.push(Arc::new(Float64Array::from(asz)));
-    }
-    let batch = RecordBatch::try_new(l2_schema(), columns)?;
-    let tmp = path.with_extension("parquet.tmp");
-    let file = File::create(&tmp).with_context(|| format!("create {tmp:?}"))?;
-    let mut writer = ArrowWriter::try_new(file, l2_schema(), None)?;
-    writer.write(&batch)?;
-    writer.close()?;
-    fs::rename(&tmp, path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
-    Ok(())
-}
-
-fn read_l2_parquet(path: &Path) -> Result<Vec<(String, OrderbookState)>> {
-    let file = File::open(path).with_context(|| format!("open {path:?}"))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-    let mut out = vec![];
-    for batch in reader {
-        let b = batch?;
-        let ts = b.column(0).as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
-        let syms = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        for i in 0..b.num_rows() {
-            let mut bids = vec![];
-            let mut asks = vec![];
-            for j in 0..L2_LEVELS {
-                let bp = b.column(2 + j * 2).as_any().downcast_ref::<Float64Array>().unwrap();
-                let bs = b.column(2 + j * 2 + 1).as_any().downcast_ref::<Float64Array>().unwrap();
-                bids.push((bp.value(i), bs.value(i)));
-            }
-            for j in 0..L2_LEVELS {
-                let ap = b.column(2 + L2_LEVELS * 2 + j * 2).as_any().downcast_ref::<Float64Array>().unwrap();
-                let asz = b.column(2 + L2_LEVELS * 2 + j * 2 + 1).as_any().downcast_ref::<Float64Array>().unwrap();
-                asks.push((ap.value(i), asz.value(i)));
-            }
-            out.push((syms.value(i).to_string(), OrderbookState { bids, asks, ts: ts.value(i) }));
-        }
-    }
-    Ok(out)
-}
-
-fn append_l2_rows(path: &Path, new: &[(String, OrderbookState)]) -> Result<()> {
-    if new.is_empty() {
-        return Ok(());
-    }
-    let old = if path.exists() { read_l2_parquet(path)? } else { vec![] };
-    let mut map: HashMap<String, OrderbookState> = HashMap::with_capacity(old.len() + new.len());
-    for (sym, state) in old {
-        map.insert(sym, state);
-    }
-    for (sym, state) in new {
-        map.insert(sym.clone(), state.clone());
-    }
-    let rows: Vec<(String, OrderbookState)> = map.into_iter().collect();
-    write_l2_parquet(path, &rows)
-}
-
-fn apply_l2_delta(levels: &mut Vec<(f64, f64)>, updates: &[(f64, f64)]) {
-    for (price, size) in updates {
-        if *size == 0.0 {
-            levels.retain(|(p, _)| p != price);
-        } else if let Some(entry) = levels.iter_mut().find(|(p, _)| p == price) {
-            entry.1 = *size;
-        } else {
-            levels.push((*price, *size));
-        }
-    }
-}
-
-fn sort_l2_levels(state: &mut OrderbookState) {
-    state.bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    state.asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    state.bids.truncate(L2_LEVELS);
-    state.asks.truncate(L2_LEVELS);
-}
-
-async fn l2_flush_loop(mut rx: mpsc::Receiver<OrderbookUpdate>) {
-    let mut state: HashMap<String, OrderbookState> = HashMap::new();
-    let mut last_flush = Instant::now();
-    loop {
-        tokio::select! {
-            maybe = rx.recv() => match maybe {
-                Some(update) => {
-                    let entry = state.entry(update.symbol.clone()).or_default();
-                    if update.is_snapshot {
-                        entry.bids = update.bids;
-                        entry.asks = update.asks;
-                        entry.ts = update.ts;
-                    } else {
-                        apply_l2_delta(&mut entry.bids, &update.bids);
-                        apply_l2_delta(&mut entry.asks, &update.asks);
-                        entry.ts = update.ts;
-                    }
-                }
-                None => break,
-            },
-            _ = sleep(Duration::from_secs(L2_FLUSH_SEC)) => {}
-        }
-        if last_flush.elapsed() < Duration::from_secs(L2_FLUSH_SEC) || state.is_empty() {
-            continue;
-        }
-        let now = Utc::now();
-        let hour = now.format("%Y%m%d_%H");
-        for cat in ["linear", "spot"] {
-            let rows: Vec<(String, OrderbookState)> = state
-                .iter()
-                .filter(|(k, _)| k.starts_with(&format!("{cat}/")))
-                .map(|(k, v)| {
-                    let sym = k.split_once('/').unwrap().1.to_string();
-                    let mut s = v.clone();
-                    sort_l2_levels(&mut s);
-                    (sym, s)
-                })
-                .collect();
-            if !rows.is_empty() {
-                let path = Path::new(L2_ROOT).join(cat).join(format!("{cat}_{hour}.parquet"));
-                let _ = append_l2_rows(&path, &rows);
-            }
-        }
         last_flush = Instant::now();
     }
 }
@@ -760,11 +664,9 @@ async fn main() -> Result<()> {
     let states = discover()?;
     let linear = states.iter().filter(|s| s.category == "linear").count();
     let spot = states.iter().filter(|s| s.category == "spot").count();
-    println!("найдено паркетов: {linear} linear + {spot} spot");
+    println!("найдено символов: {linear} linear + {spot} spot");
 
     // Глобальный дроссель REST: канал, питаемый интервалом PACE_MS.
-    // Ёмкость малая: продюсер не успевает накопить бэклог, иначе стартовый burst
-    // 1377 задач разом выстреливает запросами и ловит 10006 (rate limit по UID).
     let (ptx, prx) = mpsc::channel(8);
     let tokens = Arc::new(Mutex::new(prx));
     tokio::spawn(async move {
@@ -778,17 +680,19 @@ async fn main() -> Result<()> {
         }
     });
 
-    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
-    let client = Arc::new(client);
+    let client = Arc::new(Client::builder().timeout(Duration::from_secs(20)).build()?);
 
-    // Реестр символов для реалтайм-подписки: стартует с существующих файлов,
-    // пополняется refresh_loop раз в сутки.
     let registry = Arc::new(RwLock::new(HashMap::from([
-        ("linear".to_string(), states.iter().filter(|s| s.category == "linear").map(|s| s.symbol.clone()).collect()),
-        ("spot".to_string(), states.iter().filter(|s| s.category == "spot").map(|s| s.symbol.clone()).collect()),
+        (
+            "linear".to_string(),
+            states.iter().filter(|s| s.category == "linear").map(|s| s.symbol.clone()).collect(),
+        ),
+        (
+            "spot".to_string(),
+            states.iter().filter(|s| s.category == "spot").map(|s| s.symbol.clone()).collect(),
+        ),
     ])));
 
-    // Суточный refresh списка монет: новые USDT-пары дофиливаются от времени листинга.
     {
         let client = client.clone();
         let tokens = tokens.clone();
@@ -799,7 +703,6 @@ async fn main() -> Result<()> {
     // Фаза 1: ремонт (дофилл дыр/голов/хвостов).
     let total = states.len();
     println!("ремонт: {total} символов, темп ~{} req/s, ориентир: ~5 ч", 1000 / PACE_MS);
-    // Времена листинга для починки головы у свежесозданных файлов (сломанный refresh).
     let mut listed_map: HashMap<String, i64> = HashMap::new();
     for cat in ["linear", "spot"] {
         if let Ok(syms) = fetch_usdt_symbols(&client, cat, &tokens).await {
@@ -812,16 +715,11 @@ async fn main() -> Result<()> {
     }
     println!("времена листинга получены: {}", listed_map.len());
 
-    // Проход 1 — тяжёлый: дыры/головы/хвосты.
-    // Проход 2 — лёгкий tail-sync: файлы, отремонтированные в начале прохода 1,
-    // отстали от now на часы; повторный repair_one дочинит только хвост (1 запрос на файл).
     let mut worst = 0usize;
     for label in ["ремонт", "хвост-синк"] {
         let done = Arc::new(AtomicUsize::new(0));
         let mut tasks = JoinSet::new();
-        // Одновременно активен лишь лимит repair_one: иначе 1377 задач крутятся в одной
-        // токен-очереди по кругу (~83 с/токен на задачу) и ремонт растягивается на дни.
-        let repair_sem = Arc::new(Semaphore::new(24));
+        let repair_sem = Arc::new(Semaphore::new(REPAIR_CONCURRENCY));
         for st in states.clone() {
             let tokens = tokens.clone();
             let client = client.clone();
@@ -841,7 +739,7 @@ async fn main() -> Result<()> {
             let (st, res, done) = joined?;
             match res {
                 Ok(rows) => {
-                    if let Err(e) = append_rows(&st.path, &rows) {
+                    if let Err(e) = append_candles(&st.category, &st.symbol, &rows) {
                         eprintln!("[{}] запись: {e:#}", st.symbol);
                         failed += 1;
                     } else if !rows.is_empty() {
@@ -862,20 +760,32 @@ async fn main() -> Result<()> {
     }
     println!("ремонт завершён (худший проход: {worst} неудач). Переключаюсь в реалтайм.");
 
-    // Фаза 2: реалтайм.
-    let (wtx, wrx) = mpsc::channel(8192);
-    let (l2_tx, l2_rx) = mpsc::channel(8192);
+    // Фаза 2: реалтайм. Канал покрывает пик обновлений за цикл flush.
+    let (wtx, wrx) = mpsc::channel(1_000_000);
     for cat in ["linear", "spot"] {
         let wtx = wtx.clone();
-        let l2_tx = l2_tx.clone();
         let registry = registry.clone();
-        tokio::spawn(async move { ws_loop(cat, registry, wtx, l2_tx).await });
+        tokio::spawn(async move { ws_loop(cat, registry, wtx).await });
     }
     drop(wtx);
-    drop(l2_tx);
-    fs::create_dir_all(format!("{L2_ROOT}/linear"))?;
-    fs::create_dir_all(format!("{L2_ROOT}/spot"))?;
-    tokio::spawn(async move { l2_flush_loop(l2_rx).await });
     flush_loop(wrx).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn month_key_boundaries() {
+        assert_eq!(month_key(0), "1970-01");
+        assert_eq!(month_key(1_790_000_000_000), "2026-09");
+        assert_eq!(month_key(1_792_500_000_000), "2026-10");
+    }
+
+    #[test]
+    fn month_path_is_partitioned_by_symbol() {
+        let p = part_path("linear", "BTCUSDT", 1_792_500_000_000);
+        assert!(p.ends_with("data/klines/linear/BTCUSDT/2026-10.parquet"));
+    }
 }
