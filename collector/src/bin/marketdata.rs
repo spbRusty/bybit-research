@@ -49,6 +49,16 @@ const DATA_ROOT: &str = "data/market";
 const TRIGGERS_DIR: &str = "data/triggers";
 const CAPTURES_DIR: &str = "data/market/orderbook/captures";
 
+/// Локальный WS-прокси с permessage-deflate; при отсутствии env — прямой Bybit.
+fn ws_url(category: &str) -> String {
+    match std::env::var("BYBIT_WS_PROXY") {
+        Ok(p) if !p.trim().is_empty() => {
+            format!("{}/{}", p.trim().trim_end_matches('/'), category)
+        }
+        _ => format!("wss://stream.bybit.com/v5/public/{category}"),
+    }
+}
+
 
 /// Один элемент столбца.
 #[derive(Debug, Clone)]
@@ -354,8 +364,8 @@ where S: Sink<Message> + Unpin, S::Error: std::error::Error + Send + Sync + 'sta
 async fn ws_loop(stream: Stream, syms: Arc<Vec<String>>, tx: mpsc::Sender<(String, Table)>) {
     let mut backoff = 1u64;
     loop {
-        let url = "wss://stream.bybit.com/v5/public/linear";
-        match ws_run(stream, url, &syms, &tx).await {
+        let url = ws_url("linear");
+        match ws_run(stream, &url, &syms, &tx).await {
             Ok(()) => { backoff = 1; }
             Err(e) => {
                 eprintln!("[ws {}] {e:#}; переподключение через {backoff}с", stream.dir());
@@ -655,8 +665,8 @@ async fn ob_capture_once(
     tx: &mpsc::Sender<(String, Table)>,
     deadline: &std::time::Instant,
 ) -> Result<()> {
-    let url = "wss://stream.bybit.com/v5/public/linear";
-    let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+    let url = ws_url("linear");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
     let (mut sink, mut stream_ws) = ws.split();
 
     // Подписываемся на orderbook

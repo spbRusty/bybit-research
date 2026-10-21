@@ -16,7 +16,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 use collector_lib::book_state::{BookState, LevelSnapshot, ReconstructedSnapshot, SNAPSHOT_LEVELS};
 
-const WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
+/// Локальный WS-прокси с permessage-deflate; при отсутствии env — прямой Bybit.
+fn ws_url() -> String {
+    match std::env::var("BYBIT_WS_PROXY") {
+        Ok(p) if !p.trim().is_empty() => format!("{}/linear", p.trim().trim_end_matches('/')),
+        _ => "wss://stream.bybit.com/v5/public/linear".to_string(),
+    }
+}
 const SUB_CHUNK: usize = 100; // символов на одно WS-соединение, как в marketdata.rs
 const DEFAULT_FREQ: u64 = 5;
 const DEFAULT_DATA_ROOT: &str = "data/market/orderbook/reconstructed";
@@ -606,7 +612,7 @@ async fn ws_batch(symbols: Vec<String>, tx: mpsc::Sender<ObMsg>, shutdown: Arc<A
 
 async fn ws_run(symbols: &[String], tx: &mpsc::Sender<ObMsg>, shutdown: &Arc<AtomicBool>) -> Result<()> {
     let topics: Vec<String> = symbols.iter().map(|s| format!("orderbook.50.{s}")).collect();
-    let (ws, _) = tokio_tungstenite::connect_async(WS_URL).await?;
+    let (ws, _) = tokio_tungstenite::connect_async(&ws_url()).await?;
     let (mut sink, mut stream) = ws.split();
     for chunk in topics.chunks(SUB_CHUNK) {
         let sub = serde_json::json!({"op": "subscribe", "args": chunk});

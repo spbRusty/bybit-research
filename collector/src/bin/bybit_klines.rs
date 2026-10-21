@@ -52,6 +52,15 @@ const FLUSH_SEC: u64 = 600;
 const REPAIR_CONCURRENCY: usize = 4;
 /// Ping каждые 20 с (рекомендация Bybit); ресабскрайб раз в 60 с убран.
 const PING_SEC: u64 = 20;
+/// Локальный WS-прокси с permessage-deflate; при отсутствии env — прямой Bybit.
+fn ws_url(category: &str) -> String {
+    match std::env::var("BYBIT_WS_PROXY") {
+        Ok(p) if !p.trim().is_empty() => {
+            format!("{}/{}", p.trim().trim_end_matches('/'), category)
+        }
+        _ => format!("wss://stream.bybit.com/v5/public/{category}"),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -522,7 +531,7 @@ async fn ws_loop(
 ) {
     let mut backoff = 1u64;
     loop {
-        let url = format!("wss://stream.bybit.com/v5/public/{category}");
+        let url = ws_url(category);
         match ws_run(&url, category, &registry, &tx).await {
             Ok(_) => backoff = 1,
             Err(e) => {
@@ -619,7 +628,11 @@ async fn send_candles(
     sym: &str,
     candles: Vec<Candle>,
 ) -> Result<()> {
-    let cat = if url.contains("/public/spot") { "spot" } else { "linear" };
+    let cat = if url.contains("/public/spot") || url.trim_end_matches('/').ends_with("/spot") {
+        "spot"
+    } else {
+        "linear"
+    };
     let key = format!("{cat}/{sym}");
     tx.send((key, candles)).await.context("ws tx закрыт")
 }

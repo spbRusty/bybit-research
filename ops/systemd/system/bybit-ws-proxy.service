@@ -1,0 +1,18 @@
+[Unit]
+Description=Bybit WebSocket permessage-deflate proxy (localhost)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vlad
+Group=vlad
+WorkingDirectory=/home/vlad/Документы/построение/ops/ws-proxy
+ExecStart=/usr/local/bin/node proxy.js
+Restart=always
+RestartSec=2
+Environment=NODE_ENV=production
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

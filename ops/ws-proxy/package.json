@@ -1,0 +1,12 @@
+{
+  "name": "bybit-ws-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local WS proxy: Bybit permessage-deflate -> uncompressed localhost",
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "scripts": {
+    "start": "node proxy.js"
+  }
+}

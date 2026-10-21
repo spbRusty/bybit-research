@@ -12,6 +12,7 @@ RestartSec=5
 StandardOutput=append:/home/vlad/Документы/построение/collector/logs/ob_reconstructor.log
 StandardError=append:/home/vlad/Документы/построение/collector/logs/ob_reconstructor.log
 Environment=MALLOC_ARENA_MAX=2
+Environment=BYBIT_WS_PROXY=ws://127.0.0.1:8765
 NoNewPrivileges=true
 
 [Install]

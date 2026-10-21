@@ -15,6 +15,7 @@ StandardOutput=append:/home/vlad/Документы/построение/collect
 StandardError=append:/home/vlad/Документы/построение/collector/logs/bybit_klines.log
 Environment=MALLOC_ARENA_MAX=2
 MemoryMax=16G
+Environment=BYBIT_WS_PROXY=ws://127.0.0.1:8765
 NoNewPrivileges=true
 
 [Install]
