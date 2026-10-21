@@ -139,7 +139,7 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 
 <script>
 const API = '/api';
-let countdown = 3;
+let countdown = 15;
 let sseActive = false;
 const _prev = {};
 
@@ -571,7 +571,7 @@ async function refreshAll() {
     renderSysStatus(), renderResearchController(), renderLiveData()
   ]);
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
-  countdown = 3;
+  countdown = 15;
 }
 
 setInterval(() => {

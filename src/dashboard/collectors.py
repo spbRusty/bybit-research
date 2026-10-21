@@ -73,6 +73,10 @@ def _load_toml(name: str) -> dict:
 # ─── 1. Paper Trading ──────────────────────────────────────────────
 
 def get_paper() -> dict:
+    return _cached("paper", 60, _get_paper)
+
+
+def _get_paper() -> dict:
     from config.settings import load_toml
     risk = load_toml("risk.toml")
 
@@ -284,6 +288,10 @@ def get_pipeline_status() -> dict:
 # ─── 8. Hypotheses ─────────────────────────────────────────────────
 
 def get_hypotheses() -> dict:
+    return _cached("hypotheses", 60, _get_hypotheses)
+
+
+def _get_hypotheses() -> dict:
     hyp_path = HYPOTHESES_DIR / "hypotheses_v1.json"
     hypotheses = []
     if hyp_path.exists():
@@ -403,7 +411,7 @@ def get_data_status() -> dict:
             "total_files": sum(s["files"] for s in stats.values()),
             "total_size_mb": round(sum(s["total_size_mb"] for s in stats.values()), 1),
         }
-    return _cached("data_status", 300, _load)
+    return _cached("data_status", 1800, _load)
 
 
 # ─── 10. Collector Market Data ─────────────────────────────────────
@@ -452,12 +460,16 @@ def get_market_data() -> dict:
             }
 
         return {"streams": streams}
-    return _cached("market_data", 600, _load)
+    return _cached("market_data", 1800, _load)
 
 
 # ─── 13. Orderbook Captures ─────────────────────────────────────────
 
 def get_captures() -> dict:
+    return _cached("captures", 60, _get_captures)
+
+
+def _get_captures() -> dict:
     """Orderbook capture status: pending triggers + completed captures."""
     from config.settings import MARKET_DATA_DIR
 
@@ -558,6 +570,10 @@ def get_system_status() -> dict:
 # ─── 15. Order Book Collector ──────────────────────────────────────
 
 def get_ob_collector() -> dict:
+    return _cached("ob_collector", 60, _get_ob_collector)
+
+
+def _get_ob_collector() -> dict:
     """Order Book collector metrics from _metrics.jsonl (live MARKET_DATA_DIR tree)."""
     metrics_path = MARKET_DATA_DIR / "orderbook" / "reconstructed" / "_metrics.jsonl"
     
@@ -736,7 +752,7 @@ def get_candle_collector() -> dict:
             "total_files": total_files,
             "total_size_mb": round(total_size / 1e6, 1),
         }
-    return _cached("candle_collector", 300, _load)
+    return _cached("candle_collector", 1800, _load)
 
 
 # ─── 17. Data Quality ──────────────────────────────────────────────
@@ -813,7 +829,7 @@ def get_data_quality() -> dict:
                     quality["klines"]["missing"] += 1
 
         return quality
-    return _cached("data_quality", 300, _load)
+    return _cached("data_quality", 1800, _load)
 
 
 # ─── 18. Research Conclusion ───────────────────────────────────────
@@ -1048,6 +1064,10 @@ def get_research_gate() -> dict:
 # ─── 20. Alerts ────────────────────────────────────────────────────
 
 def get_alerts() -> list[dict]:
+    return _cached("alerts", 30, _get_alerts)
+
+
+def _get_alerts() -> list[dict]:
     """Active alerts based on system state."""
     alerts = []
     

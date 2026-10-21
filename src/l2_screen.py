@@ -264,10 +264,17 @@ def main(argv: list[str] | None = None) -> int:
     store_files = sorted(src.glob("*.parquet")) if src.is_dir() else [src]
     latest = max(RESULTS_DIR.glob("l2_screen_*.json"),
                  key=lambda p: p.stat().st_mtime, default=None)
-    if (latest is not None and not args.force
-            and max(p.stat().st_mtime for p in store_files) <= latest.stat().st_mtime):
-        logger.info("no new l2_events since %s — skip", latest.name)
-        return 0
+    if latest is not None and not args.force:
+        # Данные растут внутри суток, но вердикт/acceptance зависит от
+        # календарных дат. Один скрин в UTC-сутки достаточен и экономит
+        # ~20 минут CPU на каждом 3-часовом цикле.
+        last_day = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc).date()
+        if last_day == datetime.now(tz=timezone.utc).date():
+            logger.info("screen already ran today (%s) — skip", latest.name)
+            return 0
+        if max(p.stat().st_mtime for p in store_files) <= latest.stat().st_mtime:
+            logger.info("no new l2_events since %s — skip", latest.name)
+            return 0
 
     cost = float(GATES["survival_cost"])
     q_bh = float(GATES["bh_q"])
