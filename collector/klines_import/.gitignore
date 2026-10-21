@@ -1,0 +1,6 @@
+/target
+logs/
+data/
+__pycache__/
+*.csv
+*.png
