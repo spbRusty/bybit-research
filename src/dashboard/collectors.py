@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import time
+import tomllib
 from collections import deque
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
@@ -1070,48 +1075,7 @@ def get_research_gate() -> dict:
 # ─── 20. Alerts ────────────────────────────────────────────────────
 
 def get_alerts() -> list[dict]:
-    return _cached("alerts", 30, _get_alerts)
-
-
-def _get_alerts() -> list[dict]:
-    """Active alerts based on system state."""
-    alerts = []
-    
-    # Check OB collector
-    ob = get_ob_collector()
-    if ob["status"] == "NOT RUNNING":
-        alerts.append({"level": "error", "source": "Коллектор стакана", "message": "Коллектор не запущен"})
-    elif ob["status"] == "NO DATA":
-        alerts.append({"level": "warning", "source": "Коллектор стакана", "message": "Данные не поступают"})
-    elif ob["status"] == "ERRORS":
-        alerts.append({"level": "error", "source": "OB Collector", "message": f"{ob['total_errors']} write errors"})
-    
-    if ob.get("disk_free_gb") is not None and ob["disk_free_gb"] < 5:
-        alerts.append({"level": "critical", "source": "Disk", "message": f"Low disk space: {ob['disk_free_gb']:.1f} GB"})
-    
-    # Check candle collector
-    cc = get_candle_collector()
-    if cc["status"] == "NO DATA":
-        alerts.append({"level": "warning", "source": "Коллектор свечей", "message": "Нет данных свечей"})
-    
-    # Check data quality
-    dq = get_data_quality()
-    if dq["orderbook"]["gap"] > 0:
-        alerts.append({"level": "warning", "source": "Data Quality", "message": f"{dq['orderbook']['gap']} OB gaps detected"})
-    
-    # Check pipeline
-    pipeline = get_pipeline_status()
-    if pipeline.get("verdict") == "STOP":
-        alerts.append({"level": "error", "source": "Пайплайн", "message": "Пайплайн остановлен"})
-    elif pipeline.get("verdict") == "ERROR":
-        alerts.append({"level": "error", "source": "Пайплайн", "message": "Ошибка пайплайна"})
-    
-    # Check system status
-    status = get_system_status()
-    if status.get("any_stale"):
-        alerts.append({"level": "warning", "source": "Система", "message": "Некоторые лог-файлы устарели"})
-    
-    return alerts
+    return _cached("alerts", 30, lambda: get_overview()["alerts"])
 
 
 # ─── 20. Shadow Paper Status ──────────────────────────────────────
@@ -1172,12 +1136,7 @@ def get_shadow_paper() -> dict:
 def get_logs(n: int = 30) -> dict:
     """Последние N строк логов: research-цикл, orchestrator, collector."""
     def _tail(path: Path) -> list[str]:
-        if not path.exists():
-            return []
-        try:
-            return path.read_text(errors="replace").splitlines()[-n:]
-        except Exception:
-            return []
+        return _tail_lines(path, n)
 
     return {
         "research": _tail(LOGS_DIR / "research_cycle.log"),
@@ -1204,3 +1163,511 @@ def get_l2_screen() -> dict:
     out["age_min"] = round(_age_s(path) / 60, 1)
     out["runs"] = len(files)
     return out
+
+
+# ─── 23. Общий обзор (overview / coverage / collectors / equity) ───
+#
+# Всё ниже — только чтение существующих артефактов. Тяжёлые источники
+# кэшируются, чтобы CPU дашборда оставался низким при опросе раз в 15с.
+
+_TAIL_BYTES = 256 * 1024
+_STATS_RE = re.compile(
+    r"\[stats\]\s+(?P<elapsed>\d+)s:\s+msgs=(?P<msgs>\d+)\s+snaps=(?P<snaps>\d+)\s+"
+    r"active=(?P<active>\d+)/(?P<total>\d+)\s+jumps=(?P<jumps>\d+)\s+"
+    r"reconn=(?P<reconn>\d+)\s+rows=(?P<rows>\d+)")
+_SUB_RE = re.compile(r"\[ws (\w+)\] подписан: (\d+) символов")
+_NEXT_RE = re.compile(r"\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2})")
+
+_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dash")
+
+
+def _tail_text(path: Path, max_bytes: int = _TAIL_BYTES) -> str:
+    """Последние max_bytes байт файла (целиком не читаем — логи бывают на ГБ)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # отбросить неполную первую строку
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _tail_lines(path: Path, n: int = 200, max_bytes: int = _TAIL_BYTES) -> list[str]:
+    return [ln for ln in _tail_text(path, max_bytes).splitlines() if ln.strip()][-n:]
+
+
+def _count_in_tail(path: Path, needle: bytes, max_bytes: int = 1024 * 1024) -> int:
+    """Сколько раз needle встречается в хвосте файла (без чтения целиком)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            return f.read().count(needle)
+    except OSError:
+        return 0
+
+
+def _latest_l2_screen() -> dict:
+    """Новейший results/l2_screen_*.json (кеш 30с)."""
+    files = sorted(RESULTS_DIR.glob("l2_screen_*.json"))
+    if not files:
+        return {}
+    path = files[-1]
+
+    def _load() -> dict:
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return {}
+
+    data = _cached(f"l2_screen:{path.name}", 30, _load)
+    out = dict(data)
+    out["_file"] = path.name
+    out["_age_min"] = round(_age_s(path) / 60, 1)
+    return out
+
+
+def _l2_periods() -> dict:
+    """Периоды L2-исследования и дата приёмки из config/l2_research.toml."""
+    try:
+        with open(ROOT / "config" / "l2_research.toml", "rb") as f:
+            cfg = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {"periods": {}, "acceptance_date": None, "gates": {}}
+    periods = {k: list(v) for k, v in (cfg.get("periods") or {}).items()}
+    acceptance = None
+    oos = periods.get("oos") or []
+    if len(oos) == 2:
+        try:  # приёмка = закрытие OOS + 1 день (финализация окна)
+            acceptance = (datetime.fromisoformat(oos[1]) + timedelta(days=1)).date().isoformat()
+        except ValueError:
+            acceptance = None
+    return {"periods": periods, "acceptance_date": acceptance,
+            "gates": cfg.get("gates") or {}}
+
+
+def _days_to(iso_date: str | None) -> int | None:
+    if not iso_date:
+        return None
+    try:
+        return (datetime.fromisoformat(iso_date).date()
+                - datetime.now(timezone.utc).date()).days
+    except ValueError:
+        return None
+
+
+def _service(log_rel: str, threshold_min: float) -> dict:
+    """Сервис жив, если его лог обновлялся недавно."""
+    path = ROOT / log_rel
+    if not path.exists():
+        return {"active": False, "lag_min": None}
+    age_min = round(_age_s(path) / 60, 1)
+    return {"active": age_min <= threshold_min, "lag_min": age_min}
+
+
+def _next_timer_run(unit: str = "l2_search.timer") -> str | None:
+    """Ближайший запуск systemd --user таймера (HH:MM) или None."""
+    def _query() -> str | None:
+        try:
+            r = subprocess.run(
+                ["systemctl", "--user", "list-timers", unit, "--no-pager", "--no-legend"],
+                capture_output=True, text=True, timeout=2.0)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        for line in r.stdout.splitlines():
+            if unit not in line:
+                continue
+            if line.lstrip().startswith("-"):   # таймер не активен
+                return None
+            m = _NEXT_RE.search(line)
+            if m:
+                return m.group(1)
+        return None
+
+    def _run() -> str | None:
+        try:
+            return _POOL.submit(_query).result(timeout=2.5)
+        except Exception:
+            return None
+
+    return _cached(f"next_timer:{unit}", 60, _run)
+
+
+def _ob_stats() -> dict:
+    """Хвост ob_reconstructor.log: [stats] строка + счётчик queue full."""
+    log = ROOT / "collector" / "logs" / "ob_reconstructor.log"
+    matches = [m for m in (_STATS_RE.search(ln)
+                           for ln in _tail_text(log, 64 * 1024).splitlines()) if m]
+    out: dict = {"queue_full": _count_in_tail(log, b"queue full")}
+    if not matches:
+        return out
+    last = matches[-1]
+    out["active_symbols"] = int(last.group("active"))
+    out["symbols_total"] = int(last.group("total"))
+    out["rows"] = int(last.group("rows"))
+    out["reconnects"] = int(last.group("reconn"))
+    out["jumps"] = int(last.group("jumps"))
+    out["msgs"] = int(last.group("msgs"))
+    if len(matches) >= 2:
+        prev = matches[-2]
+        dt = int(last.group("elapsed")) - int(prev.group("elapsed"))
+        d_msgs = int(last.group("msgs")) - int(prev.group("msgs"))
+        if dt > 0:
+            out["msgs_per_s"] = round(d_msgs / dt, 1)
+    return out
+
+
+def _marketdata_symbols() -> dict:
+    """Сколько символов подписано в каждом потоке (по логу marketdata)."""
+    log = ROOT / "collector" / "logs" / "marketdata.log"
+    out: dict = {}
+    for line in _tail_text(log, 512 * 1024).splitlines():
+        m = _SUB_RE.search(line)
+        if m:
+            out[m.group(1)] = int(m.group(2))
+    # запасной источник — каталоги символов marketdata
+    for stream in ("trades", "liquidation"):
+        if out.get(stream):
+            continue
+        d = MARKET_DATA_DIR / stream / "linear"
+        try:
+            out[stream] = sum(1 for p in d.iterdir() if p.is_dir()) if d.exists() else 0
+        except OSError:
+            out[stream] = 0
+    return out
+
+
+def _paper_state() -> tuple[dict, dict]:
+    return (_read_json_file(PAPER_PORTFOLIO / "state.json"),
+            _read_json_file(PAPER_SHADOW / "state.json"))
+
+
+def _paper_summary() -> dict:
+    """Сводка бумаги: портфель + shadow."""
+    state, shadow = _paper_state()
+    src = state or shadow
+    fees = src.get("total_fees", src.get("fees", 0.0)) or 0.0
+    slip = src.get("total_slippage", src.get("slippage", 0.0)) or 0.0
+    if state.get("trade_count", 0) or state:
+        status = "ТОРГУЕТ" if state.get("trade_count", 0) else "ЖДЁТ КАНДИДАТА"
+    else:
+        status = "НЕТ ДАННЫХ"
+    return {
+        "status": status,
+        "balance": src.get("balance"),
+        "trade_count": src.get("trade_count", 0) or 0,
+        "realized_pnl": src.get("realized_pnl", 0.0) or 0.0,
+        "fees": fees,
+        "slippage": slip,
+        "mode": src.get("mode"),
+        "hypothesis_id": src.get("hypothesis_id"),
+        "shadow_trades": len(shadow.get("trades") or []),
+        "shadow_pnl": shadow.get("realized_pnl", 0.0) or 0.0,
+    }
+
+
+# ─── 23a. /api/overview ───────────────────────────────────────────
+
+def get_overview() -> dict:
+    return _cached("overview", 30, _get_overview)
+
+
+def _get_overview() -> dict:
+    l2 = _latest_l2_screen()
+    periods = _l2_periods()
+    acceptance = periods.get("acceptance_date")
+    days_left = _days_to(acceptance)
+    verdict = l2.get("verdict")
+    n_events = l2.get("n_events") or {}
+    coverage = l2.get("coverage_ok_share")
+
+    services = {
+        "klines": _service("collector/logs/bybit_klines.log", 30),
+        "marketdata": _service("collector/logs/marketdata.log", 10),
+        "ob_reconstructor": _service("collector/logs/ob_reconstructor.log", 10),
+        "dashboard": {"active": True, "lag_min": 0.0},
+    }
+    paper = _paper_summary()
+
+    research = {
+        "verdict": verdict,
+        "reason": l2.get("reason"),
+        "discovery": periods["periods"].get("discovery"),
+        "validation": periods["periods"].get("validation"),
+        "oos": periods["periods"].get("oos"),
+        "acceptance_date": acceptance,
+        "days_to_acceptance": days_left,
+        "coverage_ok_share": coverage,
+        "n_events_discovery": n_events.get("discovery", 0),
+        "n_events_validation": n_events.get("validation", 0),
+        "n_events_oos": n_events.get("oos", 0),
+        "n_bh": l2.get("n_bh_significant", 0),
+        "n_hypotheses": l2.get("n_hypotheses", 0),
+        "paper_gate": "CANDIDATE найден" if verdict == "CANDIDATE" else "ждём CANDIDATE",
+        "last_run": l2.get("_file"),
+        "last_run_age_min": l2.get("_age_min"),
+    }
+
+    return {
+        "services": services,
+        "research": research,
+        "paper": paper,
+        "next_run": _next_timer_run(),
+        "alerts": _actionable_alerts(services, research, paper),
+    }
+
+
+def _actionable_alerts(services: dict, research: dict, paper: dict) -> list[dict]:
+    """Только блокеры, требующие действия — без шума «лог устарел»."""
+    alerts: list[dict] = []
+    acceptance = research.get("acceptance_date")
+    if research.get("verdict") != "CANDIDATE":
+        msg = "нужен CANDIDATE"
+        if acceptance:
+            msg += f", не раньше {acceptance}"
+        alerts.append({"level": "info", "source": "Бумага", "message": f"не торгует: {msg}"})
+    coverage = research.get("coverage_ok_share")
+    if coverage is not None and coverage < 0.5:
+        alerts.append({"level": "warning", "source": "Покрытие",
+                       "message": f"качественных событий {coverage * 100:.0f}% (< 50%)"})
+    labels = {"klines": "Свечи", "marketdata": "Поток сделок",
+              "ob_reconstructor": "Стакан", "dashboard": "Дашборд"}
+    for name, svc in services.items():
+        if not svc.get("active"):
+            lag = svc.get("lag_min")
+            alerts.append({"level": "error", "source": labels.get(name, name),
+                           "message": "нет свежих данных"
+                                      + (f" {lag} мин" if lag is not None else "")})
+    disk = _disk_free_gb()
+    if disk is not None and disk < 10:
+        alerts.append({"level": "error", "source": "Диск",
+                       "message": f"свободно {disk:.1f} ГБ (< 10 ГБ)"})
+    return alerts
+
+
+def _disk_free_gb() -> float | None:
+    try:
+        return round(shutil.disk_usage(ROOT).free / 1e9, 1)
+    except OSError:
+        return None
+
+
+# ─── 23b. /api/coverage ───────────────────────────────────────────
+
+def get_coverage() -> dict:
+    return _cached("coverage", 300, _get_coverage)
+
+
+def _get_coverage() -> dict:
+    """Покрытие L2-событий по дням (метаданные parquet, без чтения данных)."""
+    src = EVENTS_DIR / "l2_events"
+    dates: list[dict] = []
+    total_rows = 0
+    total_size = 0
+    if src.exists():
+        for f in sorted(src.glob("*.parquet")):
+            try:
+                rows = pq.ParquetFile(f).metadata.num_rows
+                size = f.stat().st_size
+            except Exception:
+                continue
+            total_rows += rows
+            total_size += size
+            dates.append({"date": f.stem, "rows": rows,
+                          "size_mb": round(size / 1e6, 2)})
+    l2 = _latest_l2_screen()
+    return {
+        "dates": dates,
+        "total_rows": total_rows,
+        "total_size_mb": round(total_size / 1e6, 2),
+        "dates_count": len(dates),
+        "coverage_ok_share": l2.get("coverage_ok_share"),
+    }
+
+
+# ─── 23c. /api/collectors ─────────────────────────────────────────
+
+def get_collectors() -> dict:
+    return _cached("collectors", 30, _get_collectors)
+
+
+def _get_collectors() -> dict:
+    ob = get_ob_collector()
+    stats = _ob_stats()
+    md = _marketdata_symbols()
+    cc = get_candle_collector()
+
+    cats = cc.get("categories") or {}
+    newest = None
+    lags = []
+    for info in cats.values():
+        if info.get("newest") and (newest is None or str(info["newest"]) > newest):
+            newest = str(info["newest"])
+        if info.get("lag_min") is not None:
+            lags.append(info["lag_min"])
+    lag_min = min(lags) if lags else None
+
+    disk = ob.get("disk_free_gb")
+    if disk is None:
+        disk = _disk_free_gb()
+
+    return {
+        "ob": {
+            "active_symbols": stats.get("active_symbols", ob.get("symbols_count", 0)),
+            "symbols_total": stats.get("symbols_total"),
+            "msgs_per_s": stats.get("msgs_per_s"),
+            "rows": stats.get("rows", ob.get("total_rows", 0)),
+            "reconnects": stats.get("reconnects", ob.get("total_reconnects", 0)),
+            "queue_full": stats.get("queue_full", 0),
+            "jumps": stats.get("jumps", 0),
+        },
+        "marketdata": {
+            "trades_symbols": md.get("trades", 0),
+            "liquidation_symbols": md.get("liquidation", 0),
+        },
+        "klines": {
+            "files": cc.get("total_files", 0),
+            "newest": newest,
+            "lag_min": lag_min,
+            "status": cc.get("status"),
+        },
+        "disk_free_gb": disk,
+    }
+
+
+# ─── 23d. /api/equity ─────────────────────────────────────────────
+
+def get_equity() -> dict:
+    return _cached("equity", 60, _get_equity)
+
+
+def _get_equity() -> dict:
+    """Кривая капитала бумаги: точки + последние сделки."""
+    state, _shadow = _paper_state()
+    trades: list[dict] = []
+    for tf in sorted(PAPER_TRADES.glob("*.parquet")):
+        try:
+            trades.extend(pl.read_parquet(tf).to_dicts())
+        except Exception:
+            continue
+    known = {t.get("trade_id") for t in trades if t.get("trade_id")}
+    for t in (state.get("trades") or []):
+        if t.get("trade_id") in known:
+            continue
+        trades.append(t)
+
+    trades.sort(key=lambda t: str(t.get("exit_timestamp") or t.get("entry_timestamp") or ""))
+
+    points: list[dict] = []
+    start = state.get("equity_start")
+    if start is not None:
+        points.append({"t": state.get("started_at"), "equity": float(start),
+                       "balance": float(start)})
+    for t in trades:
+        pnl = t.get("net_pnl")
+        if pnl is None:
+            pnl = t.get("gross_pnl", 0.0) or 0.0
+        bal = t.get("balance_after")
+        if bal is None:
+            prev = points[-1]["balance"] if points else float(start or 0.0)
+            bal = prev + float(pnl or 0.0)
+        points.append({
+            "t": t.get("exit_timestamp") or t.get("entry_timestamp"),
+            "equity": float(bal),
+            "balance": float(bal),
+        })
+
+    last50 = [{
+        "t": t.get("exit_timestamp") or t.get("entry_timestamp"),
+        "symbol": t.get("symbol"),
+        "side": t.get("side"),
+        "net_pnl": t.get("net_pnl"),
+        "fees": (t.get("entry_fee") or 0.0) + (t.get("exit_fee") or 0.0),
+        "slippage": t.get("slippage_cost"),
+        "reason": t.get("reason"),
+    } for t in trades[-50:]]
+
+    empty_reason = None
+    if not trades:
+        acceptance = _l2_periods().get("acceptance_date")
+        empty_reason = "Бумага не торгует: нужен CANDIDATE"
+        if acceptance:
+            empty_reason += f", не раньше {acceptance}"
+
+    return {
+        "points": points,
+        "trades": last50,
+        "trades_count": len(trades),
+        "balance": state.get("balance"),
+        "equity_start": start,
+        "realized_pnl": state.get("realized_pnl", 0.0),
+        "fees": state.get("total_fees", state.get("fees", 0.0)) or 0.0,
+        "slippage": state.get("total_slippage", state.get("slippage", 0.0)) or 0.0,
+        "empty_reason": empty_reason,
+    }
+
+
+# ─── 23e. /api/milestones ─────────────────────────────────────────
+
+def get_milestones() -> dict:
+    return _cached("milestones", 60, _get_milestones)
+
+
+def _get_milestones() -> dict:
+    """Вехи исследования: окна данных, приёмка, текущий блокер."""
+    l2 = _latest_l2_screen()
+    periods = _l2_periods()
+    acceptance = periods.get("acceptance_date")
+    today = datetime.now(timezone.utc).date()
+    n_events = l2.get("n_events") or {}
+
+    stages = []
+    for name, label in (("discovery", "Discovery"), ("validation", "Validation"),
+                        ("oos", "OOS")):
+        win = periods["periods"].get(name) or []
+        start, end = (win + [None, None])[:2]
+        events = n_events.get(name, 0)
+        if start and end:
+            try:
+                s_d = datetime.fromisoformat(start).date()
+                e_d = datetime.fromisoformat(end).date()
+                span = max(1, (e_d - s_d).days)
+                done = min(1.0, max(0.0, (today - s_d).days / span))
+                state = "done" if today > e_d else ("active" if today >= s_d else "pending")
+            except ValueError:
+                done, state = 0.0, "pending"
+        else:
+            done, state = 0.0, "pending"
+        stages.append({
+            "key": name, "label": label, "start": start, "end": end,
+            "progress": round(done, 3), "state": state, "events": events,
+        })
+
+    blockers: list[str] = []
+    if l2.get("verdict") != "CANDIDATE":
+        blockers.append("Нет CANDIDATE — бумага не торгует")
+    if acceptance and today < datetime.fromisoformat(acceptance).date():
+        blockers.append(f"Окна OOS ещё не закрыты, приёмка не раньше {acceptance}")
+    if not n_events.get("validation"):
+        blockers.append("Окно validation ещё не наполнено событиями")
+    if not n_events.get("oos"):
+        blockers.append("Окно OOS ещё не наполнено событиями")
+    coverage = l2.get("coverage_ok_share")
+    if coverage is not None and coverage < 0.5:
+        blockers.append(f"Покрытие качественных событий {coverage * 100:.0f}% (< 50%)")
+
+    return {
+        "stages": stages,
+        "acceptance_date": acceptance,
+        "days_to_acceptance": _days_to(acceptance),
+        "verdict": l2.get("verdict"),
+        "reason": l2.get("reason"),
+        "blockers": blockers,
+        "last_run": l2.get("_file"),
+        "last_run_age_min": l2.get("_age_min"),
+    }

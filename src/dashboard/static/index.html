@@ -6,7 +6,7 @@
 <title>Дашборд исследований Bybit</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--card-sm:8px}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--track:#21262d;--text:#c9d1d9;--dim:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--card-sm:8px}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);padding:8px 12px;font-size:12px;line-height:1.35}
 h1{font-size:16px;margin-bottom:6px;color:var(--blue)}
 h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:4px}
@@ -14,14 +14,17 @@ h2{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);m
 .g2{grid-template-columns:1fr 1fr}
 .g3{grid-template-columns:1fr 1fr 1fr}
 .g4{grid-template-columns:1fr 1fr 1fr 1fr}
+.g5{grid-template-columns:repeat(5,1fr)}
 .card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:var(--card-sm)}
 .card.g span{font-size:11px;color:var(--dim);display:block}
 .card.g .v{font-size:20px;font-weight:700;color:var(--text)}
 .card.g .v.sm{font-size:14px}
+.card.g .v.big{font-size:24px;line-height:1.15;word-break:break-word}
 .status-ok{color:var(--green)}.status-warn{color:var(--yellow)}.status-err{color:var(--red)}.status-na{color:var(--dim)}
 table{width:100%;border-collapse:collapse;font-size:11px}
 th,td{padding:2px 6px;text-align:left;border-bottom:1px solid var(--border)}
 th{color:var(--dim);font-weight:600;font-size:10px}
+td.r,th.r{text-align:right}
 .mono{font-family:'SFMono-Regular',Consolas,monospace;font-size:10px}
 .tag{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600}
 .tag-pass{background:#238636;color:#fff}.tag-reject{background:#da3633;color:#fff}.tag-skip{background:#6e7681;color:#fff}.tag-stop{background:#d29922;color:#000}.tag-error{background:#f85149;color:#fff}.tag-na{background:#30363d;color:var(--dim)}
@@ -37,6 +40,33 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 #status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
 #status-dot.ok{background:var(--green)}.stale{background:var(--red)}
 .hdr{font-size:11px;color:var(--dim);margin-bottom:6px}
+
+/* Обзор: воронка, шкалы, спарклайн, справочник */
+.funnel{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:4px}
+.fstep{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px}
+.fstep.done{border-color:var(--green)}
+.fstep.active{border-color:var(--blue)}
+.fstep .fs-h{display:flex;justify-content:space-between;align-items:baseline;gap:4px}
+.fstep .fs-t{font-size:12px;font-weight:700}
+.fstep .fs-d{font-size:10px;color:var(--dim);font-family:'SFMono-Regular',Consolas,monospace}
+.bar{height:5px;border-radius:3px;background:var(--track);overflow:hidden;margin:5px 0 3px}
+.bar>i{display:block;height:100%;background:var(--blue);border-radius:3px}
+.bar.ok>i{background:var(--green)}
+.bar.warn>i{background:var(--yellow)}
+.spark{display:block;width:100%;height:54px}
+.spark path{fill:none;stroke:currentColor;stroke-width:1.5;vector-effect:non-scaling-stroke}
+.spark .area{fill:currentColor;fill-opacity:.12;stroke:none}
+.empty{color:var(--dim);font-size:11px;padding:8px;border:1px dashed var(--border);border-radius:6px}
+.blocker{margin-top:6px;padding:5px 8px;border-radius:4px;background:var(--bg);border-left:3px solid var(--yellow);font-size:11px}
+details.ref{border:1px solid var(--border);border-radius:6px;background:var(--card);padding:6px 8px;margin-bottom:8px}
+details.ref>summary{cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim)}
+details.ref>summary:hover{color:var(--text)}
+details.ref .grid{margin-top:8px}
+details.ref .card{background:var(--bg)}
+
+@media (max-width:1100px){.g5{grid-template-columns:1fr 1fr}.funnel{grid-template-columns:1fr 1fr}}
+@media (max-width:900px){.g3,.g4{grid-template-columns:1fr 1fr}}
+@media (max-width:640px){.g2,.g3,.g4,.g5,.funnel{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -45,96 +75,131 @@ th{color:var(--dim);font-weight:600;font-size:10px}
 <!-- ═══════ ALERTS ═══════ -->
 <div id="alerts-bar" style="margin-bottom:8px"></div>
 
+<!-- ═══════ ОБЗОР ═══════ -->
+<div class="grid g5" id="row-overview">
+  <div class="card g"><span>Вердикт пайплайна</span><div class="v big" id="ov-verdict">—</div><div id="ov-verdict-badge" style="margin:2px 0"></div><div class="sub" id="ov-verdict-reason"></div></div>
+  <div class="card g"><span>До приёмки</span><div class="v big" id="ov-days">—</div><div class="sub" id="ov-acceptance"></div></div>
+  <div class="card g"><span>Покрытие OB</span><div class="v big" id="ov-coverage">—</div><div class="sub" id="ov-coverage-sub"></div></div>
+  <div class="card g"><span>Коллекторы</span><div class="v big" id="ov-collectors">—</div><div class="sub" id="ov-collectors-sub"></div></div>
+  <div class="card g"><span>Бумага</span><div class="v big" id="ov-paper">—</div><div class="sub" id="ov-paper-sub"></div></div>
+</div>
+
+<!-- ═══════ ВОРОНКА ═══════ -->
+<div class="card" style="margin-bottom:8px">
+  <h2>Воронка исследования</h2>
+  <div class="funnel" id="funnel"><div class="sub">Загрузка...</div></div>
+  <div class="blocker" id="funnel-blocker"></div>
+</div>
+
+<!-- ═══════ ПОКРЫТИЕ + КОЛЛЕКТОРЫ ═══════ -->
+<div class="grid g2">
+  <div class="card">
+    <h2>Покрытие L2-событий</h2>
+    <div id="coverage-table">Загрузка...</div>
+  </div>
+  <div class="card">
+    <h2>Коллекторы</h2>
+    <div id="collectors-row">Загрузка...</div>
+  </div>
+</div>
+
+<!-- ═══════ БУМАЖНАЯ ТОРГОВЛЯ ═══════ -->
+<div class="card" style="margin-bottom:8px">
+  <h2>Бумажная торговля</h2>
+  <div class="grid g4" id="row-wallet">
+    <div class="card g"><span>Бумажная торговля</span><div class="v" id="p-status">—</div><div class="sub" id="p-reason"></div></div>
+    <div class="card g"><span>Баланс</span><div class="v" id="p-balance">—</div><div class="sub" id="p-equity-start"></div></div>
+    <div class="card g"><span>PnL</span><div class="v" id="p-pnl">—</div><div class="sub" id="p-pnl-pct"></div></div>
+    <div class="card g"><span>Винрейт</span><div class="v" id="p-winrate">—</div><div class="sub" id="p-trades"></div></div>
+  </div>
+  <div id="equity-chart" style="margin-top:6px"></div>
+  <div class="sub" id="equity-stats" style="margin-top:4px"></div>
+  <div id="equity-trades" style="margin-top:4px"></div>
+</div>
+
 <!-- ═══════ SYSTEM STATUS ═══════ -->
 <div class="grid g3" id="row-sys">
-<div class="card"><h2>Сбор данных</h2><div id="sys-data">Загрузка...</div></div>
-<div class="card"><h2>Исследование</h2><div id="sys-research">Загрузка...</div></div>
-<div class="card"><h2>Бумажная торговля</h2><div id="sys-paper">Загрузка...</div></div>
+  <div class="card"><h2>Сбор данных</h2><div id="sys-data">Загрузка...</div></div>
+  <div class="card"><h2>Исследование</h2><div id="sys-research">Загрузка...</div></div>
+  <div class="card"><h2>Бумажная торговля</h2><div id="sys-paper">Загрузка...</div></div>
 </div>
 
 <!-- ═══════ RESEARCH CONTROLLER ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Управляющий модуль</h2>
-<div id="rc-state">Загрузка...</div>
+  <h2>Управляющий модуль</h2>
+  <div id="rc-state">Загрузка...</div>
 </div>
 
 <!-- ═══════ LIVE DATA ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Живые данные</h2>
-<div id="ld-rows">Загрузка...</div>
-</div>
-
-<!-- ═══════ ROW 1: Paper Wallet ═══════ -->
-<div class="grid g4" id="row-wallet">
-<div class="card g"><span>Бумажная торговля</span><div class="v" id="p-status">—</div><div class="sub" id="p-reason"></div></div>
-<div class="card g"><span>Баланс</span><div class="v" id="p-balance">—</div><div class="sub" id="p-equity-start"></div></div>
-<div class="card g"><span>PnL</span><div class="v" id="p-pnl">—</div><div class="sub" id="p-pnl-pct"></div></div>
-<div class="card g"><span>Винрейт</span><div class="v" id="p-winrate">—</div><div class="sub" id="p-trades"></div></div>
+  <h2>Живые данные</h2>
+  <div id="ld-rows">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 2: Collectors ═══════ -->
 <div class="grid g2">
-<div class="card">
-<h2>Коллектор стакана (реконструкция)</h2>
-<div id="ob-collector">Загрузка...</div>
-</div>
-<div class="card">
-<h2>Коллектор свечей</h2>
-<div id="candle-collector">Загрузка...</div>
-</div>
-</div>
-
-<!-- ═══════ ROW 3: Parameters + Costs ═══════ -->
-<div class="grid g3">
-<div class="card">
-<h2>Риск-менеджмент</h2>
-<table id="t-risk"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
-</div>
-<div class="card">
-<h2>Размер позиции</h2>
-<table id="t-sizing"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
-</div>
-<div class="card">
-<h2>Издержки торговли</h2>
-<table id="t-costs"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
-</div>
+  <div class="card">
+    <h2>Коллектор стакана (реконструкция)</h2>
+    <div id="ob-collector">Загрузка...</div>
+  </div>
+  <div class="card">
+    <h2>Коллектор свечей</h2>
+    <div id="candle-collector">Загрузка...</div>
+  </div>
 </div>
 
-<!-- ═══════ ROW 4: Stakes ═══════ -->
-<div class="card" style="margin-bottom:8px">
-<h2>Уровни ставки</h2>
-<table id="t-stakes"><tr><td class="sub">Загрузка...</td></tr></table>
-<div class="sub" id="stake-note"></div>
-</div>
+<!-- ═══════ СПРАВОЧНИК ═══════ -->
+<details class="ref" id="ref-details">
+  <summary>Справочник</summary>
+  <div class="grid g3">
+    <div class="card">
+      <h2>Риск-менеджмент</h2>
+      <table id="t-risk"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
+    </div>
+    <div class="card">
+      <h2>Размер позиции</h2>
+      <table id="t-sizing"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
+    </div>
+    <div class="card">
+      <h2>Издержки</h2>
+      <table id="t-costs"><tr><td colspan="2" class="sub">Загрузка...</td></tr></table>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Уровни ставки</h2>
+    <table id="t-stakes"><tr><td class="sub">Загрузка...</td></tr></table>
+    <div class="sub" id="stake-note"></div>
+  </div>
+</details>
 
 <!-- ═══════ ROW 5: Research Conclusion ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Вывод исследования</h2>
-<div id="research-conclusion">Загрузка...</div>
+  <h2>Вывод исследования</h2>
+  <div id="research-conclusion">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 5b: L2 Screen ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>L2-скрин (стакан)</h2>
-<div id="l2-screen">Загрузка...</div>
+  <h2>L2-скрин (стакан)</h2>
+  <div id="l2-screen">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 8: Hypotheses ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Гипотезы и исследования</h2>
-<div id="hyp-content">Загрузка...</div>
+  <h2>Гипотезы и исследования</h2>
+  <div id="hyp-content">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 9: Orderbook Captures ═══════ -->
 <div class="card" style="margin-bottom:8px">
-<h2>Захваты стакана по событиям</h2>
-<div id="captures-summary">Загрузка...</div>
+  <h2>Захваты стакана по событиям</h2>
+  <div id="captures-summary">Загрузка...</div>
 </div>
 
 <!-- ═══════ ROW 10: Logs ═══════ -->
 <div class="card" style="margin-bottom:0">
-<h2>Логи</h2>
-<div class="log-box" id="log-content">Загрузка...</div>
+  <h2>Логи</h2>
+  <div class="log-box" id="log-content">Загрузка...</div>
 </div>
 
 <script>
@@ -157,6 +222,8 @@ const RU = {
   BUDGET_EXHAUSTED: 'БЮДЖЕТ ИСЧЕРПАН', WAITING_FOR_NEW_DATA: 'ОЖИДАНИЕ НОВЫХ ДАННЫХ',
   PASS_PENDING_PAPER: 'ПРОЙДЕН · ЖДЁТ БУМАГИ', 'NO_CANDIDATE': 'НЕТ КАНДИДАТА',
   'NO DATA': 'НЕТ ДАННЫХ', NOT_AVAILABLE: 'НЕДОСТУПНО',
+  // вердикты L2
+  CANDIDATE: 'КАНДИДАТ', PENDING_DATA: 'ЖДЁТ ДАННЫХ', NOT_READY: 'НЕ ГОТОВО',
   // вывод исследования
   'VALIDATED EDGE FOUND': 'НАЙДЕНО ПОДТВЕРЖДЁННОЕ ПРЕИМУЩЕСТВО',
   'NO STATISTICALLY VALIDATED EDGE': 'НЕТ СТАТИСТИЧЕСКИ ПОДТВЕРЖДЁННОГО ПРЕИМУЩЕСТВА',
@@ -184,6 +251,162 @@ async function fetchJSON(path) {
 }
 function money(v) { return v != null ? '$' + Number(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : 'N/A'; }
 function pct(v) { return v != null ? v.toFixed(2) + '%' : 'N/A'; }
+function num(v) { return v != null ? Number(v).toLocaleString('ru-RU') : '—'; }
+function mins(v) { return v != null ? (Math.round(v * 10) / 10) + ' мин' : '—'; }
+function cls(v, ok, warn) { return v === ok ? 'status-ok' : v === warn ? 'status-warn' : 'status-na'; }
+
+// ═══════ 0. Обзор ═══════
+async function renderOverview() {
+  const d = await fetchJSON('/overview');
+  if (!d) return;
+  const r = d.research || {}, p = d.paper || {}, s = d.services || {};
+
+  const verdict = r.verdict;
+  const vClass = verdict === 'CANDIDATE' ? 'status-ok' : verdict ? 'status-warn' : 'status-na';
+  setIf('ov-verdict', `<span class="${vClass}">${verdict ? t(verdict) : 'НЕТ ДАННЫХ'}</span>`);
+  const vBadge = verdict === 'CANDIDATE' ? 'tag-pass' : verdict === 'PENDING_DATA' ? 'tag-stop' : verdict ? 'tag-error' : 'tag-na';
+  setIf('ov-verdict-badge', `<span class="tag ${vBadge}">${r.paper_gate || ''}</span>`);
+  setIf('ov-verdict-reason', r.reason || '');
+
+  const days = r.days_to_acceptance;
+  setIf('ov-days', days == null ? '—' : `<span class="${days <= 7 ? 'status-warn' : 'status-ok'}">${days}</span> <span class="sub">дн.</span>`);
+  let acc = r.acceptance_date ? `приёмка ${r.acceptance_date}` : 'дата приёмки неизвестна';
+  if (d.next_run) acc += ` · след. скрин ${d.next_run}`;
+  setIf('ov-acceptance', acc);
+
+  const cov = r.coverage_ok_share;
+  const covClass = cov == null ? 'status-na' : cov >= 0.5 ? 'status-ok' : 'status-err';
+  setIf('ov-coverage', cov == null ? '—' : `<span class="${covClass}">${(cov * 100).toFixed(1)}%</span>`);
+  setIf('ov-coverage-sub', `событий discovery: ${num(r.n_events_discovery)} · BH-значимых: ${num(r.n_bh)}`);
+
+  const act = Object.values(s).filter(x => x && x.active).length;
+  const all = Object.keys(s).length;
+  setIf('ov-collectors', `<span class="${act === all ? 'status-ok' : 'status-err'}">${act}/${all}</span> <span class="sub">активны</span>`);
+  setIf('ov-collectors-sub', Object.entries(s).map(([k, v]) => `${k.split('_')[0]}: ${mins(v.lag_min)}`).join(' · '));
+
+  setIf('ov-paper', `<span class="${p.trade_count ? 'status-ok' : 'status-warn'}">${p.trade_count || 0}</span> <span class="sub">сделок</span>`);
+  setIf('ov-paper-sub', `баланс ${money(p.balance)} · PnL ${money(p.realized_pnl)}`);
+
+  renderAlertsBar(d.alerts || []);
+}
+
+function renderAlertsBar(alerts) {
+  if (!alerts.length) { setIf('alerts-bar', ''); return; }
+  let html = '';
+  for (const a of alerts) {
+    const bg = a.level === 'critical' ? '#da3633' : a.level === 'error' ? '#f85149' : a.level === 'warning' ? '#d29922' : '#30363d';
+    html += `<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;background:${bg};color:#fff;margin-right:4px">${a.source}: ${a.message}</span>`;
+  }
+  setIf('alerts-bar', html);
+}
+
+// ═══════ 0b. Воронка ═══════
+async function renderFunnel() {
+  const d = await fetchJSON('/milestones');
+  if (!d) return;
+  const stages = d.stages || [];
+  let html = '';
+  for (const st of stages) {
+    const state = st.state === 'done' ? 'done' : st.state === 'active' ? 'active' : '';
+    const barCls = st.state === 'done' ? 'ok' : st.state === 'active' ? '' : 'warn';
+    const prog = st.state === 'pending' ? 0 : Math.round((st.progress || 0) * 100);
+    html += `<div class="fstep ${state}">
+      <div class="fs-h"><span class="fs-t">${st.label}</span><span class="tag ${st.state === 'done' ? 'tag-pass' : st.state === 'active' ? 'tag-stop' : 'tag-na'}">${st.state === 'done' ? 'ЗАКРЫТО' : st.state === 'active' ? 'ИДЁТ' : 'ОТКРЫТО ПОЗЖЕ'}</span></div>
+      <div class="fs-d">${st.start || '—'} → ${st.end || '—'}</div>
+      <div class="bar ${barCls}"><i style="width:${prog}%"></i></div>
+      <div class="sub">событий: ${num(st.events)}</div>
+    </div>`;
+  }
+  const acc = d.acceptance_date;
+  const days = d.days_to_acceptance;
+  html += `<div class="fstep ${days != null && days <= 0 ? 'done' : ''}">
+    <div class="fs-h"><span class="fs-t">Acceptance</span><span class="tag ${days != null && days <= 0 ? 'tag-pass' : 'tag-na'}">${days != null ? days + ' дн.' : '—'}</span></div>
+    <div class="fs-d">${acc || '—'}</div>
+    <div class="bar ${days != null && days <= 0 ? 'ok' : 'warn'}"><i style="width:${days != null && days > 0 ? 0 : 100}%"></i></div>
+    <div class="sub">вердикт: ${d.verdict ? t(d.verdict) : '—'}</div>
+  </div>`;
+  setIf('funnel', html);
+
+  const blockers = d.blockers || [];
+  const paper = `Paper не торгует: нужен CANDIDATE${acc ? ', не раньше ' + acc : ''}`;
+  setIf('funnel-blocker', `<b>Блокер:</b> ${blockers.length ? blockers.join(' · ') : 'нет'}<br><b>${paper}</b>`);
+}
+
+// ═══════ 0c. Покрытие ═══════
+async function renderCoverage() {
+  const d = await fetchJSON('/coverage');
+  if (!d) return;
+  const dates = (d.dates || []).slice(-10);
+  if (!dates.length) { setIf('coverage-table', '<div class="empty">Нет файлов L2-событий</div>'); return; }
+  let html = '<table><tr><th>Дата</th><th class="r">Строк</th><th class="r">Размер</th></tr>';
+  for (const r of dates) {
+    html += `<tr><td class="mono">${r.date}</td><td class="r mono">${num(r.rows)}</td><td class="r mono">${r.size_mb} МБ</td></tr>`;
+  }
+  html += `<tr style="font-weight:700"><td>Итого</td><td class="r mono">${num(d.total_rows)}</td><td class="r mono">${d.total_size_mb} МБ</td></tr></table>`;
+  const cov = d.coverage_ok_share;
+  html += `<div class="sub">${d.dates_count} дн. с данными${cov != null ? ` · качественных событий ${(cov * 100).toFixed(1)}%` : ''}</div>`;
+  setIf('coverage-table', html);
+}
+
+// ═══════ 0d. Коллекторы ═══════
+async function renderCollectors() {
+  const d = await fetchJSON('/collectors');
+  if (!d) return;
+  const ob = d.ob || {}, md = d.marketdata || {}, kl = d.klines || {};
+  const disk = d.disk_free_gb;
+  const diskCls = disk == null ? 'status-na' : disk < 10 ? 'status-err' : disk < 50 ? 'status-warn' : 'status-ok';
+  let html = '<table>';
+  html += `<tr><td>Сообщений/с</td><td class="r mono">${ob.msgs_per_s != null ? num(ob.msgs_per_s) : '—'}</td></tr>`;
+  html += `<tr><td>Активных символов (стакан)</td><td class="r mono">${num(ob.active_symbols)}${ob.symbols_total ? ' / ' + ob.symbols_total : ''}</td></tr>`;
+  html += `<tr><td>Записано строк</td><td class="r mono">${num(ob.rows)}</td></tr>`;
+  html += `<tr><td>Переподключения</td><td class="r mono">${num(ob.reconnects)}</td></tr>`;
+  html += `<tr><td>Переполнений очереди</td><td class="r mono">${num(ob.queue_full)}</td></tr>`;
+  html += `<tr><td>Подписок: сделки / ликвидации</td><td class="r mono">${num(md.trades_symbols)} / ${num(md.liquidation_symbols)}</td></tr>`;
+  html += `<tr><td>Свечей: файлов</td><td class="r mono">${num(kl.files)}</td></tr>`;
+  html += `<tr><td>Отставание свечей</td><td class="r mono">${mins(kl.lag_min)}</td></tr>`;
+  html += `<tr><td>Диск свободно</td><td class="r mono"><span class="${diskCls}">${disk != null ? disk.toFixed(1) + ' ГБ' : '—'}</span></td></tr>`;
+  html += '</table>';
+  setIf('collectors-row', html);
+}
+
+// ═══════ 0e. Капитал бумаги ═══════
+function sparkline(points) {
+  if (!points || points.length < 2) return '';
+  const W = 100, H = 30;
+  const vals = points.map(p => Number(p.equity) || 0);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = (max - min) || 1;
+  const x = i => (i / (points.length - 1)) * W;
+  const y = v => H - ((v - min) / span) * H;
+  const d = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(2)},${y(Number(p.equity) || 0).toFixed(2)}`).join(' ');
+  const up = vals[vals.length - 1] >= vals[0];
+  return `<svg class="spark ${up ? 'status-ok' : 'status-err'}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><path class="area" d="${d} L${W},${H} L0,${H} Z"/><path d="${d}"/></svg>`;
+}
+
+async function renderEquity() {
+  const d = await fetchJSON('/equity');
+  if (!d) return;
+  const pts = d.points || [];
+  if (pts.length < 2) {
+    setIf('equity-chart', `<div class="empty">${d.empty_reason || 'Сделок ещё не было'}</div>`);
+  } else {
+    setIf('equity-chart', sparkline(pts));
+  }
+  setIf('equity-stats', `баланс ${money(d.balance)} · старт ${money(d.equity_start)} · PnL ${money(d.realized_pnl)} · комиссии ${money(d.fees)} · проскальзывание ${money(d.slippage)} · точек ${pts.length}`);
+
+  const trades = d.trades || [];
+  if (!trades.length) {
+    setIf('equity-trades', '<div class="sub">Последних сделок нет</div>');
+    return;
+  }
+  let html = '<table><tr><th>Выход</th><th>Символ</th><th>Сторона</th><th class="r">PnL</th><th class="r">Комиссия</th><th>Причина</th></tr>';
+  for (const tr of trades.slice(-15).reverse()) {
+    const pnl = Number(tr.net_pnl || 0);
+    html += `<tr><td class="mono">${(tr.t || '').slice(0, 16).replace('T', ' ')}</td><td class="mono">${tr.symbol || '—'}</td><td>${tr.side || '—'}</td><td class="r mono ${pnl >= 0 ? 'status-ok' : 'status-err'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</td><td class="r mono">${(Number(tr.fees || 0)).toFixed(3)}</td><td class="sub">${tr.reason || ''}</td></tr>`;
+  }
+  html += '</table>';
+  setIf('equity-trades', html);
+}
 
 // ═══════ 1. Paper Wallet ═══════
 async function renderPaper() {
@@ -211,16 +434,6 @@ async function renderRisk() {
   h += `<tr><td>Макс. позиций</td><td>${d.max_positions}</td></tr>`;
   setIf('t-risk', h);
 
-  const s = await fetchJSON('/stakes');
-  if (!s) return;
-  let h2 = '';
-  h2 += `<tr><td>Мин. ставка</td><td>${money(s.min_stake_usdt)}</td></tr>`;
-  h2 += `<tr><td>Текущая ставка</td><td>${money(s.current_stake_usdt)}</td></tr>`;
-  h2 += `<tr><td>Мин. лот</td><td>${s.min_lot}</td></tr>`;
-  h2 += `<tr><td>Шаг количества</td><td>${s.qty_step}</td></tr>`;
-  setIf('t-sizing', h2);
-  setIf('stake-note', s.note || '');
-
   const c = await fetchJSON('/costs');
   if (!c) return;
   let h3 = '';
@@ -237,12 +450,20 @@ async function renderRisk() {
 async function renderStakes() {
   const s = await fetchJSON('/stakes');
   if (!s) return;
+  let h2 = '';
+  h2 += `<tr><td>Мин. ставка</td><td>${money(s.min_stake_usdt)}</td></tr>`;
+  h2 += `<tr><td>Текущая ставка</td><td>${money(s.current_stake_usdt)}</td></tr>`;
+  h2 += `<tr><td>Мин. лот</td><td>${s.min_lot}</td></tr>`;
+  h2 += `<tr><td>Шаг количества</td><td>${s.qty_step}</td></tr>`;
+  setIf('t-sizing', h2);
+
   let h = '<tr><th>Уровень</th><th>USDT</th><th>% капитала</th></tr>';
   for (const l of s.levels) {
     const isCurrent = l.level === s.current_level;
     h += `<tr${isCurrent ? ' style="font-weight:700"' : ''}><td>${l.level}</td><td>${money(l.stake_usdt)}</td><td>${pct(l.pct_bankroll)}</td></tr>`;
   }
   setIf('t-stakes', h);
+  setIf('stake-note', s.note || '');
 }
 
 // ═══════ 10. Hypotheses ═══════
@@ -305,18 +526,6 @@ async function renderLogsPoll() {
   const all = [...(d.research || []).slice(-8), ...(d.collector || []).slice(-5)];
   const text = all.join('\n') || 'Логов нет';
   setIf('log-content', text);
-}
-
-// ═══════ 13. Alerts ═══════
-async function renderAlerts() {
-  const d = await fetchJSON('/alerts');
-  if (!d || !d.length) { setIf('alerts-bar', ''); return; }
-  let html = '';
-  for (const a of d) {
-    const bg = a.level === 'critical' ? '#da3633' : a.level === 'error' ? '#f85149' : a.level === 'warning' ? '#d29922' : '#30363d';
-    html += `<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600;background:${bg};color:#fff;margin-right:4px">${a.source}: ${a.message}</span>`;
-  }
-  setIf('alerts-bar', html);
 }
 
 // ═══════ 14. Order Book Collector ═══════
@@ -562,14 +771,18 @@ function startSSE() {
   } catch {}
 }
 
+const refBox = document.getElementById('ref-details');
+refBox.addEventListener('toggle', () => { if (refBox.open) { renderRisk(); renderStakes(); } });
+
 async function refreshAll() {
   await Promise.all([
-    renderPaper(), renderRisk(), renderStakes(),
-    renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll(),
-    renderAlerts(), renderOBCollector(), renderCandleCollector(), renderResearchConclusion(),
+    renderOverview(), renderFunnel(), renderCoverage(), renderCollectors(), renderEquity(),
+    renderPaper(), renderHypotheses(), renderCaptures(), renderStatus(), renderLogsPoll(),
+    renderOBCollector(), renderCandleCollector(), renderResearchConclusion(),
     renderL2Screen(),
     renderSysStatus(), renderResearchController(), renderLiveData()
   ]);
+  if (refBox.open) { renderRisk(); renderStakes(); }
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
   countdown = 15;
 }

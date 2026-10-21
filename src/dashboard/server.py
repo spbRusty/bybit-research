@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -21,6 +21,11 @@ app = FastAPI(title="Bybit Research Dashboard", version="0.2.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -106,6 +111,31 @@ def api_l2_screen():
 @app.get("/api/alerts")
 def api_alerts():
     return JSONResponse(collectors.get_alerts())
+
+
+@app.get("/api/overview")
+def api_overview():
+    return JSONResponse(collectors.get_overview())
+
+
+@app.get("/api/coverage")
+def api_coverage():
+    return JSONResponse(collectors.get_coverage())
+
+
+@app.get("/api/collectors")
+def api_collectors():
+    return JSONResponse(collectors.get_collectors())
+
+
+@app.get("/api/equity")
+def api_equity():
+    return JSONResponse(collectors.get_equity())
+
+
+@app.get("/api/milestones")
+def api_milestones():
+    return JSONResponse(collectors.get_milestones())
 
 
 @app.get("/api/stream")

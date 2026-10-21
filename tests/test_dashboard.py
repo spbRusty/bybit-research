@@ -359,5 +359,326 @@ class TestStatusBlocks(unittest.TestCase):
         )
 
 
+class TestNewRoutes(unittest.TestCase):
+    """Redesign: 5 new read-only endpoints are registered."""
+
+    def test_routes_registered(self):
+        from src.dashboard.server import app
+        paths = {r.path for r in app.routes}
+        for p in ("/api/overview", "/api/coverage", "/api/collectors",
+                  "/api/equity", "/api/milestones"):
+            self.assertIn(p, paths)
+
+
+class _FakeProc:
+    def __init__(self, stdout: str, returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
+
+
+class _FakeRoot:
+    """Поддельный корень проекта: config/, results/, collector/logs/."""
+
+    def __init__(self, tmp: Path):
+        self.root = tmp / "root"
+        (self.root / "config").mkdir(parents=True)
+        (self.root / "config" / "l2_research.toml").write_text(
+            '[periods]\n'
+            'discovery = ["2026-09-06", "2026-11-12"]\n'
+            'validation = ["2026-11-12", "2026-11-26"]\n'
+            'oos = ["2026-11-26", "2026-12-10"]\n'
+        )
+        self.results = self.root / "results"
+        self.results.mkdir()
+        self.paper = self.root / "paper" / "portfolio"
+        self.paper.mkdir(parents=True)
+        self.shadow = self.root / "paper" / "shadow"
+        self.shadow.mkdir(parents=True)
+        self.trades = self.root / "paper" / "trades"
+        self.trades.mkdir(parents=True)
+        self.events = self.root / "events"
+        self.events.mkdir()
+
+    def write_screen(self, **fields):
+        payload = {"verdict": "PENDING_DATA", "reason": "нет кандидатов",
+                   "n_events": {"discovery": 100, "validation": 0, "oos": 0},
+                   "n_bh_significant": 0, "n_hypotheses": 7,
+                   "coverage_ok_share": 0.965}
+        payload.update(fields)
+        (self.results / "l2_screen_20260911T120000Z.json").write_text(json.dumps(payload))
+
+    def write_log(self, rel: str, text: str, age_min: float = 0.0):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        ts = datetime.now(timezone.utc) - timedelta(minutes=age_min)
+        _set_mtime(path, ts)
+        return path
+
+
+class TestOverview(unittest.TestCase):
+    """Redesign: /api/overview = сервисы + вердикт + приёмка + блокеры."""
+
+    def setUp(self):
+        collectors._cache.clear()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fr = _FakeRoot(self.tmp)
+        self.fr.write_screen()
+        self.fr.write_log("collector/logs/bybit_klines.log", "ok\n")
+        self.fr.write_log("collector/logs/marketdata.log", "ok\n")
+        self.fr.write_log("collector/logs/ob_reconstructor.log", "ok\n", age_min=120)
+        self.fr.paper.joinpath("state.json").write_text(json.dumps(
+            {"balance": 1000.0, "equity_start": 1000.0, "trade_count": 0,
+             "realized_pnl": 0.0}))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _overview(self):
+        with patch("src.dashboard.collectors.ROOT", self.fr.root), \
+             patch("src.dashboard.collectors.RESULTS_DIR", self.fr.results), \
+             patch("src.dashboard.collectors.PAPER_PORTFOLIO", self.fr.paper), \
+             patch("src.dashboard.collectors.PAPER_SHADOW", self.fr.shadow), \
+             patch("src.dashboard.collectors._next_timer_run", lambda *a, **k: "18:36"):
+            return collectors.get_overview()
+
+    def test_shape_and_verdict(self):
+        d = self._overview()
+        for k in ("services", "research", "paper", "next_run", "alerts"):
+            self.assertIn(k, d)
+        self.assertEqual(d["research"]["verdict"], "PENDING_DATA")
+        self.assertEqual(d["research"]["discovery"], ["2026-09-06", "2026-11-12"])
+        self.assertEqual(d["next_run"], "18:36")
+
+    def test_acceptance_is_oos_end_plus_day(self):
+        d = self._overview()
+        self.assertEqual(d["research"]["acceptance_date"], "2026-12-11")
+        self.assertIsInstance(d["research"]["days_to_acceptance"], int)
+
+    def test_stale_service_flagged_and_alert(self):
+        d = self._overview()
+        self.assertTrue(d["services"]["klines"]["active"])
+        self.assertFalse(d["services"]["ob_reconstructor"]["active"])
+        srcs = {a["source"] for a in d["alerts"]}
+        self.assertIn("Стакан", srcs)
+
+    def test_alerts_include_candidate_blocker(self):
+        d = self._overview()
+        msgs = " ".join(a["message"] for a in d["alerts"])
+        self.assertIn("CANDIDATE", msgs)
+        self.assertIn("2026-12-11", msgs)
+
+    def test_candidate_verdict_has_no_candidate_blocker(self):
+        self.fr.write_screen(verdict="CANDIDATE")
+        d = self._overview()
+        msgs = " ".join(a["message"] for a in d["alerts"])
+        self.assertNotIn("нужен CANDIDATE", msgs)
+
+
+class TestCoverageEndpoint(unittest.TestCase):
+    """Redesign: /api/coverage считает строки только по метаданным parquet."""
+
+    def setUp(self):
+        collectors._cache.clear()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fr = _FakeRoot(self.tmp)
+        self.fr.write_screen()
+        d = self.fr.events / "l2_events"
+        d.mkdir()
+        pl.DataFrame({"a": list(range(3))}).write_parquet(d / "2026-11-26.parquet")
+        pl.DataFrame({"a": list(range(5))}).write_parquet(d / "2026-11-27.parquet")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_rows_summed_from_metadata(self):
+        with patch("src.dashboard.collectors.EVENTS_DIR", self.fr.events), \
+             patch("src.dashboard.collectors.RESULTS_DIR", self.fr.results):
+            d = collectors.get_coverage()
+        self.assertEqual(d["dates_count"], 2)
+        self.assertEqual(d["total_rows"], 8)
+        self.assertEqual([x["date"] for x in d["dates"]],
+                         ["2026-11-26", "2026-11-27"])
+        self.assertIsInstance(d["total_size_mb"], float)
+        self.assertIn("size_mb", d["dates"][0])
+        self.assertEqual(d["coverage_ok_share"], 0.965)
+
+
+class TestCollectorsEndpoint(unittest.TestCase):
+    """Redesign: /api/collectors парсит хвост логов, а не читает их целиком."""
+
+    def setUp(self):
+        collectors._cache.clear()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fr = _FakeRoot(self.tmp)
+        self.fr.write_log("collector/logs/ob_reconstructor.log",
+                          "[stats] 100s: msgs=1000 snaps=10 active=740/744 jumps=2 "
+                          "reconn=740 rows=312028\n"
+                          "[stats] 200s: msgs=3000 snaps=20 active=740/744 jumps=2 "
+                          "reconn=740 rows=312028\n"
+                          "queue full: 1\n")
+        self.fr.write_log("collector/logs/marketdata.log",
+                          "[ws trades] подписан: 744 символов\n"
+                          "[ws liquidation] подписан: 744 символов\n")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_parsed_from_log_tail(self):
+        with patch("src.dashboard.collectors.ROOT", self.fr.root), \
+             patch("src.dashboard.collectors.MARKET_DATA_DIR", self.tmp / "md"), \
+             patch("src.dashboard.collectors.RAW_KLINES_DIR", self.tmp / "klines"):
+            d = collectors.get_collectors()
+        self.assertEqual(d["ob"]["active_symbols"], 740)
+        self.assertEqual(d["ob"]["symbols_total"], 744)
+        self.assertEqual(d["ob"]["rows"], 312028)
+        self.assertEqual(d["ob"]["reconnects"], 740)
+        self.assertEqual(d["ob"]["queue_full"], 1)
+        self.assertEqual(d["ob"]["msgs_per_s"], 20.0)
+        self.assertEqual(d["marketdata"]["trades_symbols"], 744)
+        self.assertEqual(d["marketdata"]["liquidation_symbols"], 744)
+
+
+class TestEquityEndpoint(unittest.TestCase):
+    """Redesign: /api/equity = точки капитала, последние сделки, причина пустоты."""
+
+    def setUp(self):
+        collectors._cache.clear()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fr = _FakeRoot(self.tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _equity(self):
+        with patch("src.dashboard.collectors.PAPER_PORTFOLIO", self.fr.paper), \
+             patch("src.dashboard.collectors.PAPER_SHADOW", self.fr.shadow), \
+             patch("src.dashboard.collectors.PAPER_TRADES", self.fr.trades), \
+             patch("src.dashboard.collectors.ROOT", self.fr.root):
+            return collectors.get_equity()
+
+    def test_empty_paper_explains_why(self):
+        self.fr.paper.joinpath("state.json").write_text(json.dumps(
+            {"balance": 1000.0, "equity_start": 1000.0, "started_at": "2026-09-01T00:00:00"}))
+        d = self._equity()
+        self.assertEqual(d["trades_count"], 0)
+        self.assertEqual(len(d["points"]), 1)         # только старт капитала
+        self.assertEqual(d["points"][0]["equity"], 1000.0)
+        self.assertIn("CANDIDATE", d["empty_reason"])
+        self.assertIn("2026-12-11", d["empty_reason"])
+
+    def test_points_and_trades(self):
+        self.fr.paper.joinpath("state.json").write_text(json.dumps(
+            {"balance": 1010.0, "equity_start": 1000.0, "started_at": "2026-09-01T00:00:00"}))
+        pl.DataFrame({
+            "trade_id": ["t1"],
+            "symbol": ["BTCUSDT"],
+            "side": ["LONG"],
+            "net_pnl": [10.0],
+            "balance_after": [1010.0],
+            "entry_timestamp": ["2026-09-02T00:00:00"],
+            "exit_timestamp": ["2026-09-02T01:00:00"],
+            "entry_fee": [0.5],
+            "exit_fee": [0.5],
+            "slippage_cost": [0.1],
+            "reason": ["TP"],
+        }).write_parquet(self.fr.trades / "t1.parquet")
+        d = self._equity()
+        self.assertEqual(d["trades_count"], 1)
+        self.assertEqual(len(d["points"]), 2)
+        self.assertEqual(d["points"][0]["equity"], 1000.0)
+        self.assertEqual(d["points"][1]["equity"], 1010.0)
+        self.assertEqual(d["trades"][0]["symbol"], "BTCUSDT")
+        self.assertIsNone(d["empty_reason"])
+
+
+class TestMilestonesEndpoint(unittest.TestCase):
+    """Redesign: /api/milestones = воронка окон + дата приёмки + блокеры."""
+
+    def setUp(self):
+        collectors._cache.clear()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fr = _FakeRoot(self.tmp)
+        self.fr.write_screen()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _milestones(self):
+        with patch("src.dashboard.collectors.ROOT", self.fr.root), \
+             patch("src.dashboard.collectors.RESULTS_DIR", self.fr.results):
+            return collectors.get_milestones()
+
+    def test_stages_and_acceptance(self):
+        d = self._milestones()
+        self.assertEqual([s["key"] for s in d["stages"]],
+                         ["discovery", "validation", "oos"])
+        self.assertEqual(d["stages"][0]["start"], "2026-09-06")
+        self.assertEqual(d["acceptance_date"], "2026-12-11")
+        self.assertTrue(d["blockers"])
+
+    def test_blockers_mention_candidate_and_empty_windows(self):
+        d = self._milestones()
+        joined = " ".join(d["blockers"])
+        self.assertIn("CANDIDATE", joined)
+        self.assertIn("validation", joined)
+        self.assertIn("OOS", joined)
+
+
+class TestNextTimerRun(unittest.TestCase):
+    """Таймер читается из systemd и кешируется на 60с (часто — дёшево)."""
+
+    def setUp(self):
+        collectors._cache.clear()
+
+    def test_parses_next_time(self):
+        out = ("NEXT LEFT LAST PASSED UNIT ACTIVATES\n"
+               "Wed 2026-10-21 18:36:00 UTC 3min Mon 2026-10-21 18:30:00 UTC 5min "
+               "l2_search.timer l2_search.service\n")
+        with patch("src.dashboard.collectors.subprocess.run",
+                   return_value=_FakeProc(out)) as run:
+            self.assertEqual(collectors._next_timer_run(), "18:36")
+            self.assertEqual(collectors._next_timer_run(), "18:36")
+        self.assertEqual(run.call_count, 1)   # кеш 60с
+
+    def test_inactive_timer_returns_none(self):
+        out = ("-         Mon 2026-01-01 00:00:00 UTC  -  Wed 2026-01-01 00:00:00 UTC  -  "
+               "l2_search.timer  l2_search.service\n")
+        with patch("src.dashboard.collectors.subprocess.run",
+                   return_value=_FakeProc(out)):
+            self.assertIsNone(collectors._next_timer_run())
+
+
+class TestRedesignHtml(unittest.TestCase):
+    """Redesign: обзорный блок, воронка и сводка-справочник в index.html."""
+
+    def setUp(self):
+        self.html = INDEX_HTML.read_text(encoding="utf-8")
+
+    def test_overview_bar_present(self):
+        self.assertIn('id="row-overview"', self.html)
+        for hid in ("ov-verdict", "ov-days", "ov-coverage", "ov-collectors", "ov-paper"):
+            self.assertIn(f'id="{hid}"', self.html)
+
+    def test_funnel_coverage_collectors_present(self):
+        for hid in ("funnel", "funnel-blocker", "coverage-table", "collectors-row"):
+            self.assertIn(f'id="{hid}"', self.html)
+
+    def test_reference_blocks_moved_into_details(self):
+        self.assertIn('id="ref-details"', self.html)
+        for hid in ("t-risk", "t-sizing", "t-costs", "t-stakes"):
+            self.assertIn(f'id="{hid}"', self.html)
+
+    def test_new_endpoints_called(self):
+        for ep in ("/overview", "/coverage", "/collectors", "/equity", "/milestones"):
+            self.assertIn(f"fetchJSON('{ep}')", self.html)
+
+
 if __name__ == "__main__":
     unittest.main()
