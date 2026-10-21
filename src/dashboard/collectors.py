@@ -288,7 +288,13 @@ def get_pipeline_status() -> dict:
 # ─── 8. Hypotheses ─────────────────────────────────────────────────
 
 def get_hypotheses() -> dict:
-    return _cached("hypotheses", 60, _get_hypotheses)
+    # ключ включает mtime реестра: после прогона research данные не ждут TTL
+    reg = HYPOTHESES_DIR / "hypotheses_v1.json"
+    try:
+        stamp = reg.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    return _cached(f"hypotheses:{stamp}", 60, _get_hypotheses)
 
 
 def _get_hypotheses() -> dict:

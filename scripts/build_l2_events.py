@@ -38,7 +38,6 @@ from src.orderbook_integration import (  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("src.data").setLevel(logging.ERROR)  # gap-warning flood x882
 
-DUMP = Path("/home/vlad/Документы/bybit_rs/data/orderbook")
 # Accumulating store: ONE parquet per UTC date. The reconstructed source tree is a
 # rolling ~3-day window (collector cleanup), so these derived events are the only
 # durable record for the pre-registered study — old date partitions are NEVER
@@ -90,35 +89,18 @@ def minute_grid(ts: np.ndarray, dates: set[str] | None = None) -> np.ndarray:
 
 
 def universe() -> tuple[list[str], dict[str, str], list[str]]:
-    """Symbol dirs (union of both trees) -> category, skipped (no klines)."""
+    """Symbol dirs (union of both trees) -> category по раскладке klines."""
     dirs = sorted({p.name for r in ROOTS if r.is_dir()
                    for p in r.iterdir() if p.is_dir()})
-    lin = spo = set()
-    for cat, sink in (("linear", "lin"), ("spot", "spo")):
-        ps = sorted((DUMP / cat).glob("*.parquet"))
-        if ps:
-            got = set(pl.concat(
-                [pl.read_parquet(p, columns=["symbol"]) for p in ps]
-            )["symbol"].unique())
-            if sink == "lin":
-                lin = got
-            else:
-                spo = got
     cats: dict[str, str] = {}
     skipped: list[str] = []
     for s in dirs:
-        if s in lin:
+        if (RAW_KLINES_DIR / "linear" / s).is_dir():
             cats[s] = "linear"
-        elif s in spo:
+        elif (RAW_KLINES_DIR / "spot" / s).is_dir():
             cats[s] = "spot"
         else:
-            cat = next((c for c in ("linear", "spot")
-                        if (RAW_KLINES_DIR / c / f"{s}_{c}_1m.parquet").exists()),
-                       None)
-            if cat is None:
-                skipped.append(s)
-            else:
-                cats[s] = cat
+            skipped.append(s)
     # L2-поток теперь собирается только по linear (ob_reconstructor). Spot
     # оставался с покрытием ~2% и лишь загрязнял выборку — исключаем его.
     return [s for s in dirs if s in cats and cats[s] == "linear"], cats, skipped
@@ -312,7 +294,7 @@ def main() -> int:
     # Accumulate: swap ONLY the partitions for the dates just (re)built from the
     # rolling source window; every other date partition is left untouched. Guard:
     # NEVER shrink a partition. Aged-out dates get re-materialized from the coarse
-    # hourly bybit_rs dumps (l2_to_reconstructed gap-fill), which yields far fewer
+    # coarse legacy dumps, which yield far fewer
     # rows than the dense live-derived snapshot; keeping the larger version stops
     # that silent downgrade. ponytail: row-count heuristic — replace with an
     # explicit "source is live" marker if dump/live densities ever converge.

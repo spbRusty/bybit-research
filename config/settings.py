@@ -22,15 +22,15 @@ def _load_env(path: Path):
 
 _load_env(ROOT / ".env")
 
-# --- Сырые свечи Bybit (готовы, скачаны Rust-загрузчиком bybit_rs) ---
+# --- Сырые свечи Bybit (Rust bybit_klines, теперь внутри монорепо) ---
 RAW_KLINES_DIR = Path(os.environ.get(
     "RAW_KLINES_DIR",
-    str(Path.home() / "Документы/bybit_rs/data/klines")))
+    str(ROOT / "collector" / "data" / "klines")))
 
 # --- Тиковые рыночные потоки (Rust marketdata-сервис, §12-§15) ---
 MARKET_DATA_DIR = Path(os.environ.get(
     "MARKET_DATA_DIR",
-    str(Path.home() / "Документы/построение/collector/data/market")))
+    str(ROOT / "collector" / "data" / "market")))
 
 # --- Выходы (ТЗ §4) ---
 DATA = ROOT / "data"

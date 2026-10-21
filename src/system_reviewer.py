@@ -54,7 +54,7 @@ SERVICES = [  # (systemd scope, unit)
 OB_RECONSTRUCTED = ROOT / "collector" / "data" / "market" / "orderbook" / "reconstructed"
 OB_METRICS = OB_RECONSTRUCTED / "_metrics.jsonl"
 TRADES_DIR = ROOT / "collector" / "data" / "market" / "trades"
-KLINES_DIR = ROOT / ".." / "bybit_rs" / "data" / "klines"
+KLINES_DIR = ROOT / "collector" / "data" / "klines"
 SYMBOLS_FILE = ROOT / "data" / "market" / "symbols" / "linear_smoke.txt"
 
 

@@ -1,11 +1,11 @@
 [package]
-name = "bybit_rs"
+name = "bybit_collector"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "bybit_rs"
-path = "src/main.rs"
+name = "bybit_klines"
+path = "src/bin/bybit_klines.rs"
 
 [[bin]]
 name = "marketdata"
