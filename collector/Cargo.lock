@@ -382,6 +382,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "smallvec",
  "tokio",
  "tokio-tungstenite",
 ]

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
 
-use collector_lib::book_state::{BookState, LevelSnapshot, ReconstructedSnapshot};
+use collector_lib::book_state::{BookState, LevelSnapshot, ReconstructedSnapshot, SNAPSHOT_LEVELS};
 
 const WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const SUB_CHUNK: usize = 100; // символов на одно WS-соединение, как в marketdata.rs
@@ -109,8 +109,9 @@ fn read_snaps_from_parquet(path: &Path) -> Result<Vec<ReconstructedSnapshot>> {
 
     let file = fs::File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let row_count = builder.metadata().file_metadata().num_rows() as usize;
     let reader = builder.build()?;
-    let mut snaps = Vec::new();
+    let mut snaps = Vec::with_capacity(row_count);
     for batch in reader {
         let b = batch?;
         let ts = downcast_array::<Int64Array>(&b, 0)?;
@@ -125,7 +126,7 @@ fn read_snaps_from_parquet(path: &Path) -> Result<Vec<ReconstructedSnapshot>> {
         let nl = downcast_array::<Int64Array>(&b, 9)?;
         for r in 0..b.num_rows() {
             let n_levels = nl.value(r).max(0) as usize;
-            let mut levels = Vec::with_capacity(n_levels.min(MAX_LEVEL_COLS));
+            let mut levels = smallvec::SmallVec::with_capacity(n_levels.min(MAX_LEVEL_COLS));
             for i in 0..n_levels.min(MAX_LEVEL_COLS) {
                 let base = 10 + i * 4;
                 levels.push(LevelSnapshot {
@@ -343,7 +344,7 @@ fn parse_msg(v: &Value) -> Option<ObData> {
     Some(ObData { symbol, update_id, timestamp_ms, is_snapshot, bids, asks })
 }
 
-const MAX_LEVEL_COLS: usize = 20;
+const MAX_LEVEL_COLS: usize = SNAPSHOT_LEVELS;
 
 /// Батч из главного цикла в шард: снапшоты + сырые строки (по датам) + счётчик ошибок символа.
 struct FlushBatch {
@@ -948,7 +949,8 @@ impl ShardState {
         if !batch.snaps.is_empty() {
             let by_hour = group_snaps_by_hour(batch.snaps);
             let entry = self.buffers.entry(symbol.clone()).or_insert_with(|| HourBuffer {
-                hour: 0, snaps: Vec::new(), rows_since_write: 0, errors: Arc::new(AtomicU64::new(0)),
+                hour: 0, snaps: Vec::with_capacity(720), rows_since_write: 0,
+                errors: Arc::new(AtomicU64::new(0)),
             });
             entry.errors = errors.clone();
             finalized = merge_into_buffer(entry, by_hour);
@@ -1011,15 +1013,42 @@ impl ShardState {
     }
 
     /// Checkpoint: раз в CHECKPOINT_SECS пишем текущий час, если буфер вырос >= 1 строки.
+    ///
+    /// Пишем по одному символу: буфер временно изымается и возвращается после
+    /// записи. Раньше clone() всех буферов одновременно давал пик RAM +весь час.
     async fn checkpoint(&mut self) {
-        let mut writes = Vec::new();
-        for (symbol, buf) in &mut self.buffers {
-            if buf.rows_since_write > 0 && !buf.snaps.is_empty() {
-                writes.push((symbol.clone(), buf.hour, buf.snaps.clone(), buf.errors.clone()));
+        let keys: Vec<String> = self.buffers.keys().cloned().collect();
+        for symbol in keys {
+            let (hour, snaps, errors) = {
+                let Some(buf) = self.buffers.get_mut(&symbol) else { continue };
+                if buf.rows_since_write == 0 || buf.snaps.is_empty() { continue; }
                 buf.rows_since_write = 0;
+                (buf.hour, std::mem::take(&mut buf.snaps), buf.errors.clone())
+            };
+            let data_root = self.data_root.clone();
+            let sym = symbol.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                let path = data_root.join(&sym).join(hour_filename(hour));
+                let r = write_parquet_new(&path, &snaps);
+                (r, snaps)
+            })
+            .await;
+            match res {
+                Ok((r, snaps)) => {
+                    if let Err(e) = r {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[writer] {symbol} error: {e:#}");
+                    }
+                    if let Some(buf) = self.buffers.get_mut(&symbol) {
+                        buf.snaps = snaps;
+                    }
+                }
+                Err(e) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[writer] {symbol} join error: {e}");
+                }
             }
         }
-        self.write_hour_files(writes).await;
     }
 
     /// Shutdown: пишем все оставшиеся часовые буферы.
@@ -1249,7 +1278,7 @@ mod tests {
             best_ask: 101.0,
             spread_bps: 99.5,
             mid_price: 100.5,
-            levels: vec![LevelSnapshot { level: 1, bid_px: 100.0, bid_sz: 1.0, ask_px: 101.0, ask_sz: 1.5 }],
+            levels: vec![LevelSnapshot { level: 1, bid_px: 100.0, bid_sz: 1.0, ask_px: 101.0, ask_sz: 1.5 }].into(),
             gap_detected: false,
             reconstruction_version: "1.0".to_string(),
         }

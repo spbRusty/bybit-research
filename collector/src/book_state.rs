@@ -16,6 +16,11 @@
 
 use std::collections::BTreeMap;
 
+use smallvec::SmallVec;
+
+/// Сколько уровней хранится в одном снапшоте (совпадает с MAX_LEVEL_COLS в писателе).
+pub const SNAPSHOT_LEVELS: usize = 20;
+
 /// One level in the orderbook: (price, qty) for one side.
 pub type Level = (f64, f64);
 
@@ -29,7 +34,7 @@ pub struct ReconstructedSnapshot {
     pub best_ask: f64,
     pub spread_bps: f64,
     pub mid_price: f64,
-    pub levels: Vec<LevelSnapshot>,
+    pub levels: SmallVec<[LevelSnapshot; SNAPSHOT_LEVELS]>,
     pub gap_detected: bool,
     pub reconstruction_version: String,
 }
@@ -203,16 +208,16 @@ impl BookState {
             0.0
         };
 
-        let mut levels = Vec::new();
-        let bid_vec: Vec<_> = self.bids.iter().rev().collect();
-        let ask_vec: Vec<_> = self.asks.iter().collect();
-
-        let max_levels = bid_vec.len().max(ask_vec.len()).min(50);
+        // Без временных Vec<&...>: два итератора + inline-буфер уровней.
+        // Уровни сверх SNAPSHOT_LEVELS всё равно отбрасывались писателем.
+        let max_levels = self.bids.len().max(self.asks.len()).min(SNAPSHOT_LEVELS);
+        let mut bids = self.bids.iter().rev();
+        let mut asks = self.asks.iter();
+        let mut levels: SmallVec<[LevelSnapshot; SNAPSHOT_LEVELS]> =
+            SmallVec::with_capacity(max_levels);
         for i in 0..max_levels {
-            let bid_px = bid_vec.get(i).map_or(0.0, |(k, _)| k.0);
-            let bid_sz = bid_vec.get(i).map_or(0.0, |(_, v)| **v);
-            let ask_px = ask_vec.get(i).map_or(0.0, |(k, _)| k.0);
-            let ask_sz = ask_vec.get(i).map_or(0.0, |(_, v)| **v);
+            let (bid_px, bid_sz) = bids.next().map_or((0.0, 0.0), |(k, v)| (k.0, *v));
+            let (ask_px, ask_sz) = asks.next().map_or((0.0, 0.0), |(k, v)| (k.0, *v));
             levels.push(LevelSnapshot {
                 level: (i + 1) as i32,
                 bid_px,
