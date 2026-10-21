@@ -484,6 +484,22 @@ def run_review(bin_path: str, model: str, timeout: int, notify_on_pass: bool) ->
     ctx = gather_context()
 
     ok, output = run_opencode(ctx, bin_path, model, timeout)
+    # Free-tier провайдеры иногда отвечают "only from within OpenCode" или
+    # обрывают соединение. Один retry на другой модели, не дольше 10 минут.
+    fallback = os.environ.get("REVIEW_FALLBACK_MODEL", "opencode/big-pickle")
+    if not ok and fallback and fallback != model:
+        low = output.lower()
+        transient = any(k in low for k in (
+            "free tier", "console", "provider", "connection",
+            "econn", "timed out", "timeout", "network"))
+        if transient:
+            logger.warning("opencode failed (%s); retry with %s",
+                           output[:120].replace("\n", " "), fallback)
+            ok2, out2 = run_opencode(ctx, bin_path, fallback, min(timeout, 600))
+            if ok2:
+                ok, output = ok2, out2
+            else:
+                output = output + "\n--- fallback ---\n" + out2
     verdict = extract_verdict(output) if ok else None
 
     if ok and verdict:

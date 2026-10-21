@@ -1,7 +1,7 @@
 ---
 description: System reviewer for bybit-research. Periodic read-only audit of the research system: collector health, data quality, research pipeline, hypotheses, orderbook, shadow/paper, infrastructure, methodological invariants. Returns a structured JSON verdict. NEVER edits code.
 mode: primary
-model: opencode/big-pickle
+model: opencode-go/deepseek-v4.1-flash
 permission:
   edit: deny
   write: deny

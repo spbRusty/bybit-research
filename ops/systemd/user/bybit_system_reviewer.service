@@ -6,7 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/vlad/Документы/построение
-Environment=REVIEW_MODEL=opencode/big-pickle
+Environment=REVIEW_MODEL=opencode-go/deepseek-v4.1-flash
+Environment=REVIEW_FALLBACK_MODEL=opencode/big-pickle
 Environment=REVIEW_NOTIFY_ON_PASS=0
 ExecStart=/home/vlad/Документы/построение/.venv/bin/python -m src.system_reviewer --once
 Restart=on-failure

@@ -103,10 +103,19 @@ def _check_gates() -> None:
         raise ValueError(f"l2_research.toml gates weaker than research.toml: {weaker}")
 
 
+_NOTIFY_TITLE = {
+    "NOT_READY": "L2: данные ещё не готовы",
+    "PENDING_DATA": "L2: ждём validation/OOS",
+    "CANDIDATE": "L2: найден кандидат",
+    "NO_CANDIDATE": "L2: кандидатов нет",
+}
+
+
 def _notify(verdict: str, body: str) -> None:
     try:
         r = subprocess.run(
-            ["curl", "-sS", "-H", f"Title: L2-скрин: {verdict}", "-d", body, NTFY_URL],
+            ["curl", "-sS", "-H", f"Title: {_NOTIFY_TITLE.get(verdict, verdict)}",
+             "-H", "Tags: chart_with_upwards_trend", "-d", body, NTFY_URL],
             capture_output=True, text=True, timeout=20)
         if r.returncode != 0:
             logger.warning("ntfy curl rc=%s: %s", r.returncode, r.stderr.strip())
@@ -204,26 +213,67 @@ def _top_lines(rows: list[dict], n: int = 3) -> list[str]:
             for r in _top_by_gross(rows, n)]
 
 
+_NOTIFY_HUMAN = {
+    "NOT_READY": "Скрин не смог запуститься: не хватает данных или признаков.",
+    "PENDING_DATA": "Скрин отработал, но честный вердикт пока невозможен: "
+                    "окна validation/OOS ещё не заполнены.",
+    "CANDIDATE": "Гипотеза прошла все ворота. Paper можно запускать.",
+    "NO_CANDIDATE": "Ни одна гипотеза не покрыла издержки. Paper не запускается.",
+}
+
+
+def _should_notify(verdict: str) -> bool:
+    """PENDING_DATA — не чаще раза в 7 дней, остальные вердикты — всегда."""
+    if verdict != "PENDING_DATA":
+        return True
+    path = RESULTS_DIR / ".l2_notify_state.json"
+    try:
+        st = json.loads(path.read_text())
+    except (OSError, ValueError):
+        st = {}
+    if st.get("verdict") == verdict:
+        try:
+            age = (datetime.now(tz=timezone.utc)
+                   - datetime.fromisoformat(st.get("at", ""))).total_seconds()
+            if age < 7 * 86400:
+                logger.info("ntfy suppressed: PENDING_DATA уже отправлен %.1f дн назад",
+                            age / 86400)
+                return False
+        except ValueError:
+            pass
+    try:
+        path.write_text(json.dumps({"verdict": verdict,
+                                    "at": datetime.now(tz=timezone.utc).isoformat()}))
+    except OSError:
+        pass
+    return True
+
+
 def _notify_report(verdict: str, *, coverage: str = "", screening: str = "",
                    top: list[str] | None = None, extra: str = "",
                    next_step: str = "") -> None:
-    """Собрать русскоязычный многострочный отчёт и отправить его в ntfy."""
-    sections = [f"Вердикт: {verdict}\n{_explain(verdict)}"]
+    """Короткое человеческое уведомление: что случилось, цифры, что делать."""
+    if not _should_notify(verdict):
+        return
+    lines = [_NOTIFY_HUMAN.get(verdict, verdict), ""]
+    if verdict == "CANDIDATE" and extra:
+        lines.extend([extra, ""])
     if coverage:
-        sections.append(f"Данные:\n{coverage}")
+        lines.append(f"Данные: {coverage}")
     if screening:
-        sections.append(f"Скрининг:\n{screening}")
-    if extra:
-        sections.append(extra)
-    if top:
-        sections.append("Топ-3 по gross:\n" + "\n".join(top))
+        lines.append(f"Скрининг: {screening}")
+    if verdict == "CANDIDATE" and top:
+        lines.append(f"Лучший кандидат: {top[0]}")
+    if verdict == "PENDING_DATA":
+        lines.append("")
+        lines.append("Это не ошибка и не сигнал торговать. Напоминание — раз в неделю.")
+    lines.append("")
     if next_step:
-        sections.append(f"Что дальше: {next_step}")
-    sections.append("L2-поиск идёт ежедневно автоматически; "
-                     "дашборд: http://127.0.0.1:8420")
-    body = "\n\n".join(sections)
-    if len(body) > 3500:                      # ntfy limit guard
-        body = body[:3497] + "..."
+        lines.append(f"Что делать: {next_step}")
+    lines.append("Дашборд: http://127.0.0.1:8420")
+    body = "\n".join(lines)
+    if len(body) > 1800:
+        body = body[:1797] + "..."
     _notify(verdict, body)
 
 
@@ -378,18 +428,15 @@ def main(argv: list[str] | None = None) -> int:
         covers = "покрывает" if best >= cost else "НЕ покрывает"
         _notify_report(
             "PENDING_DATA",
-            coverage=f"{dates_covered[0]}..{dates_covered[1]}, "
-                     f"дат: {ot['open_time'].dt.date().n_unique()}, "
-                     f"строк: {ot.height}, "
-                     f"символов: {ot['symbol'].n_unique()}, "
-                     f"признаков ob_*: {len(feats)}",
-            screening=f"гипотез прогнано: {len(rows)}, BH-значимых (q={q_bh}): {int(sig.sum())}\n"
-                      f"лучший gross: {_bp(best)} bp из {cost * 10000:.1f} bp издержек "
-                      f"— издержки {covers}",
-            top=_top_lines(rows),
-            next_step=f"окно validation откроется {PERIODS['validation'][0]}, "
-                      f"oos — {PERIODS['oos'][0]}; честный вердикт возможен "
-                      f"не раньше {ACCEPTANCE_DATE:%Y-%m-%d}")
+            coverage=f"{dates_covered[0]}..{dates_covered[1]} · "
+                     f"{ot['open_time'].dt.date().n_unique()} дат · "
+                     f"{ot.height / 1e6:.1f}M строк · "
+                     f"{ot['symbol'].n_unique()} симв. · ok {coverage_ok_share:.0%}",
+            screening=f"{len(rows)} гипотез · BH {int(sig.sum())} · "
+                      f"лучший gross {_bp(best)} bp при издержках {cost * 1e4:.1f} bp "
+                      f"({'покрывает' if best >= cost else 'не покрывает'})",
+            next_step=f"ничего не делать. Честный вердикт — не раньше "
+                      f"{ACCEPTANCE_DATE:%Y-%m-%d}, скрин идёт автоматически.")
         return _emit(out, ts)
 
     # --- Full acceptance (all periods populated, on/after oos close) ---
@@ -485,32 +532,31 @@ def main(argv: list[str] | None = None) -> int:
 
     best = max(r["gross_mean"] for r in rows)
     covers = "покрывает" if best >= cost else "НЕ покрывает"
-    coverage = (f"{dates_covered[0]}..{dates_covered[1]}, "
-                f"дат: {ot['open_time'].dt.date().n_unique()}, строк: {ot.height}, "
-                f"символов: {ot['symbol'].n_unique()}, признаков ob_*: {len(feats)}\n"
-                + ", ".join(f"{k}: {v.height}" for k, v in ev.items()))
-    screening = (f"гипотез прогнано: {len(rows)}, BH-значимых (q={q_bh}): {int(sig.sum())}, "
-                 f"прошли отбор: {len(ok)}, финалистов validation: {len(finalists)}\n"
-                 f"лучший gross: {_bp(best)} bp из {cost * 10000:.1f} bp издержек "
-                 f"— издержки {covers}")
+    coverage = (f"{dates_covered[0]}..{dates_covered[1]} · "
+                f"{ot['open_time'].dt.date().n_unique()} дат · "
+                f"{ot.height / 1e6:.1f}M строк · {ot['symbol'].n_unique()} симв. · "
+                f"ok {coverage_ok_share:.0%}")
+    screening = (f"{len(rows)} гипотез · BH {int(sig.sum())} · "
+                 f"отбор {len(ok)} · validation {len(finalists)} · "
+                 f"лучший gross {_bp(best)} bp при издержках {cost * 1e4:.1f} bp "
+                 f"({'покрывает' if best >= cost else 'не покрывает'})")
     if out["verdict"] == "CANDIDATE":
         f = out["finalist"]
         gross = f["mean_net"] + cost    # test_hypothesis возвращает только net
         _notify_report(
             "CANDIDATE",
             coverage=coverage, screening=screening, top=_top_lines(rows),
-            extra=(f"Финалист:\n{f['condition']} | {f['entry_side']} | {f['horizon_min']}m | "
-                   f"n={f['n']} | t={f['t_stat']:.2f} | gross {_bp(gross)} bp | "
+            extra=(f"Кандидат: {f['condition']} · {f['entry_side']} · {f['horizon_min']}m · "
+                   f"n={f['n']} · t_HAC={f.get('t_hac', float('nan')):.2f} · "
                    f"нетто {_bp(f['mean_net'])} bp"),
-            next_step=f"окна заполнены (validation закрылось {PERIODS['validation'][1]}); "
-                      f"дальше — совмещённая BH-коррекция candle+L2, "
-                      f"решение о торговле только после неё")
+            next_step=f"paper включится автоматически на следующем цикле; "
+                      f"реальная торговля — только после совмещённой BH candle+L2.")
     else:
         _notify_report(
             "NO_CANDIDATE",
-            coverage=coverage, screening=screening, top=_top_lines(rows),
-            next_step=f"окна заполнены (validation закрылось {PERIODS['validation'][1]}); "
-                      f"следующий шанс появится только с новыми данными или новыми гипотезами")
+            coverage=coverage, screening=screening, top=None,
+            next_step=f"ничего не делать. Следующий шанс — с новыми данными "
+                      f"или новыми гипотезами.")
     return _emit(out, ts)
 
 
