@@ -1,0 +1,11 @@
+[Unit]
+Description=Run bybit_system_reviewer daily at 02:00
+Requires=bybit_system_reviewer.service
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

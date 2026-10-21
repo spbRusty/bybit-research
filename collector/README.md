@@ -1,14 +1,22 @@
-# marketdata — реалтайм-сбор расширенных рыночных потоков Bybit
+# collector — Rust-коллекторы Bybit
+
+Пакет `bybit_collector` содержит бинарники:
+- `bybit_klines` — 1m-свечи: `collector/data/klines/{linear,spot}/{SYM}/{YYYY-MM}.parquet`
+- `marketdata` — trades/futures/liquidation/ratio: `{kind}/linear/{SYM}/{YYYY-MM-DD}.parquet`
+- `ob_reconstructor` — `orderbook.50` -> reconstructed snapshots (`--no-raw` в проде)
+- `ob_capture_reconstruct` — разбор event-driven captures
+
+Ниже — детали `marketdata`.
 
 Rust-коллектор (см. `src/bin/marketdata.rs`) для групп признаков ТЗ §12–§15.
-Пишет parquet в `data/market/{trades,orderbook,futures,liquidation,ratio}/linear/{sym}.parquet`.
+Пишет parquet в `data/market/{trades,orderbook,futures,liquidation,ratio}/linear/{sym}/{YYYY-MM-DD}.parquet`.
 
 ## Сборка
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cd collector
-cargo build --release --bin marketdata
+cargo build --release
 ```
 
 ## systemd-сервис (user, без root)

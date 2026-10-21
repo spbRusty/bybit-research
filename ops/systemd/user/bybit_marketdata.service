@@ -1,0 +1,17 @@
+[Unit]
+Description=Bybit market-data collector (trades/orderbook/futures/liquidation/ratio)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vlad/Документы/построение/collector
+ExecStart=/home/vlad/Документы/построение/collector/target/release/marketdata
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/vlad/Документы/построение/collector/logs/marketdata.log
+StandardError=append:/home/vlad/Документы/построение/collector/logs/marketdata.log
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

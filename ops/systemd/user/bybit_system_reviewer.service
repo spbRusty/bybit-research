@@ -1,0 +1,21 @@
+[Unit]
+Description=Bybit system reviewer (OpenCode audit, READ-ONLY, Big Pickle)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vlad/Документы/построение
+Environment=REVIEW_MODEL=opencode/big-pickle
+Environment=REVIEW_NOTIFY_ON_PASS=0
+ExecStart=/home/vlad/Документы/построение/.venv/bin/python -m src.system_reviewer --once
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+StandardOutput=append:/home/vlad/Документы/построение/logs/system_reviewer_timer.log
+StandardError=append:/home/vlad/Документы/построение/logs/system_reviewer_timer.log
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

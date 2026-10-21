@@ -1,0 +1,18 @@
+[Unit]
+Description=Bybit orderbook reconstructor (continuous reconstructed snapshots for research)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vlad/Документы/построение/collector
+ExecStart=/home/vlad/Документы/построение/collector/target/release/ob_reconstructor --universe /home/vlad/Документы/построение/collector/data/market/symbols/linear.txt --freq 5 --no-raw
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/vlad/Документы/построение/collector/logs/ob_reconstructor.log
+StandardError=append:/home/vlad/Документы/построение/collector/logs/ob_reconstructor.log
+Environment=MALLOC_ARENA_MAX=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

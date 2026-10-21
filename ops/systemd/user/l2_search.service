@@ -1,0 +1,15 @@
+[Unit]
+Description=L2 orderbook hypothesis search (convert -> build events -> screen -> paper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vlad/Документы/построение
+ExecStart=/bin/bash -c '/home/vlad/Документы/построение/.venv/bin/python scripts/build_l2_events.py && /home/vlad/Документы/построение/.venv/bin/python -m src.l2_screen && /home/vlad/Документы/построение/.venv/bin/python scripts/l2_paper.py'
+TimeoutStartSec=infinity
+StandardOutput=append:/home/vlad/Документы/построение/logs/l2_search.log
+StandardError=append:/home/vlad/Документы/построение/logs/l2_search.log
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
