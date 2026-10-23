@@ -235,9 +235,9 @@ def _should_notify(verdict: str) -> bool:
         try:
             age = (datetime.now(tz=timezone.utc)
                    - datetime.fromisoformat(st.get("at", ""))).total_seconds()
-            if age < 7 * 86400:
-                logger.info("ntfy suppressed: PENDING_DATA уже отправлен %.1f дн назад",
-                            age / 86400)
+            if age < 2 * 3600:
+                logger.info("ntfy suppressed: PENDING_DATA уже отправлен %.1f ч назад",
+                            age / 3600)
                 return False
         except ValueError:
             pass
@@ -266,7 +266,7 @@ def _notify_report(verdict: str, *, coverage: str = "", screening: str = "",
         lines.append(f"Лучший кандидат: {top[0]}")
     if verdict == "PENDING_DATA":
         lines.append("")
-        lines.append("Это не ошибка и не сигнал торговать. Напоминание — раз в неделю.")
+        lines.append("Это не ошибка и не сигнал торговать. Напоминание — раз в 3 часа.")
     lines.append("")
     if next_step:
         lines.append(f"Что делать: {next_step}")
@@ -315,13 +315,6 @@ def main(argv: list[str] | None = None) -> int:
     latest = max(RESULTS_DIR.glob("l2_screen_*.json"),
                  key=lambda p: p.stat().st_mtime, default=None)
     if latest is not None and not args.force:
-        # Данные растут внутри суток, но вердикт/acceptance зависит от
-        # календарных дат. Один скрин в UTC-сутки достаточен и экономит
-        # ~20 минут CPU на каждом 3-часовом цикле.
-        last_day = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc).date()
-        if last_day == datetime.now(tz=timezone.utc).date():
-            logger.info("screen already ran today (%s) — skip", latest.name)
-            return 0
         if max(p.stat().st_mtime for p in store_files) <= latest.stat().st_mtime:
             logger.info("no new l2_events since %s — skip", latest.name)
             return 0

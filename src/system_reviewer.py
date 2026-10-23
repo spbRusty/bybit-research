@@ -329,15 +329,17 @@ def extract_verdict(text: str) -> dict | None:
     if not text:
         return None
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)  # снять ANSI-цвета
-    tail = text[-12000:]
+    # Вердикт paid-модели бывает длиннее 12 КБ (findings/tests), поэтому
+    # ищем по большому хвосту и парсим raw_decode, а не перебором пар скобок.
+    tail = text[-500_000:]
+    dec = json.JSONDecoder()
     for s in reversed([m.start() for m in re.finditer(r"\{", tail)]):
-        for e in reversed([m.end() for m in re.finditer(r"\}", tail[s:])]):
-            try:
-                v = json.loads(tail[s:s + e])
-            except ValueError:
-                continue
-            if isinstance(v, dict) and "overall_status" in v:
-                return v
+        try:
+            v, _ = dec.raw_decode(tail[s:])
+        except ValueError:
+            continue
+        if isinstance(v, dict) and "overall_status" in v:
+            return v
     return None
 
 
@@ -484,6 +486,10 @@ def run_review(bin_path: str, model: str, timeout: int, notify_on_pass: bool) ->
     ctx = gather_context()
 
     ok, output = run_opencode(ctx, bin_path, model, timeout)
+    try:
+        (RUNS_DIR / f"{run_file}.raw").write_text(output or "")
+    except OSError:
+        pass
     # Free-tier провайдеры иногда отвечают "only from within OpenCode" или
     # обрывают соединение. Один retry на другой модели, не дольше 10 минут.
     fallback = os.environ.get("REVIEW_FALLBACK_MODEL", "opencode/big-pickle")
