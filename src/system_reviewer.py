@@ -292,13 +292,13 @@ def run_opencode(context: dict, bin_path: str, model: str,
     """opencode run: вывод в temp-файл (не пайп — opencode плодит демонов,
     держащих пайпы), своя группа процессов, killpg по таймауту."""
     prompt = AUDIT_INSTRUCTIONS + "\n\nCONTEXT:\n" + json.dumps(context, ensure_ascii=False)
-    cmd = [bin_path, "run", "--agent", "system-reviewer", "-m", model,
-           "--dir", str(ROOT), prompt]
+    # opencode v2 убрал --dir: рабочий каталог задаём через cwd.
+    cmd = [bin_path, "run", "--agent", "system-reviewer", "-m", model, prompt]
     try:
         with tempfile.TemporaryFile() as tf:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                     stdout=tf, stderr=subprocess.STDOUT,
-                                    start_new_session=True)
+                                    cwd=str(ROOT), start_new_session=True)
             try:
                 rc = proc.wait(timeout)
             except subprocess.TimeoutExpired:
@@ -492,7 +492,7 @@ def run_review(bin_path: str, model: str, timeout: int, notify_on_pass: bool) ->
         pass
     # Free-tier провайдеры иногда отвечают "only from within OpenCode" или
     # обрывают соединение. Один retry на другой модели, не дольше 10 минут.
-    fallback = os.environ.get("REVIEW_FALLBACK_MODEL", "opencode/big-pickle")
+    fallback = os.environ.get("REVIEW_FALLBACK_MODEL", "")
     if not ok and fallback and fallback != model:
         low = output.lower()
         transient = any(k in low for k in (
