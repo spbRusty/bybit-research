@@ -296,9 +296,12 @@ def run_opencode(context: dict, bin_path: str, model: str,
     cmd = [bin_path, "run", "--agent", "system-reviewer", "-m", model, prompt]
     try:
         with tempfile.TemporaryFile() as tf:
+            # opencode ищет проект (и .opencode/agent) по $PWD, а systemd
+            # оставляет PWD=/home/vlad — передаём каталог явно.
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                     stdout=tf, stderr=subprocess.STDOUT,
-                                    cwd=str(ROOT), start_new_session=True)
+                                    cwd=str(ROOT), env=os.environ | {"PWD": str(ROOT)},
+                                    start_new_session=True)
             try:
                 rc = proc.wait(timeout)
             except subprocess.TimeoutExpired:
