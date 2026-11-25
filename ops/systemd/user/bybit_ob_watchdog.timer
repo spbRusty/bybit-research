@@ -1,0 +1,9 @@
+[Unit]
+Description=Check ob_reconstructor liveness every 5 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

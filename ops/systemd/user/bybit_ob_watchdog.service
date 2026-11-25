@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart ob_reconstructor if its log stops growing (silent WS stall)
+
+[Service]
+Type=oneshot
+ExecStart=/home/vlad/Документы/построение/ops/watchdogs/ob_reconstructor.sh
