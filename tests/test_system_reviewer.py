@@ -224,3 +224,10 @@ class TestRunReviewCrashHandling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestQuotaSkip(unittest.TestCase):
+    def test_quota_skip_notified_once_per_week(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(sr, "RUNS_DIR", Path(d)):
+            self.assertTrue(sr.quota_notify_allowed("SKIPPED"))
+            self.assertFalse(sr.quota_notify_allowed("SKIPPED"))  # не спамим
+            self.assertTrue(sr.quota_notify_allowed("FAIL"))      # обычный FAIL — всегда

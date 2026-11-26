@@ -465,6 +465,28 @@ def render_report(ctx: dict, verdict: dict | None, run_file: str, status: str,
     )
 
 
+QUOTA_MARKERS = ("free usage limit", "usage limit reached", "subscription is required")
+
+
+def quota_notify_allowed(status: str) -> bool:
+    """SKIPPED из-за квоты — не чаще раза в 7 дней, чтобы не спамить."""
+    if status != "SKIPPED":
+        return True
+    path = RUNS_DIR / ".quota_notify.json"
+    try:
+        at = datetime.fromisoformat(json.loads(path.read_text())["at"])
+    except (OSError, ValueError, KeyError):
+        at = None
+    if at and (datetime.now(timezone.utc) - at).total_seconds() < 7 * 86400:
+        return False
+    try:
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat()}))
+    except OSError:
+        pass
+    return True
+
+
 def should_notify(status: str, severity: str, notify_on_pass: bool) -> bool:
     return (status == "FAIL" or severity == "critical") or (notify_on_pass and status != "FAIL")
 
@@ -474,8 +496,9 @@ def notify_review(status: str, context: dict, summary: str, severity: str) -> bo
     head = context.get("git_head") or "?"
     msg = (f"[Системный ревью {head}] статус={status}, критичность={severity}\n"
            f"{summary[:400] or 'см. docs/system_review_*.md'}")
-    tags = "rotating_light" if status == "FAIL" else "mag"
-    status_ru = "ПРОВАЛ" if status == "FAIL" else ("ПРЕДУПРЕЖДЕНИЯ" if status == "PASS_WITH_WARNINGS" else "УСПЕХ")
+    tags = {"FAIL": "rotating_light", "PASS_WITH_WARNINGS": "mag"}.get(status, "warning")
+    status_ru = {"FAIL": "ПРОВАЛ", "PASS_WITH_WARNINGS": "ПРЕДУПРЕЖДЕНИЯ",
+                 "SKIPPED": "ПРОПУЩЕНО", "PASS": "УСПЕХ"}.get(status, status)
     return notify(f"СИСТЕМНЫЙ РЕВЬЮ: {status_ru}", msg, tags=tags)
 
 
@@ -511,7 +534,13 @@ def run_review(bin_path: str, model: str, timeout: int, notify_on_pass: bool) ->
                 output = output + "\n--- fallback ---\n" + out2
     verdict = extract_verdict(output) if ok else None
 
-    if ok and verdict:
+    quota = any(k in (output or "").lower() for k in QUOTA_MARKERS)
+    if quota:
+        # Это не поломка системы, а кончившаяся бесплатная квота: не FAIL.
+        status, severity = "SKIPPED", "info"
+        summary = ("Бесплатная квота opencode закончилась — аудит не выполнен. "
+                   "Нужна подписка OpenCode Go или другой ключ провайдера.")
+    elif ok and verdict:
         status = verdict.get("overall_status", "FAIL")
         severity = verdict.get("severity", "info")
         summary = verdict.get("summary", "")
@@ -534,7 +563,8 @@ def run_review(bin_path: str, model: str, timeout: int, notify_on_pass: bool) ->
         "report": str(report_path),
     }, ensure_ascii=False, indent=1))
 
-    if should_notify(status, severity, notify_on_pass):
+    notify_ok = should_notify(status, severity, notify_on_pass) or status == "SKIPPED"
+    if notify_ok and quota_notify_allowed(status):
         notify_review(status, ctx, summary, severity)
 
     logger.info("review done: %s (report=%s)", status, report_path)
