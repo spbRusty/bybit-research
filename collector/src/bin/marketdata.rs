@@ -202,7 +202,20 @@ fn append_table(path: &Path, new: &Table) -> Result<()> {
     if !is_rectangular(new) {
         anyhow::bail!("ragged table for {path:?}");
     }
-    let mut old = if path.exists() { read_parquet(path)? } else { Table::new() };
+    let mut old = if path.exists() {
+        match read_parquet(path) {
+            Ok(t) => t,
+            Err(e) => {
+                // Оборванная запись (ребут/диск) не должна блокировать сбор навсегда:
+                // откладываем битый файл и начинаем день заново.
+                eprintln!("[recover] {path:?} unreadable ({e:#}), moving to .bad");
+                let _ = fs::rename(path, path.with_extension("parquet.bad"));
+                Table::new()
+            }
+        }
+    } else {
+        Table::new()
+    };
     if old.is_empty() {
         old = new.clone();
     } else {
@@ -1229,6 +1242,17 @@ mod tests {
         src[3].1 = vec![Cell::I(5)]; // price: Float64 -> Int64
         assert!(merge_rows(&mut dst, src).is_err());
         assert_eq!(len(&dst), 1);
+    }
+
+    #[test]
+    fn append_table_recovers_from_corrupt_file() {
+        let dir = tmp_dir("corrupt");
+        let path = dir.join("trades/linear/AAAUSDT/1970-01-01.parquet");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not a parquet").unwrap();
+        append_table(&path, &trades_table(&[100], 1.0)).unwrap();
+        assert_eq!(len(&read_parquet(&path).unwrap()), 1);
+        assert!(path.with_extension("parquet.bad").exists());
     }
 
     #[test]
